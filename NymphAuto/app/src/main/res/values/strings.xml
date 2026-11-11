@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NymphAuto</string>
+    <string name="accessibility_desc">NymphAuto 通过无障碍 dispatchGesture 接口把脚本配置好的手势注入屏幕，用 takeScreenshot 进行找图/找字识别。本服务不创建录屏会话（与录屏软件完全兼容）、不读取与操作无关的屏幕内容、不上传任何数据、完全离线运行。</string>
+    <string name="hint_text">· 首次使用需在系统设置开启「无障碍服务」；Android 13 及以上侧载后若开关被拦，请到 应用信息 → 允许「受限设置」。\n· 找图/找字识别需 Android 11 及以上（无障碍截图）；更低版本可用「节点/文字」类动作，不依赖截图。\n· 无法作用于支付、锁屏、权限弹窗等系统安全窗口。\n· 停止会在当前手势完成后生效（已提交的手势无法中途撤销）。\n· 本工具仅用于辅助本人合法的重复操作，请勿用于抢单、刷量、游戏外挂或任何违规用途。</string>
+</resources>

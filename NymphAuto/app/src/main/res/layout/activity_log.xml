@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp"
+    android:background="#0F1115">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="运行日志"
+        android:textColor="#E5E7EB"
+        android:textSize="18sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="导入、执行、异常全流水；仅存本机，可分享导出"
+        android:textColor="#6B7280"
+        android:textSize="11sp" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="12dp">
+
+        <Button
+            android:id="@+id/btnLogShare"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="分享日志" />
+
+        <Button
+            android:id="@+id/btnLogBundle"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:text="导出调试包" />
+
+        <Button
+            android:id="@+id/btnLogClear"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:text="清空" />
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="调试包 = 运行日志 + 失败截图（zip）。匹配不上时，把它发给开发者即可定位"
+        android:textColor="#6B7280"
+        android:textSize="11sp" />
+
+    <TextView
+        android:id="@+id/tvCrashBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:padding="10dp"
+        android:background="#3B1216"
+        android:textColor="#FCA5A5"
+        android:textSize="12sp"
+        android:visibility="gone"
+        android:text="检测到上次崩溃，点击查看完整堆栈" />
+
+    <TextView
+        android:id="@+id/tvLogEmpty"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:text="暂无日志"
+        android:textColor="#6B7280"
+        android:visibility="gone" />
+
+    <ListView
+        android:id="@+id/lvLog"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="8dp"
+        android:divider="#1F2937"
+        android:dividerHeight="1dp" />
+</LinearLayout>

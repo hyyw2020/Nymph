@@ -1,0 +1,42 @@
+NymphAuto — 离线自动化脚本工具
+Copyright (c) 2026 NymphAuto contributors
+
+本产品主许可为 MIT License（见仓库根目录 LICENSE）。
+本文件列出随发行版一同分发、但适用各自独立许可的上游组件。
+完整清单、固定版本、引入方式与许可条款见 UPSTREAM_LICENSES.md。
+
+--------------------------------------------------------------------
+vendored 源码（随仓库完整保留其 LICENSE 与版权声明）
+--------------------------------------------------------------------
+quickjs-ng — MIT License
+  Copyright (c) 2017-2026 Fabrice Bellard
+  Copyright (c) 2017-2024 Charlie Gordon
+  Copyright (c) 2023-2026 Ben Noordhuis
+  Copyright (c) 2023-2026 Saúl Ibarra Corretgé
+  位置：app/src/main/cpp/quickjs/（其内 LICENSE 为许可全文）
+
+--------------------------------------------------------------------
+二进制 / 模型资产（各自上游许可）
+--------------------------------------------------------------------
+ONNX Runtime Android 1.31.1 (Microsoft) — MIT License
+ML Kit Text Recognition 16.0.1 (Google) — 见 Google ML Kit 服务条款
+TensorFlow Lite Task Vision 0.4.4 (Google) — Apache License 2.0
+efficientdet_lite0 int8 模型 (Google MediaPipe) — Apache License 2.0 / CC BY 4.0
+AndroidX / Material Components — Apache License 2.0
+Kotlin stdlib / kotlinx.coroutines / kotlinx.serialization — Apache License 2.0
+JUnit 4（仅测试期，不随 APK 分发）— Eclipse Public License 1.0
+
+--------------------------------------------------------------------
+互操作与商标声明
+--------------------------------------------------------------------
+本工程仅对公开脚本格式（.zjs / 行分隔 JSON）做解析兼容，
+不包含、不使用、也不反编译任何第三方闭源 APK 的代码、资源或资产。
+「自动精灵」为其权利人所有之商标，本工程与之无任何关联。
+
+--------------------------------------------------------------------
+隐私与权限
+--------------------------------------------------------------------
+发行版 APK 无 INTERNET / ACCESS_NETWORK_STATE 权限（aapt2 实测）。
+脚本、日志、失败截图与录制事件流均为本机明文 JSON，零数据收集、零上报。
+录制与截图全程走 Android 无障碍服务，不使用 MediaProjection，
+不与系统录屏争抢权限，不消费或拦截其他应用的触摸事件。

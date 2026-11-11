@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+      硬性约束：零网络权限。
+      主动 remove 掉传递依赖可能带入的 INTERNET / ACCESS_NETWORK_STATE，
+      从 Manifest 层面保证"完全离线"，也杜绝任何上报行为。
+    -->
+    <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove" />
+    <!--
+      TFLite Task Vision 的 library manifest 目标 SDK 很低，manifest merger 会
+      「隐含」补上三个旧权限（READ_PHONE_STATE / READ|WRITE_EXTERNAL_STORAGE）。
+      本工程模型从 assets 读取、文件访问全走 SAF，这三项完全不需要，
+      v2.0 起显式移除，权限表只保留真正用到的能力。
+    -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" tools:node="remove" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" tools:node="remove" />
+
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- AAPM（高级保护模式）状态查询：Android 16+；开启时自动化工具无豁免，需诚实告知 -->
+    <uses-permission android:name="android.permission.QUERY_ADVANCED_PROTECTION_MODE" />
+
+    <!-- Android 11+ 包可见性：只声明脚本需要打开/查询的 App，替代 QUERY_ALL_PACKAGES -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".NymphApp"
+        android:allowBackup="false"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:enableOnBackInvokedCallback="true"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:exported="true"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ui.LogActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.MainActivity" />
+
+        <!--
+          无障碍服务：手势注入 + 截图（Android 11+）+ 节点树。
+          注意 canTakeScreenshot 而非 MediaProjection —— 不与用户录屏抢权限。
+        -->
+        <service
+            android:name=".engine.AutoClickService"
+            android:exported="false"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- 运行编排服务（前台服务 specialUse，Android 14+ 合规） -->
+        <service
+            android:name=".service.RunnerService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="本地脚本无障碍手势自动执行（dispatchGesture 触摸注入，不读取屏幕内容，不创建录屏会话）" />
+        </service>
+
+        <!--
+          录制编排服务（前台服务 specialUse）。
+          硬约束：不创建录屏会话、不申请 MediaProjection、不拦截外部触摸。
+          浮窗用 FLAG_NOT_TOUCH_MODAL，无障碍服务不启用触摸浏览，
+          因此录制期间其他 APP 的触摸与点击语义完全不变。
+        -->
+        <service
+            android:name=".service.RecordingService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="无障碍被动事件录制（零 MediaProjection，不消费触摸，不打断其他应用）" />
+        </service>
+
+        <!--
+          系统级悬浮动作编辑器（v2.8.0，前台服务 specialUse）。
+          用 TYPE_APPLICATION_OVERLAY 让「编辑动作」脱离 MainActivity，
+          可在其他 APP 界面之上显示、切后台仍存在、通知栏可随时呼出。
+          零新增权限（复用 SYSTEM_ALERT_WINDOW）、零 MediaProjection、
+          FLAG_NOT_TOUCH_MODAL 只消费自身区域触摸，不打断底层 APP。
+        -->
+        <service
+            android:name=".service.FloatingEditorService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="系统级悬浮动作编辑器（TYPE_APPLICATION_OVERLAY 跨应用编辑脚本动作，零 MediaProjection，不消费面板外触摸）" />
+        </service>
+
+        <!-- 脚本输入法：中文/特殊符号输入、全按键支持（增强通道，非必需） -->
+        <service
+            android:name=".engine.ImeService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/method" />
+        </service>
+
+        <!-- 调试包分享：日志 + 失败截图经 FileProvider 授权导出（用户手动触发） -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="dev.nymph.auto.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

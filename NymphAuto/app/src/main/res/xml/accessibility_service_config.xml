@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  无障碍服务配置 —— 录制与回放共用。
+
+  ============================ 硬性约束 ============================
+  1) 零 MediaProjection：截图只用 AccessibilityService.takeScreenshot()（API 30+）,
+     canTakeScreenshot=true 是本服务唯一的截图能力，不与系统录屏争权限。
+  2) 录制不打断其他 APP：只订阅「被动语义事件」。这些事件由系统广播给观察者，
+     服务不消费、不拦截、不重排任何触摸。
+     **刻意不启用** flagRequestTouchExplorationMode / canRequestTouchExplorationMode：
+     官方文档与实测均表明触摸浏览模式会把单击重解释为「先聚焦再双击」，
+     会改变其他 APP 的交互语义，属于「打断其他 APP」，故禁用。
+     同理不使用 TYPE_TOUCH_INTERACTION_START/END、不使用 FLAG_WATCH_OUTSIDE_TOUCH
+     覆盖层、不使用任何 onTouchEvent 透明窗口。
+  3) 不使用 typeWindowContentChanged：噪声极大且会诱发高频截图，拖慢系统分发。
+  ================================================================
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeViewClicked|typeViewLongClicked|typeViewScrolled|typeViewFocused|typeViewSelected|typeViewTextChanged|typeWindowStateChanged|typeWindowsChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
+    android:canRequestTouchExplorationMode="false"
+    android:notificationTimeout="100"
+    android:description="@string/accessibility_desc" />
