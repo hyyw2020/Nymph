@@ -37,7 +37,7 @@ class RunStatsTest {
         val line = s.summary(27.7, 1, 1)
         assertTrue(line.contains("已执行 16 步"))
         assertTrue(line.contains("命中 0、跳过 0、失败 0"))
-        // 必须如实标注「无目标校验」，不把没找图显示成没执行
+        // 必须按实际情况标注「无目标校验」，不把没找图显示成没执行
         assertTrue(line.contains("无目标校验"))
         assertTrue(line.contains("27.7s"))
     }

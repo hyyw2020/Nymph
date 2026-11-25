@@ -103,7 +103,7 @@ class RecordCompiler(private val options: RecordOptions = RecordOptions()) {
                 continue
             }
             // v2.3.0：窗口层级变化事件不携带任何可回放语义，统一留到动作生成
-            // 阶段整体丢弃并如实计数，不再在此做同包合并——避免两处逻辑互相
+            // 阶段整体丢弃并按实际情况计数，不再在此做同包合并——避免两处逻辑互相
             // 干扰，也让报告里的「忽略窗口事件」反映真实丢弃量。
             if (last != null && last.kind == RecordEventKind.SCROLL && e.kind == RecordEventKind.SCROLL &&
                 e.atMs - last.atMs <= options.mergeScrollWindowMs && sameDirection(last, e) &&
@@ -134,7 +134,10 @@ class RecordCompiler(private val options: RecordOptions = RecordOptions()) {
         var lastPkg = ""
         var lastAt = 0L
 
-        val first = dedup.firstOrNull()
+        // v2.9.35：参考分辨率此前取去重后首条事件，而首条常是 KEY/TEXT_INPUT
+        // （screenW=0），导致脚本 refWidth/refHeight=0、回放百分比坐标无法换算。
+        // 改为取第一条真正带屏幕信息的事件。
+        val first = dedup.firstOrNull { it.hasScreen } ?: dedup.firstOrNull()
         val refW = first?.screenW ?: 0
         val refH = first?.screenH ?: 0
         val refRot = first?.rotation ?: 0
@@ -151,7 +154,7 @@ class RecordCompiler(private val options: RecordOptions = RecordOptions()) {
         }?.node?.packageName.orEmpty()
 
         // 方向不可知的滚动条数：真机上 TYPE_VIEW_SCROLLED 的 scrollDelta
-        // 常常是 0，此时只保留「向上翻页」的默认语义，必须如实告警。
+        // 常常是 0，此时只保留「向上翻页」的默认语义，必须按实际状态告警。
         val unknownDirScrolls = dedup.count { e ->
             e.kind == RecordEventKind.SCROLL && e.dx == 0 && e.dy == 0 && e.x2 == 0 && e.y2 == 0
         }
@@ -159,7 +162,9 @@ class RecordCompiler(private val options: RecordOptions = RecordOptions()) {
             warnings += "$unknownDirScrolls 组滚动未上报方向，已按默认向上翻页重建（被动无障碍录制无法获取真实手指轨迹）"
         }
         if (startPkg.isNotEmpty() && dedup.any { it.kind == RecordEventKind.SCROLL }) {
-            warnings += "录制含滚动动作：回放前请手动回到录制起始界面（$startPkg），滚动位置无法自动还原"
+            warnings += "录制含滚动动作：回放前请手动回到录制起始界面（$startPkg），滚动位置无法自动还原；" +
+                "列表滚动会复用视图节点，同一节点在不同位置的文字会变化，" +
+                "以节点文字为锚点的步骤在位置偏移时可能匹配到相邻项，请以图像或坐标复核"
         }
 
         for ((index, e) in dedup.withIndex()) {
@@ -175,6 +180,17 @@ class RecordCompiler(private val options: RecordOptions = RecordOptions()) {
             // （依据交互事件的包名变化）统一负责。
             if (e.kind == RecordEventKind.WINDOW_CHANGED) {
                 windowDropped++
+                continue
+            }
+
+            // v2.9.35：先判定动作能否生成，再提交包守卫/等待标记。此前守卫与
+            // 等待标记在 `toAction ?: continue` 之前就 append，失败跳过后会留下
+            // "有守卫无动作"的孤儿 OPEN_APP，且 lastAt 不推进导致下一事件等待区间
+            // 叠加被跳过事件的时长（等待近乎翻倍）。
+            val action = toAction(e, anchorCounts, warnings)
+            if (action == null) {
+                // 跳过事件也要推进时间基线，否则等待重复累计
+                lastAt = e.atMs
                 continue
             }
 
@@ -199,7 +215,6 @@ class RecordCompiler(private val options: RecordOptions = RecordOptions()) {
                 waits++
             }
 
-            val action = toAction(e, anchorCounts, warnings) ?: continue
             actions += action
             if (pkg.isNotEmpty()) lastPkg = pkg
             lastAt = e.atMs
@@ -358,7 +373,7 @@ class RecordCompiler(private val options: RecordOptions = RecordOptions()) {
                 val vertical = kotlin.math.abs(e.dy) >= kotlin.math.abs(e.dx)
                 // dy>0：内容向上翻（看到后面的内容）→ 手指上滑 → 终点在上方。
                 // delta 全 0 时方向不可知，默认向上翻页（列表/抽屉最常见），
-                // 由 compile() 汇总告警，如实告知用户。
+                // 由 compile() 汇总告警，告知实际值用户。
                 val sign = if (vertical) (if (e.dy > 0) -1.0 else 1.0) else (if (e.dx > 0) -1.0 else 1.0)
                 val cx = 50.0
                 val cy = 50.0

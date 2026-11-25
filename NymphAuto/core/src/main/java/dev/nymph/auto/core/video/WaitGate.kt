@@ -12,9 +12,9 @@ import dev.nymph.auto.core.model.Region
  * 背景：横屏手游「战斗 → 随机时长开箱动画 → 结算领奖 → 再战」这类循环，
  * 阶段时长不可预测。视频导入默认生成 `waitMs = gap`（≤3s）的固定延时动作，
  * 找图动作自身也只重试 `retryWindowMs`（默认 2s）——两者都会在 10 秒级的
- * 转场动画期间超时，脚本随即空转 / 乱点，这就是「不支持复杂操作」的体感来源。
+ * 转场动画期间超时，脚本随即空转 / 无序触发，构成「复杂操作链路能力未达标」的可感知成因。
  *
- * 引擎其实早已有 [ConditionKind.APPEAR_IMAGE] + `repeatCheckUntilOk` 轮询能力，
+ * 引擎已具备 [ConditionKind.APPEAR_IMAGE] + `repeatCheckUntilOk` 轮询能力，
  * 且轮询里带脚本中止条件检查点、等待浮层上报与看门狗心跳；缺的只是「把这条
  * 条件写进脚本」。本对象把它固化成可序列化、可单测、可导出的 [Condition]，
  * 由 [VideoScriptBuilder] 生成、ScriptRunner 原样执行，**零引擎语义改动**。

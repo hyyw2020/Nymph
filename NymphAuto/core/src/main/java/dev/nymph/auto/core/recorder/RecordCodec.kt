@@ -28,6 +28,19 @@ object RecordCodec {
         if (raw.isBlank()) emptyList() else json.decodeFromString<List<RecordEvent>>(raw)
     }.getOrDefault(emptyList())
 
-    /** 追加一条事件（读-改-写，录制期低频调用足够）。 */
-    fun append(raw: String, event: RecordEvent): String = encode(decode(raw) + event)
+    /**
+     * 追加一条事件（读-改-写，录制期低频调用足够）。
+     *
+     * v2.9.35：decode 对"非空但损坏"的文件宽容返回空列表，旧实现会
+     * `encode(emptyList + event)` 把此前全部历史覆盖丢失。这里在检测到
+     * "raw 非空却解出 0 条"时拒绝覆盖、原样返回 raw——宁可丢弃这一条新事件，
+     * 也不能让一次追加抹掉整段录制历史。调用方可用 [looksCorrupt] 主动告警。
+     */
+    fun append(raw: String, event: RecordEvent): String {
+        if (looksCorrupt(raw)) return raw
+        return encode(decode(raw) + event)
+    }
+
+    /** raw 有实质内容却解不出任何事件 → 判定为损坏（供 UI 告警/备份）。 */
+    fun looksCorrupt(raw: String): Boolean = raw.isNotBlank() && decode(raw).isEmpty()
 }

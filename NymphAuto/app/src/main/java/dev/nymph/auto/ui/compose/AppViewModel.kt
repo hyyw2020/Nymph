@@ -43,6 +43,13 @@ import java.util.zip.ZipOutputStream
 
 /** 脚本列表项（只含展示所需字段，不把整份动作树带进 UI 状态）。 */
 data class ScriptUi(
+    /**
+     * 唯一标识：取存储层文件名（如 `未命名脚本.json`）。
+     * v2.9.39：LazyColumn 的 key 必须用本字段而非 [name]——老版本遗留的
+     * script.json 与新版同名文件可能解码出相同 [name]，以 name 作 key 会
+     * 抛 `Key "未命名脚本" was already used` 崩溃。文件名天然唯一。
+     */
+    val id: String,
     val name: String,
     val steps: Int,
     val savedAt: Long,
@@ -150,6 +157,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun buildSnapshot(): AppUiState {
         val items = runCatching { store.list() }.getOrDefault(emptyList()).map { item ->
             ScriptUi(
+                id = item.file.name,
                 name = item.name,
                 steps = item.steps,
                 savedAt = item.savedAt,
@@ -247,8 +255,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         "导入失败：${fail?.reason ?: "未知原因"}"
                     } else {
                         store.save(res.script)
-                        RunLog.i("Import", "导入成功「${res.script.name}」${res.script.totalActionCount()} 步${res.note}")
-                        "已导入「${res.script.name}」${res.script.totalActionCount()} 步"
+                        RunLog.i("Import", "导入成功「${res.script.name}」${res.script.totalActionCount()} 个场景${res.note}")
+                        "已导入「${res.script.name}」${res.script.totalActionCount()} 个场景"
                     }
                 }.getOrElse { e ->
                     RunLog.e("Import", "读取失败：${e.message}")
@@ -352,9 +360,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return saveScript(old.copy(name = name))
     }
 
-    /** 编辑器：按名加载脚本全文（找不到返回 null）。 */
-    fun loadScript(name: String): Script? =
-        runCatching { store.load(name) }.getOrNull()
+    /** 编辑器：按名加载脚本全文（读盘放 IO 线程），找不到回调 null。 */
+    fun loadScript(name: String, onLoaded: (Script?) -> Unit) {
+        viewModelScope.launch {
+            val script = withContext(Dispatchers.IO) {
+                runCatching { store.load(name) }.getOrNull()
+            }
+            onLoaded(script)
+        }
+    }
 
     /**
      * 编辑器 / 视频导入：保存（新建或更新）脚本并刷新列表。返回 null=成功，否则为错误文案。
@@ -367,7 +381,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val saved = repo.save(script)
             RunLog.i(
                 "Store",
-                "保存脚本「${saved.name}」r${saved.revision}（${saved.actions.size} 个顶层动作，上一版已入历史）",
+                "保存脚本「${saved.name}」r${saved.revision}（${saved.actions.size} 个顶层场景，上一版已入历史）",
             )
             refresh()
             null
@@ -409,44 +423,63 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         refresh()
     }
 
-    fun shareLogs(): String? = runCatching {
-        val text = buildString {
-            appendLine("== NymphAuto 运行日志 ==")
-            append(LogStore.exportText().ifEmpty { "（暂无日志）" })
-            LogStore.readCrash()?.let {
-                appendLine().appendLine().appendLine(it)
+    /** 分享日志：读日志放 IO，startActivity 回主线程（回调即在主线程）。 */
+    fun shareLogs(onDone: (String?) -> Unit) {
+        viewModelScope.launch {
+            val text = withContext(Dispatchers.IO) {
+                runCatching {
+                    buildString {
+                        appendLine("== NymphAuto 运行日志 ==")
+                        append(LogStore.exportText().ifEmpty { "（暂无日志）" })
+                        LogStore.readCrash()?.let {
+                            appendLine().appendLine().appendLine(it)
+                        }
+                    }
+                }
             }
+            val err = if (text.isFailure) {
+                "分享失败：${text.exceptionOrNull()?.javaClass?.simpleName}"
+            } else {
+                runCatching {
+                    val send = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_SUBJECT, "NymphAuto 运行日志")
+                        putExtra(Intent.EXTRA_TEXT, text.getOrNull())
+                    }
+                    ctx.startActivity(
+                        Intent.createChooser(send, "分享日志")
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                    )
+                }.exceptionOrNull()?.let { "分享失败：${it.javaClass.simpleName}" }
+            }
+            onDone(err)
         }
-        val send = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_SUBJECT, "NymphAuto 运行日志")
-            putExtra(Intent.EXTRA_TEXT, text)
-        }
-        ctx.startActivity(
-            Intent.createChooser(send, "分享日志").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-        )
-        null
-    }.getOrElse { "分享失败：${it.javaClass.simpleName}" }
+    }
 
-    /** 调试包：logs/ + debug/（失败现场截图）打成 zip，供离线排查。 */
-    fun exportBundle(): String? {
-        val zip = runCatching { buildBundle() }.getOrNull()
-            ?: return "调试包生成失败（无日志或无截图）"
-        return try {
-            val uri = FileProvider.getUriForFile(ctx, "dev.nymph.auto.fileprovider", zip)
-            val send = Intent(Intent.ACTION_SEND).apply {
-                type = "application/zip"
-                putExtra(Intent.EXTRA_SUBJECT, "NymphAuto 调试包")
-                putExtra(Intent.EXTRA_STREAM, uri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    /** 调试包：logs/ + debug/（失败现场截图）打成 zip，供离线排查。压缩放 IO，分享回主线程。 */
+    fun exportBundle(onDone: (String?) -> Unit) {
+        viewModelScope.launch {
+            val zip = withContext(Dispatchers.IO) {
+                runCatching { buildBundle() }.getOrNull()
             }
-            ctx.startActivity(
-                Intent.createChooser(send, "发送调试包（含失败截图）")
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-            )
-            null
-        } catch (e: Exception) {
-            "发送失败：${e.javaClass.simpleName}"
+            val err = if (zip == null) {
+                "调试包生成失败（无日志或无截图）"
+            } else {
+                runCatching {
+                    val uri = FileProvider.getUriForFile(ctx, "dev.nymph.auto.fileprovider", zip)
+                    val send = Intent(Intent.ACTION_SEND).apply {
+                        type = "application/zip"
+                        putExtra(Intent.EXTRA_SUBJECT, "NymphAuto 调试包")
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    ctx.startActivity(
+                        Intent.createChooser(send, "发送调试包（含失败截图）")
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                    )
+                }.exceptionOrNull()?.let { "发送失败：${it.javaClass.simpleName}" }
+            }
+            onDone(err)
         }
     }
 

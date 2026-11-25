@@ -164,18 +164,102 @@ class ReplayChainTest {
         assertTrue(Preflight.check(script, envOk()).ok)
     }
 
+    // ---- v2.9.32 方向无关预检：方向差异对所有脚本降级为非阻断告警 ----
+
     @Test
-    fun `方向相反时预检拦截并说明`() {
+    fun `含图片模板的脚本方向相反只告警不拦截`() {
+        // v2.9.32：运行期帧归一化（当前帧旋回拾取几何）+ 落点反变换，使依赖
+        // 图片模板的脚本同样具备方向自适应能力；预检不再据方向差异阻断执行。
         val script = Script(
             name = "s",
             refWidth = 1080,
             refHeight = 2400,
-            actions = listOf(Action(type = ActionType.TAP)),
+            actions = listOf(Action(type = ActionType.CLICK_IMAGE, imageData = "x")),
         )
         val report = Preflight.check(script, envOk().copy(screenWidth = 2400, screenHeight = 1080))
+        assertTrue(report.explain(), report.ok)
+        assertTrue(report.warnings.any { it.contains("方向") })
+        assertTrue(report.warningsText().contains("不阻断"))
+        assertFalse(report.problems.any { it.contains("方向") })
+    }
+
+    @Test
+    fun `纯坐标脚本方向相反只告警不拦截`() {
+        // 现场日志：录制时 1280×2800、运行时 2800×1280 的 30 步坐标手势脚本，
+        // 被「屏幕方向与脚本相反」拦下 12 次。百分比坐标与方向无关，应可回放。
+        val script = Script(
+            name = "录制 11-15",
+            refWidth = 1280,
+            refHeight = 2800,
+            actions = listOf(Action(type = ActionType.TAP), Action(type = ActionType.SWIPE)),
+        )
+        val report = Preflight.check(script, envOk().copy(screenWidth = 2800, screenHeight = 1280))
+        assertTrue(report.explain(), report.ok)
+        assertTrue(report.warnings.any { it.contains("方向") })
+        assertTrue(report.warningsText().contains("不阻断"))
+        assertFalse(report.problems.any { it.contains("方向") })
+    }
+
+    @Test
+    fun `纯坐标脚本宽高比差异大也只告警`() {
+        val script = Script(
+            name = "s",
+            refWidth = 1000,
+            refHeight = 2000,
+            actions = listOf(Action(type = ActionType.TAP)),
+        )
+        val report = Preflight.check(script, envOk().copy(screenWidth = 1000, screenHeight = 3000))
+        assertTrue(report.explain(), report.ok)
+        assertTrue(report.warnings.any { it.contains("宽高比") })
+    }
+
+    // ---- v2.9.27 包可见性：查不到不等于未安装 ----
+
+    @Test
+    fun `包可见性受限时缺失目标应用只告警不拦截`() {
+        // 现场日志：com.hihonor.gameassistant 录制阶段刚采集 55 个事件，
+        // 回放预检却因 getLaunchIntentForPackage==null 判「未安装」拦下 12 次。
+        val script = Script(
+            name = "录制 11-15",
+            actions = listOf(Action(type = ActionType.OPEN_APP, packageName = "com.hihonor.gameassistant")),
+        )
+        val env = envOk().copy(packageVisibilityRestricted = true)
+        val report = Preflight.check(script, env)
+        assertTrue(report.explain(), report.ok)
+        assertTrue(report.warningsText().contains("无法确认"))
+        assertTrue(report.warningsText().contains("包守卫"))
+        assertFalse(report.problems.any { it.contains("未安装") })
+    }
+
+    @Test
+    fun `包可见性未受限时缺失目标应用仍拦截`() {
+        val script = Script(
+            name = "s",
+            actions = listOf(Action(type = ActionType.OPEN_APP, packageName = "com.missing")),
+        )
+        val report = Preflight.check(script, envOk().copy(packageVisibilityRestricted = false))
         assertFalse(report.ok)
-        assertTrue(report.problems.any { it.contains("方向") })
-        assertTrue(report.explain().contains("预检未通过"))
+        assertTrue(report.problems.any { it.contains("未安装") })
+    }
+
+    @Test
+    fun `受限脚本方向差异与包缺失同时存在仍可回放`() {
+        // 复刻现场：竖屏录制 + 横屏运行 + 目标应用查不到，两者都只能是告警。
+        val script = Script(
+            name = "录制 11-15",
+            refWidth = 1280,
+            refHeight = 2800,
+            actions = listOf(
+                Action(type = ActionType.OPEN_APP, packageName = "com.hihonor.gameassistant"),
+                Action(type = ActionType.TAP),
+            ),
+        )
+        val env = envOk().copy(
+            screenWidth = 2800, screenHeight = 1280, packageVisibilityRestricted = true,
+        )
+        val report = Preflight.check(script, env)
+        assertTrue(report.explain(), report.ok)
+        assertEquals(2, report.warnings.size)
     }
 
     @Test

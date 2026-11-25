@@ -18,13 +18,14 @@ import java.nio.FloatBuffer
  * 基于 **ONNX Runtime Android 1.31.1**（2026-10 release，MIT）的
  * **完全离线**中文 OCR 引擎。
  *
- * ## 为什么替换/补位 ML Kit
+ * ## 为什么补位 ML Kit
  *
- * ML Kit 中文识别的 `text-recognition-chinese:16.0.1` 依赖 Google Play 服务
- * **按需下载模型**（GMS 侧网络）。本 APK 声明 `tools:node="remove"` 移除了
- * INTERNET / ACCESS_NETWORK_STATE 权限，且大量国产 ROM 无 GMS——该通道
- * 在这些设备上**永远不可用**。本引擎把模型文件放在本机，推理不联网、
- * 不依赖 GMS，是「完全离线」承诺下唯一可靠的 OCR 通道。
+ * ML Kit 中文识别的 `com.google.mlkit:text-recognition-chinese:16.0.1` 为
+ * **bundled 静态打包**坐标（模型随库进入 APK，不依赖 GMS 侧按需下载）。
+ * 本 APK 通过 `tools:node="remove"` 移除 INTERNET / ACCESS_NETWORK_STATE，
+ * 以维持零网络权限契约；bundled 坐标本身不需要联网，二者不冲突。
+ * 本引擎的价值在于：模型版本与字符布局完全由用户按 manifest 声明控制，
+ * 不引入任何 GMS 依赖，是「完全离线 + 可声明校验」承诺下的主 OCR 通道。
  *
  * ## 模型可插拔契约（Apache-2.0 的 PaddleOCR PP-OCRv5 导出 ONNX）
  *
@@ -55,6 +56,7 @@ class OnnxOcrEngine(private val context: Context) : OcrEngine {
     private var env: OrtEnvironment? = null
     private var detSession: OrtSession? = null
     private var recSession: OrtSession? = null
+    private var sessionOptions: OrtSession.SessionOptions? = null
     private var keys: List<String> = emptyList()
     private var detInputName = ""
     private var recInputName = ""
@@ -81,20 +83,30 @@ class OnnxOcrEngine(private val context: Context) : OcrEngine {
             setIntraOpNumThreads(Runtime.getRuntime().availableProcessors().coerceIn(1, 4))
             setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
         }
-        val d = e.createSession(fDet.readBytes(), opts)
-        val r = e.createSession(fRec.readBytes(), opts)
-        detInputName = d.inputNames.firstOrNull().orEmpty()
-        recInputName = r.inputNames.firstOrNull().orEmpty()
-        if (detInputName.isEmpty() || recInputName.isEmpty()) {
-            runCatching { d.close() }; runCatching { r.close() }; runCatching { opts.close() }
-            return
+        // v2.9.35：opts/session 都是持有 native 内存的句柄。此前成功路径从不 close
+        // opts、createSession 抛异常时已建的 d 也不 close，多次初始化累积到 OOM。
+        // 用局部 var + try/finally：任何失败路径都释放已创建的句柄，成功则移交字段。
+        var d: OrtSession? = null
+        var r: OrtSession? = null
+        try {
+            d = e.createSession(fDet.readBytes(), opts)
+            r = e.createSession(fRec.readBytes(), opts)
+            detInputName = d.inputNames.firstOrNull().orEmpty()
+            recInputName = r.inputNames.firstOrNull().orEmpty()
+            if (detInputName.isEmpty() || recInputName.isEmpty()) return
+            keys = OcrPostprocess.loadKeys(fKeys.readText(Charsets.UTF_8))
+            env = e
+            detSession = d
+            recSession = r
+            sessionOptions = opts
+            ready = keys.isNotEmpty()
+            if (ready) RunLog.i("OcrOnnx", "离线 OCR 就绪（ONNX Runtime 1.31.1，字典 ${keys.size} 字，纯 CPU）")
+        } finally {
+            // 移交字段的会话不在 finally 关闭；未移交的（d/r 与字段非同一实例）在此释放。
+            if (detSession !== d) runCatching { d?.close() }
+            if (recSession !== r) runCatching { r?.close() }
+            if (sessionOptions !== opts) runCatching { opts.close() }
         }
-        keys = OcrPostprocess.loadKeys(fKeys.readText(Charsets.UTF_8))
-        env = e
-        detSession = d
-        recSession = r
-        ready = keys.isNotEmpty()
-        RunLog.i("OcrOnnx", "离线 OCR 就绪（ONNX Runtime 1.31.1，字典 ${keys.size} 字，纯 CPU）")
     }
 
     /** filesDir 优先；没有则读 assets/ocr/（自行随包时）。 */
@@ -153,9 +165,10 @@ class OnnxOcrEngine(private val context: Context) : OcrEngine {
             val t = (b.top * dh / ph).coerceIn(0, bmp.height - 1)
             val r = (b.right * dw / pw).coerceIn(l + 1, bmp.width)
             val bt = (b.bottom * dh / ph).coerceIn(t + 1, bmp.height)
-            val text = recognizeLine(e, rec, bmp, l, t, r, bt)
-            if (text.isNotBlank()) {
-                out += TextBox(text, (l + r) / 2, (t + bt) / 2)
+            val decoded = recognizeLine(e, rec, bmp, l, t, r, bt)
+            if (decoded.text.isNotBlank()) {
+                // v2.9.37：透传 CTC softmax 置信度，贯通到 ocr_triggered 日志与断言。
+                out += TextBox(decoded.text, (l + r) / 2, (t + bt) / 2, decoded.confidence)
             }
         }
         return out
@@ -164,7 +177,7 @@ class OnnxOcrEngine(private val context: Context) : OcrEngine {
     private fun recognizeLine(
         e: OrtEnvironment, rec: OrtSession,
         bmp: Bitmap, l: Int, t: Int, r: Int, b: Int,
-    ): String {
+    ): OcrPostprocess.Decoded {
         val cw = (r - l).coerceAtLeast(1)
         val ch = (b - t).coerceAtLeast(1)
         val crop = Bitmap.createBitmap(bmp, l, t, cw, ch)
@@ -186,8 +199,9 @@ class OnnxOcrEngine(private val context: Context) : OcrEngine {
         }
         val classes = shape.lastOrNull() ?: 0
         val steps = if (shape.size >= 2) shape[shape.size - 2] else 0
-        if (classes <= 0 || steps <= 0) return ""
-        return OcrPostprocess.ctcGreedy(logits, steps, classes, keys)
+        if (classes <= 0 || steps <= 0) return OcrPostprocess.Decoded("", 0.0)
+        // v2.9.37：走 scored 版本，文本与置信度一并产出（ctcGreedy 仍保留供纯文本调用方）。
+        return OcrPostprocess.ctcGreedyScored(logits, steps, classes, keys)
     }
 
     /** ARGB_8888 → CHW float，(v/255 - 0.5)/0.5。 */
@@ -211,8 +225,10 @@ class OnnxOcrEngine(private val context: Context) : OcrEngine {
         ready = false
         runCatching { detSession?.close() }
         runCatching { recSession?.close() }
+        runCatching { sessionOptions?.close() }
         detSession = null
         recSession = null
+        sessionOptions = null
         // OrtEnvironment 是进程级单例，不在此关闭（其他会话可能仍在用）
     }
 }

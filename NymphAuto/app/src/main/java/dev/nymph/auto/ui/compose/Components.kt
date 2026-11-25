@@ -1,13 +1,12 @@
 package dev.nymph.auto.ui.compose
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -37,12 +36,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+/**
+ * 通用组件层 —— 统一遵循 "Quiet Precision" art direction：
+ *  - 状态用色相区分，但文字取 onContainer 色（craft floor：彩色面上从该色相取字，不用灰）；
+ *  - 卡片用完整描边 + 分层底色，不用单侧竖条装饰（craft floor 绝对禁令）；
+ *  - 分组标题用有分量的字号，不做 eyebrow 小标签（craft floor 绝对禁令）；
+ *  - 组内紧、组间松，标题上方留白大于下方。
+ */
 
 /** 小圆点状态标签：绿=正常、红=缺失、灰=中性。 */
 @Composable
@@ -57,37 +64,43 @@ fun StatusPill(
         Tone.BAD -> MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
         Tone.NEUTRAL -> MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
     }
-    Surface(shape = CircleShape, color = bg, modifier = modifier) {
-        Text(
-            text = text,
-            style = MaterialTheme.typography.labelSmall,
-            color = fg,
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-        )
+    Surface(shape = Ds.RadiusPill, color = bg, modifier = modifier) {
+        Row(
+            modifier = Modifier.padding(horizontal = Ds.SM, vertical = Ds.XS),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // 设计稿 After 栏：选中态 chip 前置小方块，让「正常/已就绪」一眼可扫。
+            // 仅 OK 态带方块，NEUTRAL 不带 —— 强调色克制使用，不靠色块撑视觉。
+            if (tone == Tone.OK) {
+                Box(Modifier.size(5.dp).background(fg, CircleShape))
+                Spacer(Modifier.width(Ds.XS))
+            }
+            Text(text = text, style = Ds.Label, color = fg)
+        }
     }
 }
 
 enum class Tone { OK, WARN, BAD, NEUTRAL }
 
-/** 分组标题。 */
+/** 分组标题：承担区块层级，用有分量的标题字号而非 eyebrow 小标签。 */
 @Composable
 fun SectionTitle(text: String, trailing: String? = null) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(start = 4.dp, end = 4.dp, top = 18.dp, bottom = 8.dp),
+            .padding(start = Ds.LG, end = Ds.LG, top = Ds.XL, bottom = Ds.SM),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
             text = text,
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = Ds.Title,
+            color = MaterialTheme.colorScheme.onSurface,
             modifier = Modifier.weight(1f),
         )
         if (trailing != null) {
             Text(
                 text = trailing,
-                style = MaterialTheme.typography.labelSmall,
+                style = Ds.Label,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
@@ -107,16 +120,16 @@ fun InfoRow(
 ) {
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
-        shape = MaterialTheme.shapes.medium,
+        shape = Ds.RadiusMd,
         modifier = Modifier.fillMaxWidth(),
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            modifier = Modifier.padding(horizontal = Ds.LG, vertical = Ds.MD),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(
                 modifier = Modifier
-                    .size(34.dp)
+                    .size(36.dp)
                     .background(MaterialTheme.colorScheme.surfaceVariant, CircleShape),
                 contentAlignment = Alignment.Center,
             ) {
@@ -124,30 +137,30 @@ fun InfoRow(
                     imageVector = icon,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(18.dp),
+                    modifier = Modifier.size(19.dp),
                 )
             }
-            Spacer(Modifier.width(12.dp))
+            Spacer(Modifier.width(Ds.MD))
             Column(modifier = Modifier.weight(1f)) {
-                Text(title, style = MaterialTheme.typography.titleMedium)
+                Text(title, style = Ds.ItemTitle)
                 Text(
                     subtitle,
-                    style = MaterialTheme.typography.bodySmall,
+                    style = Ds.BodySecondary,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(Ds.SM))
             if (actionText != null && onAction != null) {
                 Surface(
                     color = MaterialTheme.colorScheme.primary,
-                    shape = CircleShape,
+                    shape = Ds.RadiusPill,
                     onClick = onAction,
                 ) {
                     Text(
                         text = actionText,
-                        style = MaterialTheme.typography.labelMedium,
+                        style = Ds.Label,
                         color = MaterialTheme.colorScheme.onPrimary,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        modifier = Modifier.padding(horizontal = Ds.LG, vertical = Ds.SM),
                     )
                 }
             } else {
@@ -157,7 +170,12 @@ fun InfoRow(
     }
 }
 
-/** 说明卡：一组要点 + 可选强调色。 */
+/** 说明卡：一组要点 + 可选强调色。
+ *
+ * craft floor：不用「圆角盒子左侧竖条」这种装饰（a bar down one side of a
+ * rounded box）。改用完整描边 + 标题字重强调；强调色只用于标题文字，
+ * 干干净净，不靠色条撑视觉。
+ */
 @Composable
 fun NoteCard(
     title: String,
@@ -167,45 +185,42 @@ fun NoteCard(
 ) {
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
-        shape = MaterialTheme.shapes.medium,
-        modifier = modifier.fillMaxWidth(),
+        shape = Ds.RadiusMd,
+        modifier = modifier
+            .fillMaxWidth()
+            .border(Dp.Hairline, MaterialTheme.colorScheme.outlineVariant, Ds.RadiusMd),
     ) {
-        Row(Modifier.height(IntrinsicSize.Min)) {
-            Box(
-                Modifier
-                    .width(3.dp)
-                    .fillMaxHeight()
-                    .background(accent),
+        Column(Modifier.padding(Ds.LG)) {
+            Text(
+                title,
+                style = Ds.ItemTitle,
+                color = accent,
             )
-            Column(Modifier.padding(14.dp)) {
-                Text(
-                    title,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = accent,
-                )
-                Spacer(Modifier.height(6.dp))
-                lines.forEach { line ->
-                    Row(Modifier.padding(vertical = 1.dp)) {
-                        Text(
-                            "·",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            line,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
+            Spacer(Modifier.height(Ds.SM))
+            lines.forEach { line ->
+                Row(Modifier.padding(vertical = Ds.XS / 2)) {
+                    Text(
+                        "·",
+                        style = Ds.BodySecondary,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.width(Ds.SM))
+                    Text(
+                        line,
+                        style = Ds.BodySecondary,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
         }
     }
 }
 
-
-/** 脚本卡片：名称/依赖/时间 + 运行/更多菜单。 */
+/** 脚本卡片：名称/依赖/时间 + 运行/更多菜单。
+ *
+ * 视觉层级：名称（ItemTitle 半粗）→ 场景数/标签（pill）→ 依赖摘要（次正文）
+ * → 时间（标签）+ 运行（实心主按钮）。行距按「组内紧、组间松」重排。
+ */
 @Composable
 fun ScriptCard(
     item: ScriptUi,
@@ -219,26 +234,27 @@ fun ScriptCard(
     var menu by remember { mutableStateOf(false) }
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
-        shape = MaterialTheme.shapes.large,
-        modifier = Modifier.fillMaxWidth(),
+        shape = Ds.RadiusLg,
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(Dp.Hairline, MaterialTheme.colorScheme.outlineVariant, Ds.RadiusLg),
     ) {
-        Column(Modifier.padding(start = 16.dp, top = 14.dp, end = 6.dp, bottom = 12.dp)) {
+        Column(Modifier.padding(start = Ds.LG, top = Ds.LG, end = Ds.SM, bottom = Ds.MD)) {
             Row(verticalAlignment = Alignment.Top) {
                 Column(Modifier.weight(1f)) {
                     Text(
                         text = item.name,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
+                        style = Ds.ItemTitle,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    Spacer(Modifier.height(4.dp))
+                    Spacer(Modifier.height(Ds.SM))
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        StatusPill("${item.steps} 步", Tone.OK)
-                        Spacer(Modifier.width(6.dp))
+                        StatusPill("${item.steps} 个场景", Tone.OK)
+                        Spacer(Modifier.width(Ds.SM))
                         if (item.needsScreenshot) {
                             StatusPill("截图", Tone.NEUTRAL)
-                            Spacer(Modifier.width(6.dp))
+                            Spacer(Modifier.width(Ds.SM))
                         }
                         if (item.needsAi) StatusPill("AI", Tone.NEUTRAL)
                     }
@@ -253,7 +269,7 @@ fun ScriptCard(
                     }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                         DropdownMenuItem(
-                            text = { Text("编辑动作") },
+                            text = { Text("编辑场景") },
                             leadingIcon = { Icon(Icons.Filled.Edit, null) },
                             onClick = { menu = false; onEdit() },
                         )
@@ -281,29 +297,30 @@ fun ScriptCard(
                     }
                 }
             }
+            Spacer(Modifier.height(Ds.MD))
             Text(
                 text = item.depsLine,
-                style = MaterialTheme.typography.bodySmall,
+                style = Ds.BodySecondary,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(end = 10.dp),
+                modifier = Modifier.padding(end = Ds.MD),
             )
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(Ds.MD))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = timeText(item.savedAt),
-                    style = MaterialTheme.typography.labelSmall,
+                    style = Ds.Mono.copy(fontSize = Ds.Label.fontSize),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(Modifier.weight(1f))
                 Surface(
                     color = MaterialTheme.colorScheme.primary,
-                    shape = CircleShape,
+                    shape = Ds.RadiusPill,
                     onClick = onRun,
                 ) {
                     Row(
-                        Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
+                        Modifier.padding(horizontal = Ds.LG, vertical = Ds.SM),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.Center,
                     ) {
@@ -313,10 +330,10 @@ fun ScriptCard(
                             tint = MaterialTheme.colorScheme.onPrimary,
                             modifier = Modifier.size(16.dp),
                         )
-                        Spacer(Modifier.width(4.dp))
+                        Spacer(Modifier.width(Ds.SM))
                         Text(
                             "运行",
-                            style = MaterialTheme.typography.labelMedium,
+                            style = Ds.Label,
                             color = MaterialTheme.colorScheme.onPrimary,
                         )
                     }

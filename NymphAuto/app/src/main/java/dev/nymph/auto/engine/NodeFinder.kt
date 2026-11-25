@@ -31,10 +31,14 @@ class NodeFinder {
     /** 按文本查找（"点击文字"的节点兜底通道，OCR 不可用时降级）。 */
     fun findByText(text: String, regex: Boolean): NodeHit? {
         val root = AutoClickService.live()?.rootInActiveWindow() ?: return null
-        val re = if (regex) runCatching { Regex(text) }.getOrNull() else null
-        return dfs(root, 0, emptyList(), emptyList(), listOf(text), 0, 0)?.takeIf { hit ->
-            re == null || re.matches(hit.text)
+        if (regex) {
+            // v2.9.35：正则模式必须直接用 re.matches 逐节点匹配，禁止用正则源串
+            // 做字面 contains 预过滤（含 \d .* | 等元字符时恒不匹配）；编译失败
+            // 显式返回 null，绝不降级为字面包含（静默切换语义无从排查）。
+            val re = runCatching { Regex(text) }.getOrNull() ?: return null
+            return dfs(root, 0, emptyList(), emptyList(), emptyList(), 0, 0, textRegex = re)
         }
+        return dfs(root, 0, emptyList(), emptyList(), listOf(text), 0, 0)
     }
 
     private fun dfs(
@@ -45,6 +49,7 @@ class NodeFinder {
         texts: List<String>,
         depthMin: Int,
         depthMax: Int,
+        textRegex: Regex? = null,
     ): NodeHit? {
         val viewId = node.viewIdResourceName.orEmpty()
         val cls = node.className?.toString().orEmpty()
@@ -53,6 +58,7 @@ class NodeFinder {
         val match = inDepth && when {
             ids.isNotEmpty() && ids.none { viewId.contains(it) } -> false
             classes.isNotEmpty() && classes.none { cls.contains(it) } -> false
+            textRegex != null -> textRegex.matches(txt)
             texts.isNotEmpty() && texts.none { txt.contains(it) } -> false
             ids.isEmpty() && classes.isEmpty() && texts.isEmpty() -> false
             else -> true
@@ -63,7 +69,7 @@ class NodeFinder {
         }
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            dfs(child, depth + 1, ids, classes, texts, depthMin, depthMax)?.let { return it }
+            dfs(child, depth + 1, ids, classes, texts, depthMin, depthMax, textRegex)?.let { return it }
         }
         return null
     }
@@ -186,11 +192,15 @@ class NodeFinder {
      * @return 当前窗口树中标记为敏感的节点数（0=非敏感页）
      */
     fun countSensitiveNodes(): Int {
-        if (Build.VERSION.SDK_INT < 33) return 0
+        // v2.9.24：isAccessibilityDataSensitive() 自 API 34（Android 14）起才公开。
+        // 旧门限写成 33，导致 Android 13 设备对**每个节点**都触发一次
+        // NoSuchMethodError（被 runCatching 吞掉，但异常构造本身很贵），
+        // 大节点树页面上探测耗时可放大数倍；这里按真实 API 级别设门限。
+        if (Build.VERSION.SDK_INT < 34) return 0
         val root = AutoClickService.live()?.rootInActiveWindow() ?: return 0
         var count = 0
         fun walk(n: AccessibilityNodeInfo) {
-            // 方法自 API 36 公开；低版本不存在时 NoSuchMethodError 被 runCatching 吞掉
+            // 保留 runCatching：个别 OEM 会在自家 ROM 上裁剪/替换该实现。
             val sensitive = runCatching { n.isAccessibilityDataSensitive }.getOrDefault(false)
             if (sensitive) count++
             for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it) }

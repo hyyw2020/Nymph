@@ -55,23 +55,30 @@ class ScriptGrants(private val dir: File) {
     fun stored(name: String): ScriptGrant = read()[name].toGrant()
 
     /** 生效状态：进程内一次性授权优先于持久化状态。 */
+    // v2.9.35：once 是普通 HashMap，与 grantOnce/clearOnce/persist 跨线程读写，
+    // 统一 @Synchronized 保护，避免丢失更新与可见性问题。
+    @Synchronized
     fun effective(name: String): ScriptGrant = once[name] ?: stored(name)
 
     /** 记录进程内一次性授权。 */
+    @Synchronized
     fun grantOnce(name: String, grant: ScriptGrant) {
         once[name] = grant
     }
 
     /** 清除进程内一次性授权（运行结束后调用，允许下次重新询问）。 */
+    @Synchronized
     fun clearOnce(name: String) {
         once.remove(name)
     }
 
     /** 持久化授权（仅 ALLOW_ALWAYS / DENY_ALWAYS / ASK 有意义）。 */
+    // v2.9.35：read→改→write 三段式此前无锁，两个脚本几乎同时授权时后写覆盖前写；
+    // 配合 AtomicTextFile 的唯一临时名，整体加锁保证 read-modify-write 原子。
+    @Synchronized
     fun persist(name: String, grant: ScriptGrant) {
         val cur = read().toMutableMap()
         if (grant == ScriptGrant.ASK) cur.remove(name) else cur[name] = grant.name
-        // v2.9.0：授权表同样原子写，避免半截 JSON 让「记住的选择」全部丢失。
         AtomicTextFile.write(file, json.encodeToString(Persisted(cur.toMap())))
     }
 
@@ -88,10 +95,15 @@ class ScriptGrants(private val dir: File) {
          * 是否需要在运行前征求授权：脚本（含子动作）中存在 RUN_JS。
          * 纯函数——UI 询问与服务端校验用同一判定，避免两边口径漂移。
          */
-        fun needsConsent(script: Script): Boolean = containsRunJs(script.actions)
+        fun needsConsent(script: Script): Boolean =
+            containsRunJs(script.actions) || containsRunJs(script.listeners.all())
 
         private fun containsRunJs(actions: List<Action>): Boolean = actions.any { a ->
-            a.type == ActionType.RUN_JS || containsRunJs(a.children)
+            a.type == ActionType.RUN_JS
+                || containsRunJs(a.children)
+                // v2.9.35：监听器（10 个时机钩子）里的动作同样可执行 RUN_JS，
+                // 漏遍历会让"回调中挂 JS"的脚本绕过运行前授权直接执行任意代码。
+                || containsRunJs(a.listeners.all())
         }
     }
 }

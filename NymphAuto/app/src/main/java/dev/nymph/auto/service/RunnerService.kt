@@ -8,7 +8,9 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -19,6 +21,8 @@ import android.view.View
 import android.view.WindowManager
 import dev.nymph.auto.NymphApp
 import dev.nymph.auto.R
+import dev.nymph.auto.core.editor.OverlayBounds
+import dev.nymph.auto.core.editor.SceneTrigger
 import dev.nymph.auto.core.importer.ScriptCodec
 import dev.nymph.auto.core.log.RunLog
 import dev.nymph.auto.core.model.Script
@@ -45,12 +49,15 @@ import dev.nymph.auto.runner.RunnerZdjlApi
 import dev.nymph.auto.runner.ScriptRunner
 import dev.nymph.auto.ui.BallPanel
 import dev.nymph.auto.ui.CoordinatePicker
+import dev.nymph.auto.ui.DragDiagnostics
 import dev.nymph.auto.ui.FloatBall
+import dev.nymph.auto.ui.OverlayWindowMetrics
 import dev.nymph.auto.visual.RecognitionSettings
 import dev.nymph.auto.visual.SceneGuardSettings
 import dev.nymph.auto.visual.VisualSettings
 import dev.nymph.auto.visual.VisualizerLayer
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -59,6 +66,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.newSingleThreadContext
 import kotlin.math.abs
 import java.io.File
 
@@ -67,17 +75,32 @@ import java.io.File
  *
  * 录屏兼容性：全程无 MediaProjection；前台通知与悬浮窗均不与录屏会话交互。
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 class RunnerService : Service() {
 
-    enum class State { IDLE, RUNNING, PAUSED }
+    /**
+     * 运行态。与「连接相位」（[dev.nymph.auto.core.runner.ConnectionState]）正交：
+     * PAUSED 仍持有连接但零动作；HALTED 表示已停在某一步且可从未完成处继续；
+     * 归还连接（[handover]）会离开本状态机、回到 IDLE 并释放采集与注入。
+     */
+    enum class State { IDLE, RUNNING, PAUSED, HALTED }
 
     companion object {
         const val ACTION_START = "dev.nymph.auto.action.START"
         const val ACTION_TOGGLE = "dev.nymph.auto.action.TOGGLE"
         const val ACTION_STOP = "dev.nymph.auto.action.STOP"
+
+        /** 归还连接：停止一切采集与注入，回 IDLE。通知栏常驻入口。 */
+        const val ACTION_HANDOVER = "dev.nymph.auto.action.HANDOVER"
+
+        /** 从终止位置继续（HALTED → RUNNING）。 */
+        const val ACTION_RESUME = "dev.nymph.auto.action.RESUME"
         const val EXTRA_SCRIPT_JSON = "script_json"
         const val EXTRA_SCRIPT_NAME = "script_name"
         const val PREFS = "nymphauto"
+
+        /** 已成功跑完过的脚本名集合键（决定「首次运行」预告窗口长度）。 */
+        private const val KEY_COMPLETED = "completed_scripts"
 
         /**
          * 进程内实时状态快照（供 Compose 主界面只读展示）。
@@ -95,7 +118,30 @@ class RunnerService : Service() {
         var liveScriptName: String = ""
             private set
 
-        /** 看门狗轮询间隔 / 判定卡死阈值。长 WAIT 与条件轮询会刷新心跳，不会误杀。 */
+        /**
+         * v2.9.33：离线 OCR 通道不可用告警的进程内一次性标志。避免每次运行都弹提示；
+         * 只在脚本确实依赖文字锚点且两路 OCR 均不可用时提示一次。
+         */
+        @Volatile
+        var ocrUnavailableWarned: Boolean = false
+            private set
+
+        fun markOcrUnavailableWarned() {
+            ocrUnavailableWarned = true
+        }
+
+        /**
+         * ADR-075 裁决 4 收尾：进程内服务实例引用（只内存、不持久化、不进 Script）。
+         * 供同进程的 Compose 工作台在建档进入/退出时调用相机球置位 API。
+         * 服务未启动时为 null——调用方必须判空、静默降级，绝不能因此启动/停止脚本。
+         */
+        @Volatile
+        private var liveInstance: RunnerService? = null
+
+        /** 取当前服务实例；服务未启动返回 null（fail-soft，调用方判空即可）。 */
+        fun live(): RunnerService? = liveInstance
+
+        /** 看门狗轮询间隔 / 判定卡死阈值。长 WAIT 与条件轮询会刷新心跳，不会误判终止。 */
         private const val WATCHDOG_TICK_MS = 5_000L
         private const val WATCHDOG_STALL_MS = 120_000L
 
@@ -124,13 +170,44 @@ class RunnerService : Service() {
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    /**
+     * v2.9.35：脚本执行专用单线程。JS 的 QuickJS runtime 非线程安全且同一实例必须
+     * 单线程调用；此前脚本跑在 Dispatchers.Main，JS 里一个 while(true) 会占死主线程，
+     * 使停止按钮（点击回调派发到主线程）永远无法执行 requestInterrupt。迁到专用线程后：
+     *  - JS 死循环只占该线程，主线程空闲 → 停止可响应 → interrupt（原子标志，任意线程可调）
+     *    能在下一个字节码边界中断 JS；
+     *  - 单线程满足 QuickJS 的线程约定；
+     *  - 所有 UI/面板回调经 [postUi] 切回主线程，避免跨线程操作 View。
+     * 看门狗、状态机、停止链路仍在 [scope]（主线程），不受影响。
+     */
+    private val scriptThread = newSingleThreadContext("nymph-script")
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** 把 UI/面板/通知操作切回主线程；已在主线程则直接执行（幂等）。 */
+    private fun postUi(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) block() else mainHandler.post(block)
+    }
+
     private var script: Script? = null
     private var runner: ScriptRunner? = null
     private var runnerJob: Job? = null
     private var watchdogJob: Job? = null
 
-    /** 本次运行的 QuickJS 原生运行时（停止时中断 + 释放；null=内存引擎）。 */
-    private var quickJs: QuickJsAndroidBinding? = null
+    /**
+     * v2.9.46：运行会话身份守卫。每次启动分配单调 id；停止/交接先失效旧 id，
+     * 使旧协程的 finally / postUi / invokeOnCompletion 中的字段提交全部跳过，
+     * 杜绝「旧收尾破坏新一轮」（关掉新浮层、取消新看门狗、清空新引用、改写新状态）。
+     */
+    private val runToken = dev.nymph.auto.core.runner.RunToken()
+
+    /**
+     * 本次运行的 QuickJS 原生运行时（停止时中断 + 释放；null=内存引擎）。
+     * v2.9.45：跨线程访问（主线程停止链路 / 脚本线程收尾 / completion 兜底），
+     * 标 @Volatile 保证引用可见；真正的 native 销毁集中在脚本协程收尾完成，
+     * 主线程绝不直接 destroy 正在 eval 的 runtime。
+     */
+    @Volatile private var quickJs: QuickJsAndroidBinding? = null
 
     /** 脚本运行授权（三档权限，与 UI 询问同一存储）。 */
     private val grants by lazy { ScriptGrants(File(filesDir, "scripts")) }
@@ -139,6 +216,40 @@ class RunnerService : Service() {
             field = value
             publishLive(value, script?.name.orEmpty())
         }
+
+    /**
+     * 最近的终止报告（null=无）。HALTED 时通知栏与面板共用同一份，避免文案分叉。
+     * 由 ScriptRunner.onHalt 写入；「从这步继续」读取 resumeStep。
+     */
+    private var lastHalt: dev.nymph.auto.core.runner.HaltReport.Report? = null
+
+    /**
+     * v2.9.31：连续「疑似在场」未达阈值的可见告警（null = 无）。
+     * 面板与通知共用同一份文案；运行开始 / 归还 / 停止时清空。
+     */
+    private var suspectNotice: String? = null
+
+    /** 继续时的起始步（0-based，-1=从头）。只在 toggle IDLE 分支消费一次。 */
+    private var pendingResumePc: Int = -1
+
+    /**
+     * 连接相位（v2.9.30）。IDLE→ACQUIRING→OWNED，释放走 RELEASE→IDLE。
+     * 只有 OWNED 允许注入与采集；其余相位 RunnerService 不派发任何动作。
+     */
+    private var phase: dev.nymph.auto.core.runner.ConnectionState.Phase =
+        dev.nymph.auto.core.runner.ConnectionState.Phase.IDLE
+
+    /** 相位迁移的唯一入口：保证 UI 与通知同步刷新。 */
+    private fun movePhase(event: dev.nymph.auto.core.runner.ConnectionState.Event) {
+        val t = dev.nymph.auto.core.runner.ConnectionState.next(phase, event)
+        if (t.ignored) {
+            RunLog.d("Runner", "连接相位忽略事件 ${event.name}（当前 ${phase.name}）")
+            return
+        }
+        phase = t.to
+        RunLog.i("Runner", "连接相位 ${t.from.name} -> ${t.to.name}（${event.name}）")
+        refreshForeground()
+    }
     private lateinit var wm: WindowManager
     private var ball: FloatBall? = null
     private var ballParams: WindowManager.LayoutParams? = null
@@ -147,10 +258,50 @@ class RunnerService : Service() {
     /** 动作可视化层（v2.4.0）；默认关闭时全程为 null，零开销。 */
     private var visualizer: VisualizerLayer? = null
 
+    /**
+     * v2.9.19：显示屏全屏绝对坐标边界缓存。窗口带 `FLAG_LAYOUT_IN_SCREEN |
+     * FLAG_LAYOUT_NO_LIMITS`，其 x/y 与边界收敛必须使用同一坐标空间。
+     * 仅在服务创建、悬浮球创建与配置变更时刷新，拖动热路径不重读。
+     */
+    private var screenW = 1
+    private var screenH = 1
+
     override fun onCreate() {
         super.onCreate()
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        refreshBounds()
+        liveInstance = this
         RunLog.i("Runner", "服务已创建（SDK ${Build.VERSION.SDK_INT}）")
+    }
+
+    private fun refreshBounds() {
+        val size = OverlayWindowMetrics.screenSize(wm)
+        screenW = size.width
+        screenH = size.height
+    }
+
+    /**
+     * v2.9.19：横竖屏切换、折叠屏展开或外接显示切换后，按旧边界下的相对锚点
+     * 重定位运行球与控制面板，再提交布局更新，避免窗口停留在旧坐标导致
+     * 越界不可见。边界未变化时不做任何 relayout。
+     */
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        val previous = OverlayBounds.Size(screenW.coerceAtLeast(1), screenH.coerceAtLeast(1))
+        refreshBounds()
+        val current = OverlayBounds.Size(screenW, screenH)
+        if (previous == current) return
+        val bp = ballParams
+        val b = ball
+        if (bp != null && b != null) {
+            val (nx, ny) = OverlayBounds.reposition(
+                bp.x, bp.y, bp.width, bp.height, previous, current,
+            )
+            bp.x = nx
+            bp.y = ny
+            runCatching { wm.updateViewLayout(b, bp) }
+            layoutPanel(nx, ny)
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -159,6 +310,13 @@ class RunnerService : Service() {
         RunLog.d("Runner", "onStartCommand action=${intent?.action}")
         when (intent?.action) {
             ACTION_START -> {
+                // v2.9.46：运行中不接受新的启动请求——此前会直接覆盖 script 字段，
+                // 让悬浮球指向新脚本而后台仍在跑旧脚本，状态与执行体错位。
+                if (state != State.IDLE) {
+                    RunLog.w("Runner", "忽略启动请求：当前状态 ${state.name}（先停止再启动其它脚本）")
+                    toast("脚本正在运行，请先停止后再启动其它脚本")
+                    return START_NOT_STICKY
+                }
                 val name = intent.getStringExtra(EXTRA_SCRIPT_NAME)
                 val parsed = if (name != null) {
                     RunLog.i("Runner", "从脚本库加载「$name」")
@@ -179,6 +337,26 @@ class RunnerService : Service() {
                 toast("已就绪：${parsed.name}，点悬浮球展开控制面板")
             }
             ACTION_TOGGLE -> toggle()
+            // v2.9.30：通知栏三键之一。归还是「立刻不占读屏」，因此不经过
+            // toggle 的暂停语义（暂停仍持有通道，只是不派发动作）。
+            ACTION_HANDOVER -> {
+                handover()
+                return START_NOT_STICKY
+            }
+            // 「从这步继续」：HALTED 状态下重建执行器并从记录步开始。
+            ACTION_RESUME -> {
+                if (state == State.HALTED) {
+                    lastHalt?.let { report ->
+                        if (report.resumeStep > 0) pendingResumePc = report.resumeStep - 1
+                    }
+                    lastHalt = null
+                    state = State.IDLE
+                    toggle()
+                } else {
+                    RunLog.d("Runner", "忽略继续请求：当前 ${state.name}")
+                }
+                return START_NOT_STICKY
+            }
             ACTION_STOP -> {
                 stopAll()
                 return START_NOT_STICKY
@@ -189,9 +367,21 @@ class RunnerService : Service() {
     }
 
     override fun onDestroy() {
+        if (liveInstance === this) liveInstance = null
         visualizer?.close()
         visualizer = null
+        // v2.9.35：系统直接回收服务（不走 stopAll）时，浮窗与前台通知此前不清理，
+        // 造成窗口泄漏/通知残留。这里兜底移除全部窗口并撤前台。
+        panel?.let { v -> runCatching { wm.removeView(v) } }
+        panel = null
+        panelParams = null
+        ball?.let { v -> runCatching { wm.removeView(v) } }
+        ball = null
+        ballParams = null
+        stopForegroundCompat()
         scope.cancel()
+        // v2.9.35：释放脚本专用线程（否则其线程与 Looper 长期存活）。
+        scriptThread.close()
         super.onDestroy()
     }
 
@@ -225,7 +415,7 @@ class RunnerService : Service() {
                 panel?.setTier(CapabilityMatrix.describe(tier))
                 RunLog.i("Runner", "能力矩阵定档：${CapabilityMatrix.describe(tier)}")
                 if (tier == CapabilityTier.UNAVAILABLE) {
-                    // AAPM 开启或无无障碍：诚实告知，不做任何绕过（裁定：架构不可用）
+                    // AAPM 开启或无无障碍：明确告知，不做任何绕过（裁定：架构不可用）
                     val why = if (cap.aapmEnabled) {
                         "高级保护模式（AAPM）已开启，自动化工具无豁免，请关闭后重试"
                     } else {
@@ -235,10 +425,38 @@ class RunnerService : Service() {
                     toast(why)
                     return
                 }
-                // ---- OCR（ONNX Runtime 离线优先 / ML Kit GMS 兜底）+ AI 检测 ----
+                // ---- v2.9.25 场景模板前置检查 ----
+                // 场景驱动脚本里，没有画面模板的规则运行期一律 fail-closed。全部规则
+                // 都没有模板时，runSceneDriven 会在第一帧立刻中止 —— 此前仍会起服务、
+                // 建悬浮球、定档能力矩阵、加载 OCR，然后界面闪一下「已结束」，用户看到
+                // 的是「点了运行，什么都没发生」。现在在消耗任何资源之前就把结论讲清楚。
+                if (s.sceneDriven) {
+                    val triggerable = SceneTrigger.triggerableCount(s.actions)
+                    if (triggerable == 0) {
+                        RunLog.e(
+                            "Runner",
+                            "已拦截：场景驱动脚本共 ${s.actions.size} 条规则，可用画面模板 0 条（fail-closed 必然不触发）",
+                        )
+                        toast("这个脚本没有可用的场景模板，运行不会产生任何动作。请在悬浮编辑器中重新拾取坐标后再试")
+                        return
+                    }
+                }
+                // ---- OCR（ONNX Runtime 离线优先 / ML Kit bundled 静态打包兜底）+ AI 检测 ----
                 // 均为可选通道：不可用时 VisionPipeline 内部降级，不影响其他能力。
                 // 提前到预检之前创建，供 EnvironmentSnapshot.aiSupported 判定。
                 val ocr = OcrEngineFactory.create(this@RunnerService)
+                // v2.9.33：离线 OCR 通道需用户自备可插拔模型，未就绪时静默回退会让
+                // 文字锚点脚本失效而用户不知情。仅当脚本确实用到文字锚点、且两路 OCR
+                // 均不可用时，做一次可见告警（toast + 运行日志），说明降级影响与补齐
+                // 方式；进程内只弹一次，不打扰无关脚本。ML Kit bundled 通道随包可用，
+                // 故"两路皆不可用"只出现在极端构造失败场景，文案不臆测 GMS 状态。
+                if (!ocr.available && s.dependsOnText() && !ocrUnavailableWarned) {
+                    val msg = "本脚本含文字识别步骤，但 OCR 通道未就绪（可插拔模型未检测到，bundled 引擎亦不可用）：" +
+                        "文字锚点可能匹配失败。可在应用文件目录的 ocr/ 下放置 det.onnx / rec.onnx / keys.txt 启用离线通道。"
+                    RunLog.w("Runner", msg)
+                    toast(msg)
+                    markOcrUnavailableWarned()
+                }
                 val aiDetector = AiDetector(this)
                 // ---- 预检（裁定阶段 3.1）：跑之前就知道缺什么，不匹配即拦截 ----
                 val report = Preflight.check(
@@ -249,11 +467,15 @@ class RunnerService : Service() {
                         screenWidth = f.width,
                         screenHeight = f.height,
                         screenRotation = f.rotation,
-                        installedPackages = launchablePackages(s),
+                        installedPackages = installedPackages(s),
+                        packageVisibilityRestricted = Build.VERSION.SDK_INT >= 30,
                         aapmEnabled = cap.aapmEnabled,
                         aiSupported = aiDetector.available,
                     ),
                 )
+                if (report.warnings.isNotEmpty()) {
+                    RunLog.w("Runner", "预检提示（不拦截）：${report.warningsText()}")
+                }
                 if (!report.ok) {
                     RunLog.e("Runner", "预检拦截：${report.explain()}")
                     toast(report.explain())
@@ -261,6 +483,10 @@ class RunnerService : Service() {
                     return
                 }
                 RunLog.i("Runner", "开始执行「${s.name}」（屏幕 ${f.width}x${f.height}，档位 $tier）")
+                // v2.9.30：新一轮运行清空上一次的终止报告，否则「继续」会读到旧步号。
+                lastHalt = null
+                panel?.setHalt(null)
+                movePhase(dev.nymph.auto.core.runner.ConnectionState.Event.Acquire)
                 // 坐标拾取是全屏可触摸模态层，若残留会混进 takeScreenshot 污染找图。
                 // 回放启动即强制关闭（幂等），保证截图帧里没有编辑器浮层。
                 CoordinatePicker.dismiss()
@@ -268,6 +494,15 @@ class RunnerService : Service() {
                 // 注入屏幕边界：手势坐标（含 jitter / 拟人抖动 / 贝塞尔控制点）
                 // 统一钳制在屏内，杜绝负 Path bounds 打断脚本（v2.2.0 真机修复）。
                 gesture.setScreenBounds(f.width, f.height)
+                // v2.9.29：注入系统手势热区。落点落在返回 / Home 热区时，
+                // 系统会静默消费触摸而 dispatchGesture 仍返回成功——不收敛就会
+                // 出现「日志显示已点击、界面没反应」。滑动不做内移，见 GestureEngine。
+                gesture.setEdgeInsets(
+                    runCatching { AutoClickService.live()?.gestureInsets() }.getOrNull()
+                        ?: dev.nymph.auto.core.vision.EdgeSafety.fallback(
+                            resources.displayMetrics.density,
+                        ),
+                )
                 // ---- 动作可视化（v2.4.0）----
                 // 只依赖 Context + WindowManager 的独立组件，零录屏权限。
                 // 默认关闭时 start() 内部不 addView，configProvider 每动作读一次，
@@ -312,7 +547,12 @@ class RunnerService : Service() {
                 // 可视化接线：配置由 SharedPreferences 实时读，cue 出口指向叠加层。
                 // 两项都可空/可关，关闭时 ScriptRunner 的 visualize() 首行即返回。
                 r.visualConfigProvider = { VisualSettings.load(this@RunnerService) }
-                r.onVisualCue = { cue -> visualizer?.onCue(cue) }
+                r.onVisualCue = { cue -> postUi { visualizer?.onCue(cue) } }
+                // 场景规则诊断覆盖层（每规则 ROI 框 + 命中状态 + 落点 + 序号），
+                // 复用同一 overlay 窗口，零新增权限。
+                // v2.9.16：回调恒定挂载；是否绘制由 VisualizerLayer 依据独立开关
+                // sceneDebugEnabled 判定，不再依赖「动作可视化」总开关。
+                r.onSceneDebug = { boxes -> postUi { visualizer?.onSceneDebug(boxes) } }
                 // v2.5.0：回放前界面校验，避免动作打在错误界面上还报成功。
                 // 老脚本无起始包名会自动跳过；关闭开关可退回旧行为。
                 r.sceneGuardEnabled = SceneGuardSettings.load(this@RunnerService)
@@ -325,11 +565,25 @@ class RunnerService : Service() {
                 r.retryWindowMs = tuning.retryWindowMs
                 r.debugDumpDir = File(filesDir, "debug")
                 r.capabilityTier = tier
+                // v2.9.31：新一轮运行清空上一轮的模板失效告警。
+                suspectNotice = null
+                panel?.setSuspect("")
                 // 等待浮层（裁定阶段 3.5）：主界面只显示"正在等待 X Ns / Ms"
-                r.onWaitStatus = { st -> panel?.setWait(st) }
+                r.onWaitStatus = { st -> postUi { panel?.setWait(st) } }
+                // v2.9.31：「疑似在场」升级为面板 + 通知可见状态，不静默轮询。
+                r.onSuspectedPresent = { msg ->
+                    postUi {
+                        suspectNotice = msg
+                        panel?.setSuspect(msg)
+                        RunLog.w("Runner", "疑似在场持续未触发：$msg")
+                        refreshForeground()
+                    }
+                }
                 // 四类归因（裁定阶段 4）：按类给出对应动作，并定位到失败步
                 r.onFail = { reason, msg, step ->
-                    val where = if (step > 0) "第 $step 步 · " else ""
+                    // v2.9.14：中性话术——场景驱动下 step 是命中的规则下标，
+                    // 顺序链下是顶层动作号；统一「第 N 条」不再引入「步」概念。
+                    val where = if (step > 0) "第 $step 条 · " else ""
                     RunLog.e("Script", "[${reason.label}] $where$msg")
                     toast("$where${reason.label}：${reason.action}")
                 }
@@ -343,10 +597,30 @@ class RunnerService : Service() {
                     RunLog.w("Runner", "界面提示：$msg")
                     toast(msg)
                 }
+                // ---- v2.9.30 预告 / 终止 / 续跑 ----
+                // 首次运行 = 该脚本从未成功跑完过（持久化事实，不是启发式猜测）。
+                r.firstRun = !completedScripts().contains(s.name)
+                // 从终止位置继续：pendingResumePc 为 0-based，-1 表示从头。
+                r.resumeFromPc = pendingResumePc.coerceAtLeast(0).also { pendingResumePc = -1 }
+                r.onNext = { text -> postUi { panel?.setNext(text) } }
+                r.onAnnounce = { d, msg ->
+                    postUi { panel?.showUndo(d.undoWindowMs) }
+                    RunLog.i("Runner", "预告[${d.level}] $msg（${d.reason}）")
+                    toast(msg)
+                }
+                r.onHalt = { rep -> postUi { onHalt(rep) } }
+                // v2.9.46：分配本次运行的会话身份。下面所有延迟收尾（finally / postUi /
+                // invokeOnCompletion）都捕获 myRunId，只有它仍是 current 时才提交字段与状态。
+                val myRunId = runToken.next()
                 runner = r
                 state = State.RUNNING
+                movePhase(dev.nymph.auto.core.runner.ConnectionState.Event.Acquired)
                 startWatchdog()
-                runnerJob = scope.launch {
+                // v2.9.46：捕获本轮看门狗的局部引用，收尾时无条件取消自己那份——
+                // 既不让旧看门狗泄漏空转，也不会误取消新一轮的看门狗。
+                val myWatchdog = watchdogJob
+                // v2.9.35：脚本跑在专用线程，JS 死循环不再冻结主线程，停止按钮可响应。
+                runnerJob = scope.launch(scriptThread) {
                     val ok = try {
                         r.run(s)
                     } catch (e: CancellationException) {
@@ -359,13 +633,25 @@ class RunnerService : Service() {
                         toast("执行异常：${e.message}")
                         false
                     } finally {
-                        stopWatchdog()
-                        // 可视化层：移除窗口、注销帧回调、清空活跃 cue（停帧）
-                        visualizer?.close()
-                        visualizer = null
-                        // 原生运行时随本次运行创建、随本次运行释放（防止多轮累积泄漏）
+                        // v2.9.46：本轮资源一律释放（用局部引用，无条件，防泄漏）。
+                        // 但对共享字段的改写只在「本轮仍是当前运行」时提交——否则会破坏
+                        // 用户已开启的新一轮（关掉新浮层 / 清空新 runtime / 取消新看门狗）。
+                        val isCurrentRun = runToken.isCurrent(myRunId)
+                        myWatchdog?.cancel() // 无条件取消本轮看门狗；字段置空下面守卫
+                        if (isCurrentRun && this@RunnerService.watchdogJob === myWatchdog) {
+                            this@RunnerService.watchdogJob = null
+                        }
+                        // 可视化层：移除窗口、注销帧回调、清空活跃 cue（停帧）。用局部 vis，
+                        // 绝不 close 字段——字段此时可能已指向新一轮的浮层。
+                        vis.close()
+                        if (isCurrentRun && this@RunnerService.visualizer === vis) {
+                            this@RunnerService.visualizer = null
+                        }
+                        // 原生运行时随本次运行创建、随本次运行释放（局部引用，无条件）。
                         quickJs?.dispose()
-                        this@RunnerService.quickJs = null
+                        if (isCurrentRun && this@RunnerService.quickJs === quickJs) {
+                            this@RunnerService.quickJs = null
+                        }
                         // OCR/AI 会话同理：识别器与检测器随本次运行关闭
                         ocr.close()
                         aiDetector.close()
@@ -376,14 +662,49 @@ class RunnerService : Service() {
                             grants.clearOnce(s.name)
                         }
                     }
-                    runner = null
-                    runnerJob = null
-                    state = State.IDLE
-                    panel?.setWait(null)
-                    RunLog.i("Runner", if (ok) "脚本执行完毕" else "脚本执行结束（未跑完）")
-                    if (ok) toast("脚本执行完毕")
-                    updateBall()
-                    refreshForeground()
+                    // v2.9.46：runner/runnerJob 字段同样只在当前运行收尾时清空。
+                    if (runToken.isCurrent(myRunId)) {
+                        runner = null
+                        runnerJob = null
+                    }
+                    // v2.9.35：脚本运行在专用线程，收尾涉及 View/状态/通知的段落统一
+                    // 切回主线程，保持与迁移前（全程主线程）完全一致的执行语义。
+                    postUi {
+                        // v2.9.46：旧收尾的 UI/状态提交不得覆盖新一轮。
+                        if (!runToken.isCurrent(myRunId)) return@postUi
+                        panel?.setNext("")
+                        panel?.setWait(null)
+                        // v2.9.30：有可恢复的终止报告 → 停在 HALTED，「从这步继续」才有落点；
+                        // 正常跑完或不可恢复（脚本自身错误/看门狗）则回 IDLE 并清空报告。
+                        val halt = lastHalt
+                        state = if (halt != null && halt.resumable) State.HALTED else State.IDLE
+                        if (halt == null || !halt.resumable) {
+                            panel?.setHalt(null)
+                            lastHalt = null
+                        }
+                        // 释放连接相位：一次运行结束不再持有注入与采集。
+                        movePhase(dev.nymph.auto.core.runner.ConnectionState.Event.Release)
+                        movePhase(dev.nymph.auto.core.runner.ConnectionState.Event.Settled)
+                        RunLog.i("Runner", if (ok) "脚本执行完毕" else "脚本执行结束（未跑完）")
+                        if (ok) {
+                            markCompleted(s.name)
+                            toast("脚本执行完毕")
+                        }
+                        updateBall()
+                        refreshForeground()
+                    }
+                // v2.9.45：原生 runtime 释放兜底。脚本线程的 finally 是正常释放路径；
+                // 本回调覆盖「协程尚未启动即被取消、finally 未执行」的边界。两条路径
+                // 都走 QuickJsAndroidBinding.dispose() 的原子一次性句柄，重复调用安全。
+                // 捕获本次运行的局部 quickJs（而非字段），避免误伤下一轮新建的运行时。
+                }.also { job ->
+                    job.invokeOnCompletion {
+                        // 局部 quickJs 无条件释放（幂等），字段置空仅在仍是当前运行时提交。
+                        quickJs?.dispose()
+                        if (runToken.isCurrent(myRunId) && this@RunnerService.quickJs === quickJs) {
+                            this@RunnerService.quickJs = null
+                        }
+                    }
                 }
             }
             State.RUNNING -> {
@@ -395,6 +716,18 @@ class RunnerService : Service() {
                 runner?.paused?.value = false
                 state = State.RUNNING
                 RunLog.i("Runner", "已继续")
+            }
+            State.HALTED -> {
+                // 面板主按钮在 HALTED 下是「从这步继续」，与通知栏 action 同语义。
+                val report = lastHalt
+                if (report != null && report.resumeStep > 0) {
+                    pendingResumePc = report.resumeStep - 1
+                }
+                lastHalt = null
+                state = State.IDLE
+                panel?.setHalt(null)
+                toggle()
+                return
             }
         }
         vibrate(30L)
@@ -423,9 +756,21 @@ class RunnerService : Service() {
      * 目标应用可启动性探测（包可见性过滤后仍准确：OPEN_APP 只需要能启动）。
      * 不可启动的包名（未安装/不可见）会在预检里被拦下并说明。
      */
-    private fun launchablePackages(s: Script): Set<String> = runCatching {
+    /**
+     * v2.9.27：判定「包是否存在」，不再用「能否取得 launcher Intent」冒充已安装。
+     *
+     * 旧实现把「没有启动入口」翻译成「没有安装」：本应用 <queries> 只声明
+     * ACTION_MAIN，游戏助手 / 覆盖层类应用没有 launcher 入口或不在可见范围，
+     * getLaunchIntentForPackage 返回 null，于是一个明明装着的包被判未安装，
+     * 预检拦下整个录制脚本（v1.2.1 同类问题、v2.9.27 现场回归）。现在以
+     * getPackageInfo 存在性为准，launch intent 仅作兜底。
+     */
+    private fun installedPackages(s: Script): Set<String> = runCatching {
         val pm = packageManager
-        s.dependencies().packages.filter { pm.getLaunchIntentForPackage(it) != null }.toSet()
+        s.dependencies().packages.filter { pkg ->
+            runCatching { pm.getPackageInfo(pkg, 0); true }.getOrDefault(false) ||
+                pm.getLaunchIntentForPackage(pkg) != null
+        }.toSet()
     }.getOrDefault(emptySet())
 
     // ------------------------------------------------------------ 前台通知
@@ -446,10 +791,26 @@ class RunnerService : Service() {
             Intent(this, RunnerService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
+        // v2.9.30：归还连接。切到任何界面都够得着——这正是「随时可收回」的落点，
+        // 悬浮面板在目标应用全屏时可能被遮、也可能被系统限制，通知栏不会。
+        val handover = PendingIntent.getService(
+            this, 4,
+            Intent(this, RunnerService::class.java).setAction(ACTION_HANDOVER),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        // 从终止位置继续（仅 HALTED 时有意义）。
+        val resume = PendingIntent.getService(
+            this, 5,
+            Intent(this, RunnerService::class.java).setAction(ACTION_RESUME),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
         val s = script
         val text = when {
+            suspectNotice != null && state == State.RUNNING ->
+                "模板可能失效 · 点通知回到应用重新拾取"
             state == State.RUNNING -> "执行中：${s?.name ?: ""}"
             state == State.PAUSED -> "已暂停：${s?.name ?: ""}"
+            state == State.HALTED -> lastHalt?.shortText ?: "已停止"
             s != null -> "已就绪：${s.name} · 点悬浮球开始"
             else -> "NymphAuto"
         }
@@ -458,15 +819,35 @@ class RunnerService : Service() {
         } else {
             @Suppress("DEPRECATION") Notification.Builder(this)
         }
-        val n = builder
+        // 三键常驻：暂停/继续（或恢复）、归还连接、停止。
+        // 顺序按「最常用 → 最收束」，用户在任何界面下拉通知即可收回控制。
+        val primaryLabel = when (state) {
+            State.RUNNING -> "暂停"
+            State.PAUSED -> "继续"
+            State.HALTED -> "从这步继续"
+            State.IDLE -> "开始"
+        }
+        val primaryIntent = if (state == State.HALTED) resume else toggle
+        builder
             .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle("NymphAuto")
             .setContentText(text)
             .setOngoing(true)
             .setContentIntent(open)
-            .addAction(Notification.Action.Builder(null, if (state == State.RUNNING) "暂停" else "继续", toggle).build())
+            .addAction(Notification.Action.Builder(null, primaryLabel, primaryIntent).build())
+            .addAction(Notification.Action.Builder(null, "归还连接", handover).build())
             .addAction(Notification.Action.Builder(null, "停止", stop).build())
-            .build()
+        // v2.9.31：仅当「疑似在场」持续未触发时追加第四键。点击回到主界面，
+        // 由用户重新拾取锚点 —— 复用既有 open Intent，零新增权限、零新 Activity。
+        if (suspectNotice != null) {
+            val repick = PendingIntent.getActivity(
+                this, 6,
+                Intent(this, dev.nymph.auto.ui.MainActivity::class.java),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            builder.addAction(Notification.Action.Builder(null, "重新拾取", repick).build())
+        }
+        val n = builder.build()
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
@@ -478,6 +859,7 @@ class RunnerService : Service() {
 
     private fun showBall() {
         if (ball != null) return
+        refreshBounds()
         if (!Settings.canDrawOverlays(this)) {
             RunLog.e("Runner", "悬浮窗权限缺失，无法创建悬浮球")
             toast("缺少悬浮窗权限")
@@ -488,13 +870,20 @@ class RunnerService : Service() {
         val p = WindowManager.LayoutParams().apply {
             type = overlayType()
             format = PixelFormat.TRANSLUCENT
+            // v2.9.18：补齐 FLAG_LAYOUT_IN_SCREEN|FLAG_LAYOUT_NO_LIMITS，与坐标拾取器
+            // 窗口配置对齐。缺这两项时，OEM ROM / 游戏空间下悬浮窗的视觉位置与触摸命中
+            // 区域会错位，表现为悬浮窗可见但位移交互未生效；补上后运行球以全屏绝对坐标布局，
+            // 触摸落点回到窗口本体。拖动逻辑（attachBallTouch 的 updateViewLayout）不变。
             flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
             width = dp(52)
             height = dp(52)
             gravity = Gravity.TOP or Gravity.START
-            x = (resources.displayMetrics.widthPixels - dp(72)).coerceAtLeast(0)
-            y = resources.displayMetrics.heightPixels / 3
+            // v2.9.19：初始位置与边界收敛使用同一全屏绝对坐标真源。
+            x = (screenW - dp(72)).coerceAtLeast(0)
+            y = screenH / 3
         }
         attachBallTouch(v, p)
         runCatching { wm.addView(v, p) }.onFailure {
@@ -516,8 +905,11 @@ class RunnerService : Service() {
         val pp = WindowManager.LayoutParams().apply {
             type = overlayType()
             format = PixelFormat.TRANSLUCENT
+            // v2.9.18：与运行球同款补齐布局坐标空间标志（见上方说明）。
             flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
             width = dp(112)
             height = WindowManager.LayoutParams.WRAP_CONTENT
             gravity = Gravity.TOP or Gravity.START
@@ -538,12 +930,16 @@ class RunnerService : Service() {
     private fun layoutPanel(ballX: Int, ballY: Int) {
         val p = panelParams ?: return
         val v = panel ?: return
-        val dm = resources.displayMetrics
         // 高度含能力档位行与等待浮层行（5 行）
         val panelH = dp(200)
-        p.x = ballX.coerceIn(0, (dm.widthPixels - p.width).coerceAtLeast(0))
-        p.y = if (ballY + dp(56) + panelH <= dm.heightPixels) ballY + dp(56)
+        val preferredY = if (ballY + dp(56) + panelH <= screenH) ballY + dp(56)
         else (ballY - panelH - dp(8)).coerceAtLeast(0)
+        // v2.9.19：边界收敛统一走全屏绝对坐标契约，与运行球、编辑面板一致。
+        val (cx, cy) = OverlayBounds.clamp(
+            ballX, preferredY, p.width, panelH, OverlayBounds.Size(screenW, screenH),
+        )
+        p.x = cx
+        p.y = cy
         runCatching { wm.updateViewLayout(v, p) }
     }
 
@@ -557,6 +953,25 @@ class RunnerService : Service() {
         if (p.visibility == View.VISIBLE) layoutPanel(ballParams?.x ?: 0, ballParams?.y ?: 0)
     }
 
+    /**
+     * ADR-075 / 裁决 4 + 收尾：进入编辑建档态——把运行球切为相机语义（全局常驻）。
+     * 球未显示时先按需创建；悬浮窗权限缺失/添加失败由 [showBall] 内部 toast + 静默降级，
+     * 绝不抛异常、绝不启动/停止脚本。点球只调 [onCapture]（抓帧），不再展开面板/启停。
+     * 建档结束必须调用 [exitEditCameraMode] 复位，绝不把 EDIT_CAMERA 泄漏到运行态。
+     */
+    fun enterEditCameraMode(onCapture: () -> Unit) {
+        if (ball == null) showBall()
+        val v = ball ?: return
+        v.onCapture = onCapture
+        v.setMode(FloatBall.Mode.EDIT_CAMERA)
+        hidePanel()
+    }
+
+    /** ADR-075 / 裁决 4：退出建档态立即复位 RUN_STATUS 并清空抓帧回调，恢复球启停。 */
+    fun exitEditCameraMode() {
+        ball?.setMode(FloatBall.Mode.RUN_STATUS)
+    }
+
     private fun attachBallTouch(v: FloatBall, p: WindowManager.LayoutParams) {
         var downRawX = 0f
         var downRawY = 0f
@@ -565,6 +980,8 @@ class RunnerService : Service() {
         var moved = false
         var longPressed = false
         val longPressRunnable = Runnable {
+            // ADR-075 裁决 4：编辑建档态下长按也绝不停脚本（互斥标志隔离启停）。
+            if (v.currentMode() == FloatBall.Mode.EDIT_CAMERA) return@Runnable
             longPressed = true
             vibrate(60L)
             RunLog.i("Runner", "长按悬浮球：停止并关闭")
@@ -574,6 +991,7 @@ class RunnerService : Service() {
         v.setOnTouchListener { _, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    DragDiagnostics.onDown(DragDiagnostics.Target.RUNNER_BALL)
                     downRawX = e.rawX
                     downRawY = e.rawY
                     offX = p.x - e.rawX
@@ -584,27 +1002,44 @@ class RunnerService : Service() {
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
+                    DragDiagnostics.onMove(DragDiagnostics.Target.RUNNER_BALL)
                     if (abs(e.rawX - downRawX) > dp(8) || abs(e.rawY - downRawY) > dp(8)) {
                         moved = true
                         v.removeCallbacks(longPressRunnable)
-                        // v2.9.4：旧版无边界收敛，球可被拖出屏幕后永久失联
+                        // v2.9.4：旧版无边界收敛，球可被拖出屏幕后越界不可见
                         // （gravity=TOP|START，x/y 即左上偏移）。与录制面板同理 clamp。
-                        val dm = resources.displayMetrics
-                        p.x = (e.rawX + offX).toInt()
-                            .coerceIn(0, (dm.widthPixels - p.width).coerceAtLeast(0))
-                        p.y = (e.rawY + offY).toInt()
-                            .coerceIn(0, (dm.heightPixels - p.height).coerceAtLeast(0))
+                        // v2.9.19：e.rawX/rawY 为全屏绝对坐标，边界收敛必须取同一
+                        // 坐标空间的窗口指标真源，不再使用应用窗口可用区尺寸。
+                        val bx = p.x
+                        val by = p.y
+                        val (cx, cy) = OverlayBounds.clamp(
+                            (e.rawX + offX).toInt(), (e.rawY + offY).toInt(),
+                            p.width, p.height, OverlayBounds.Size(screenW, screenH),
+                        )
+                        p.x = cx
+                        p.y = cy
                         runCatching { wm.updateViewLayout(v, p) }
+                        // v2.9.17 / D3：旁路记录本次提交前后坐标，不改变位移逻辑。
+                        DragDiagnostics.onCommit(DragDiagnostics.Target.RUNNER_BALL, bx, by, p.x, p.y)
                         layoutPanel(p.x, p.y)
                     }
                     true
                 }
                 MotionEvent.ACTION_UP -> {
+                    DragDiagnostics.onEnd(DragDiagnostics.Target.RUNNER_BALL)
                     v.removeCallbacks(longPressRunnable)
-                    if (!moved && !longPressed) togglePanel()
+                    if (!moved && !longPressed) {
+                        // ADR-075 裁决 4：编辑建档态点球只抓帧，绝不展开面板/触发启停。
+                        if (v.currentMode() == FloatBall.Mode.EDIT_CAMERA) {
+                            v.onCapture?.invoke()
+                        } else {
+                            togglePanel()
+                        }
+                    }
                     true
                 }
                 MotionEvent.ACTION_CANCEL -> {
+                    DragDiagnostics.onEnd(DragDiagnostics.Target.RUNNER_BALL, wasCancelled = true)
                     v.removeCallbacks(longPressRunnable)
                     true
                 }
@@ -627,7 +1062,7 @@ class RunnerService : Service() {
      * 长时间不返回；用户看到的现象是悬浮球一直在转、脚本却永远停在同一步。
      * 这里以 [ScriptRunner.lastProgressAt] 为心跳：连续 [WATCHDOG_STALL_MS]
      * 没有任何动作推进（且不处于暂停、不在等待条件）才判定卡死并停止，
-     * 避免把长 WAIT / 长条件轮询误杀——那两类在 ScriptRunner 里都会刷新心跳。
+     * 避免将长 WAIT / 长条件轮询误判终止——那两类在 ScriptRunner 里都会刷新心跳。
      *
      * 这是兜底而非主路径：正常脚本永远不会触发。触发时保留最后一步描述，
      * 让用户知道卡在哪，而不是只看到「停止了」。
@@ -656,19 +1091,110 @@ class RunnerService : Service() {
         watchdogJob = null
     }
 
+    /**
+     * 收到终止报告：把「为什么停 / 停在哪 / 能做什么」同时写进日志、面板与通知。
+     *
+     * 停在 HALTED 而不是直接回 IDLE，是因为用户此刻通常不在本应用界面——
+     * 通知栏会保留「从这步继续」，回来时不必从头再跑或重新授权。
+     */
+    private fun onHalt(rep: dev.nymph.auto.core.runner.HaltReport.Report) {
+        lastHalt = rep
+        state = if (rep.resumable) State.HALTED else State.IDLE
+        RunLog.w("Runner", "终止：${rep.headline}｜${rep.detail}")
+        suspectNotice = null
+        panel?.setSuspect("")
+        panel?.setWait(null)
+        panel?.setNext("")
+        panel?.setHalt(rep)
+        toast(rep.shortText)
+        updateBall()
+        refreshForeground()
+    }
+
+    /** 已成功跑完过的脚本名集合。读失败按空集处理（等价于「首次运行」，更保守）。 */
+    private fun completedScripts(): Set<String> = runCatching {
+        getSharedPreferences(PREFS, MODE_PRIVATE).getStringSet(KEY_COMPLETED, emptySet())
+            ?.toSet()
+            .orEmpty()
+    }.getOrDefault(emptySet())
+
+    /** 记录一次成功跑完，供下次判定「首次运行」。 */
+    private fun markCompleted(name: String) {
+        if (name.isBlank()) return
+        runCatching {
+            val cur = completedScripts().toMutableSet()
+            if (cur.add(name)) {
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putStringSet(KEY_COMPLETED, cur).apply()
+            }
+        }
+    }
+
+    /**
+     * 归还连接（v2.9.30）。
+     *
+     * 与暂停的区别是**是否继续占用通道**：暂停保留连接、只是不派发动作；
+     * 归还立即停止采集与注入，把相位收束到 RELEASE 再回 IDLE。
+     *
+     * 边界（如实说明，不美化）：无障碍通道由系统持有，本应用无法像 Shizuku 的
+     * `disconnect()` 那样真正解绑系统服务。因此这里的「归还」精确含义是
+     * **本进程不再读屏、不再截图、不再注入**；系统设置里的服务开关保持开启，
+     * 以免用户每次都要回设置重开。状态卡与文案不得写成「已断开系统服务」。
+     */
+    private fun handover() {
+        RunLog.i("Runner", "归还连接：停止采集与注入，回 IDLE")
+        // v2.9.46：先让旧会话失效，旧协程收尾的字段写会被守卫跳过；随后用户可立刻
+        // 开启新一轮，不会被这次收尾破坏。资源释放仍在旧协程 finally 里无条件完成。
+        runToken.invalidate()
+        movePhase(dev.nymph.auto.core.runner.ConnectionState.Event.Release)
+        // 先让执行器停在检查点，再取消，避免注入链路在取消瞬间仍持有通道。
+        runner?.paused?.value = true
+        // v2.9.45：只发中断 + 取消协程。native runtime 的销毁交给脚本线程 finally
+        // 与 invokeOnCompletion 兜底，主线程绝不 dispose 正在 eval 的 runtime（UAF）。
+        quickJs?.requestStop()
+        stopWatchdog() // v2.9.46：同步取消本轮看门狗（旧协程 finally 还会用局部引用兜底 cancel）
+        runnerJob?.cancel()
+        runnerJob = null
+        runner = null
+        quickJs = null
+        visualizer?.close()
+        visualizer = null
+        lastHalt = dev.nymph.auto.core.runner.HaltReport.handedOver()
+        suspectNotice = null
+        state = State.IDLE
+        panel?.setSuspect("")
+        panel?.setWait(null)
+        panel?.setNext("")
+        panel?.setHalt(lastHalt)
+        movePhase(dev.nymph.auto.core.runner.ConnectionState.Event.Settled)
+        toast("已归还连接，不再占用读屏")
+        updateBall()
+        refreshForeground()
+    }
+
     private fun stopAll() {
         RunLog.i("Runner", "停止运行并关闭悬浮球")
+        // v2.9.46：先失效旧会话，旧收尾的字段提交全部跳过，允许立即重新运行。
+        runToken.invalidate()
+        movePhase(dev.nymph.auto.core.runner.ConnectionState.Event.Release)
+        lastHalt = null
+        suspectNotice = null
+        panel?.setSuspect("")
+        panel?.setNext("")
+        panel?.setHalt(null)
         // 可视化层：与 ball/panel 一起清理，避免服务停止后残留浮层
         visualizer?.close()
         visualizer = null
         // 先中断正在执行的 JS（指令级），再取消协程——否则 JS 死循环
-        // 会挡住取消检查点，停止按钮无响应
-        quickJs?.requestInterrupt()
-        quickJs?.dispose()
-        quickJs = null
+        // 会挡住取消检查点，停止按钮无响应。
+        // v2.9.45：主线程只中断 + 取消，不直接 dispose 正在 eval 的 native runtime；
+        // 销毁由脚本协程 finally + invokeOnCompletion 幂等兜底，杜绝 UAF / double-free。
+        quickJs?.requestStop()
+        stopWatchdog() // v2.9.46：同步取消本轮看门狗（旧协程 finally 还会用局部引用兜底 cancel）
         runnerJob?.cancel()
         runnerJob = null
         runner = null
+        quickJs = null
         state = State.IDLE
         panel?.let { runCatching { wm.removeView(it) } }
         panel = null
@@ -678,6 +1204,10 @@ class RunnerService : Service() {
             ball = null
             ballParams = null
         }
+        // v2.9.35：此前先撤前台再 movePhase(Settled)，而 movePhase 末尾会
+        // refreshForeground→startForeground 又把前台挂回，导致服务销毁后通知残留。
+        // 调换顺序：先让状态机收尾（如需前台则在此刷新），最后统一撤掉前台。
+        movePhase(dev.nymph.auto.core.runner.ConnectionState.Event.Settled)
         stopForegroundCompat()
         stopSelf()
     }
@@ -721,6 +1251,11 @@ class RunnerService : Service() {
     }
 
     private fun toast(msg: String) {
-        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+        // v2.9.35：脚本迁到专用线程后，脚本内回调（onFail/onAbnormal/zdjl.toast 等）
+        // 也会走这里；Toast 必须在有 Looper 的主线程构造。postUi 幂等，主线程路径
+        // 保持同步，脚本线程路径自动切回，一并修复"zdjl.toast 静默失效"。
+        postUi {
+            android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+        }
     }
 }

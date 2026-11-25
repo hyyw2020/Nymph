@@ -35,7 +35,10 @@ class LogActivity : Activity() {
     private lateinit var tvCrash: TextView
     private var adapter: ArrayAdapter<String>? = null
 
-    private val onEntry: (LogEntry) -> Unit = { refresh() }
+    // v2.9.35：RunLog 监听器在写日志的线程（可能是脚本线程/Default）同步回调，
+    // refresh() 里操作 ListView/TextView 必须在主线程，否则 CalledFromWrongThreadException
+    // 被 RunLog 的 runCatching 吞掉 → 日志页在前台时后台写日志不刷新。统一 post 回主线程。
+    private val onEntry: (LogEntry) -> Unit = { runOnUiThread { refresh() } }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

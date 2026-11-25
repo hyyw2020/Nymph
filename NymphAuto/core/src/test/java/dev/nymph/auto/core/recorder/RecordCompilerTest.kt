@@ -194,7 +194,7 @@ class RecordCompilerTest {
     fun `事件数超上限被截断并给出告警`() {
         val strict = RecordCompiler(RecordOptions(maxEvents = 2))
         val r = strict.compile("截断", listOf(click(0), click(500, x = 800, viewId = "id2"), click(1000, x = 900, viewId = "id3")))
-        assertEquals(3, r.report.rawEvents)                 // 原始输入如实上报
+        assertEquals(3, r.report.rawEvents)                 // 原始输入按实际情况上报
         assertTrue(r.report.keptEvents <= 2)                // 截断后参与编译的不超过上限
         assertTrue(r.report.warnings.any { it.contains("上限") })
     }

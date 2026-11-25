@@ -10,7 +10,7 @@ package dev.nymph.auto.core.recorder
  * 且受硬性契约约束**不拦截、不消费、不重排触摸**。自绘界面
  * （Unity / Cocos 游戏、视频播放器、地图、Flutter / SurfaceView 全绘页面）里的
  * 「按钮」不是 Android View，系统不会派发这些语义事件——于是用户照常操作几十秒，
- * 停止后只得到「未录到有效动作」，却完全不知道为什么，进而认为「不能实现类似操作」。
+ * 停止后只得到「未录到有效动作」，却完全不知道为什么，进而认为「目标操作不可达」。
  *
  * 这个边界**不能**靠加 `FLAG_WATCH_OUTSIDE_TOUCH`、全屏透明覆盖层或触摸浏览来
  * 「修复」，那会打断其他 APP 的正常触摸分发（违反第 5 条硬契约）。因此本类选择
@@ -100,7 +100,7 @@ object RecordabilityGuard {
     fun warningVerdict(s: Signal): Verdict =
         if (s.totalEvents <= 0) Verdict.NO_EVENTS else diagnose(s)
 
-    /** 根因一句话：用于日志页与收尾 toast 的主干，如实说明边界而非含糊带过。 */
+    /** 根因一句话：用于日志页与收尾 toast 的主干，按实际情况说明边界而非含糊带过。 */
     fun reason(v: Verdict): String = when (v) {
         Verdict.WAITING -> "录制仍在待命：请切到目标 APP 后再操作，本应用内的点击不会记入脚本。"
         Verdict.NO_EVENTS -> "系统未向无障碍服务派发任何事件，请确认已在系统设置中开启 NymphAuto 无障碍服务。"

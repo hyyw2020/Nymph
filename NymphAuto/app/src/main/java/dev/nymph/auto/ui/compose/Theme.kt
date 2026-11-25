@@ -1,6 +1,5 @@
 package dev.nymph.auto.ui.compose
 
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Shapes
 import androidx.compose.material3.Typography
@@ -10,7 +9,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.nymph.auto.core.design.NymphDesignTokens as T
 
@@ -77,35 +75,29 @@ private val NymphColors = darkColorScheme(
     inverseOnSurface = c(T.INVERSE_ON_SURFACE),
 )
 
+// 排版阶梯来自 DesignSystem 的「Quiet Precision」art direction：
+// 每级字号都有清晰的 scale / weight 差，强调靠字重而非颜色，标题负字距收紧。
+// 具体数值集中定义在 Ds，避免各 composable 各写 sp。
 private val NymphTypography = Typography(
-    headlineSmall = TextStyle(
-        fontFamily = FontFamily.SansSerif,
-        fontWeight = FontWeight.SemiBold,
-        fontSize = 22.sp,
-        lineHeight = 28.sp,
-    ),
-    titleLarge = TextStyle(
-        fontWeight = FontWeight.SemiBold,
-        fontSize = 19.sp,
-        lineHeight = 25.sp,
-    ),
-    titleMedium = TextStyle(
-        fontWeight = FontWeight.Medium,
-        fontSize = 15.sp,
-        lineHeight = 21.sp,
-    ),
-    bodyMedium = TextStyle(fontSize = 13.5.sp, lineHeight = 20.sp),
-    bodySmall = TextStyle(fontSize = 12.sp, lineHeight = 17.sp),
-    labelMedium = TextStyle(fontSize = 11.sp, lineHeight = 15.sp, fontWeight = FontWeight.Medium),
-    labelSmall = TextStyle(fontSize = 10.sp, lineHeight = 14.sp),
+    displaySmall = Ds.Display.copy(fontFamily = FontFamily.SansSerif),
+    headlineSmall = Ds.Title.copy(fontFamily = FontFamily.SansSerif),
+    titleLarge = Ds.Title.copy(fontFamily = FontFamily.SansSerif),
+    titleMedium = Ds.ItemTitle,
+    titleSmall = Ds.ItemTitle.copy(fontSize = 14.sp, lineHeight = 20.sp, fontWeight = FontWeight.Medium),
+    bodyLarge = Ds.Body.copy(fontSize = 15.sp, lineHeight = 22.sp),
+    bodyMedium = Ds.Body,
+    bodySmall = Ds.BodySecondary,
+    labelLarge = Ds.Label.copy(fontWeight = FontWeight.SemiBold),
+    labelMedium = Ds.Label,
+    labelSmall = Ds.Label.copy(fontSize = 11.sp, lineHeight = 15.sp),
 )
 
 private val NymphShapes = Shapes(
-    extraSmall = RoundedCornerShape(6.dp),
-    small = RoundedCornerShape(10.dp),
-    medium = RoundedCornerShape(14.dp),
-    large = RoundedCornerShape(20.dp),
-    extraLarge = RoundedCornerShape(28.dp),
+    extraSmall = Ds.RadiusSm,
+    small = Ds.RadiusSm,
+    medium = Ds.RadiusMd,
+    large = Ds.RadiusLg,
+    extraLarge = Ds.RadiusLg,
 )
 
 @Composable

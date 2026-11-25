@@ -30,7 +30,7 @@ class DragGestureTest {
     @Test
     fun `落点在空白区域 面板自己消费 DOWN 后仍能产生位移`() {
         // v2.9.3 的 bug：onTouchEvent(DOWN) 返回 false，MOVE 不再派发，
-        // 这条路径完全拿不到增量，面板实际拖不动。
+        // 这条路径完全拿不到增量，面板实际无位移响应。
         val g = g()
         g.onDown(100f, 100f)
         assertNull("未跨阈值不移动", g.onOwnMove(105f, 100f))

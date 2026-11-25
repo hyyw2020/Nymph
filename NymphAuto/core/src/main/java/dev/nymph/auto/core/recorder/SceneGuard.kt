@@ -14,7 +14,7 @@ import dev.nymph.auto.core.model.ActionType
  * 但整体与实际需求完全不符。
  *
  * 无障碍事件无法还原滚动位置/页面状态（这是能力边界，不猜），因此本守卫只做
- * 一件诚实的事：**在动作开始前比对录制起始包名与当前前台包名，不一致就明确
+ * 一件按实际状态的事：**在动作开始前比对录制起始包名与当前前台包名，不一致就明确
  * 拦截并提示用户回到正确界面**，而不是把一堆动作打在错误界面上还报「成功」。
  *
  * ## v2.9.1 真机补强：同包名 ≠ 同界面
@@ -72,7 +72,7 @@ object SceneGuard {
 
     /**
      * 位置敏感脚本的执行前警告（core 单一真源，app 层复用，避免两处各写一遍）。
-     * 如实说明能力边界，并给出可操作的动作；[recorded] 为空时也保持语句通顺。
+     * 按实际情况说明能力边界，并给出可操作的动作；[recorded] 为空时也保持语句通顺。
      */
     fun positionalWarning(recorded: String, why: String): String {
         val pkgHint = if (recorded.isBlank()) "" else

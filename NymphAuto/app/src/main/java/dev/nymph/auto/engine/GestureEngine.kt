@@ -3,6 +3,8 @@ package dev.nymph.auto.engine
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
+import dev.nymph.auto.core.vision.EdgeSafety
+import dev.nymph.auto.core.log.RunLog
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.sync.Mutex
@@ -29,10 +31,21 @@ class GestureEngine {
 
     private val mutex = Mutex()
 
-    /** 形态随机总开关（调试置 false 可复现精确回放；固定种子保证同序列）。 */
+    /**
+     * 形态随机总开关（调试置 false 可复现精确回放）。
+     *
+     * v3.0.0：默认每次会话用安全随机种子——固定种子意味着"抖动序列每次完全一样"，
+     * 可复现即可预测，对反检测零价值（红方评审结论）。需要可复现时由调用方显式
+     * 设 [seed] 并置 formRandomEnabled=true，而不是全局写死一个常量。
+     */
     var formRandomEnabled: Boolean = true
 
-    private val rng = java.util.Random(FORM_SEED)
+    private var rng: java.util.Random = java.util.Random(java.security.SecureRandom().nextLong())
+
+    /** 显式设定种子以获得可复现序列（调试/回归用）；不调用则每次会话安全随机。 */
+    fun setSeed(value: Long) {
+        rng = java.util.Random(value)
+    }
 
     /**
      * 屏幕合法坐标上界（RunnerService 装配时注入）。
@@ -47,6 +60,52 @@ class GestureEngine {
     fun setScreenBounds(w: Int, h: Int) {
         maxX = (w - 1).coerceAtLeast(0)
         maxY = (h - 1).coerceAtLeast(0)
+        screenW = w.coerceAtLeast(1)
+        screenH = h.coerceAtLeast(1)
+    }
+
+    /**
+     * v2.9.29：系统手势热区。由 RunnerService 从无障碍服务读取后注入。
+     *
+     * 默认全 0 表示「不知道」——此时不做任何内移，保持历史行为；只有拿到真实
+     * insets 才收敛，避免在无手势导航的设备上把合法边缘点击改坏。
+     */
+    fun setEdgeInsets(insets: EdgeSafety.Insets) {
+        edgeInsets = insets
+    }
+
+    /** 累计被边缘修正的点击数，供执行总结呈现（不含滑动）。 */
+    var edgeAdjusted: Int = 0
+        private set
+
+    private var edgeInsets = EdgeSafety.Insets()
+    private var loggedEdge = false
+    private var screenW = 0
+    private var screenH = 0
+
+    /**
+     * 点类手势的落点收敛。
+     *
+     * 只对**单点**手势内移：落点在返回/Home 热区内时，系统会静默消费掉这次触摸，
+     * `dispatchGesture` 却返回成功——表现为「日志显示点了、界面没反应」。
+     *
+     * **滑动不做内移**：从左边缘起手往右滑本身就是系统返回手势或抽屉手势，
+     * 把起点搬离边缘会直接改变手势语义，比失败更糟。
+     */
+    private fun safePoint(x: Int, y: Int): Pair<Int, Int> {
+        if (screenW <= 0 || screenH <= 0) return x to y
+        val a = EdgeSafety.adjust(x, y, screenW, screenH, edgeInsets)
+        if (!a.moved) return x to y
+        edgeAdjusted++
+        if (!loggedEdge) {
+            loggedEdge = true
+            RunLog.i(
+                "Gesture",
+                "落点位于${a.reason}，已内移至 (${a.x},${a.y})（原 $x,$y）；" +
+                    "该点若不内移会被系统手势消费，事件不会到达目标应用",
+            )
+        }
+        return a.x to a.y
     }
 
     private fun px(v: Float): Float = v.coerceIn(0f, maxX.toFloat())
@@ -80,14 +139,22 @@ class GestureEngine {
     }
 
     fun planTap(x: Int, y: Int, holdMs: Long): PlannedGesture {
-        val hold = holdMs.coerceIn(MIN_TAP_MS, MAX_GESTURE_MS)
+        // v3.0.0：点击按压收敛到 40..120ms——过短被系统丢弃，过长失去点击语义。
+        val hold = holdMs.coerceIn(MIN_TAP_MS, MAX_TAP_MS)
+        val (sx, sy) = safePoint(x, y)
         val builder = GestureDescription.Builder()
-        builder.addStroke(if (formRandomEnabled) strokeHuman(x, y, hold) else strokeAt(x, y, 0L, hold))
+        builder.addStroke(if (formRandomEnabled) strokeHuman(sx, sy, hold) else strokeAt(sx, sy, 0L, hold))
         return PlannedGesture(builder.build(), hold + TIMEOUT_MARGIN_MS)
     }
 
-    fun planLongPress(x: Int, y: Int, holdMs: Long): PlannedGesture =
-        planTap(x, y, holdMs.coerceAtLeast(LONG_PRESS_MS))
+    fun planLongPress(x: Int, y: Int, holdMs: Long): PlannedGesture {
+        // 长按不走 planTap 的 120ms 点击上限，独立用手势总时长上限。
+        val hold = holdMs.coerceIn(LONG_PRESS_MS, MAX_GESTURE_MS)
+        val (sx, sy) = safePoint(x, y)
+        val builder = GestureDescription.Builder()
+        builder.addStroke(strokeAt(sx, sy, 0L, hold))
+        return PlannedGesture(builder.build(), hold + TIMEOUT_MARGIN_MS)
+    }
 
     /** 多击合并提交；超出系统限制（笔数/总时长）返回 null，由调用方逐次派发。 */
     fun planMultiTap(x: Int, y: Int, holdMs: Long, gapMs: Long, times: Int): PlannedGesture? {
@@ -95,10 +162,11 @@ class GestureEngine {
         val hold = holdMs.coerceIn(MIN_TAP_MS, MAX_GESTURE_MS)
         if (times > MAX_STROKES) return null
         if (times * (hold + gapMs) > MAX_GESTURE_MS) return null
+        val (sx, sy) = safePoint(x, y)
         val builder = GestureDescription.Builder()
         var t = 0L
         repeat(times) {
-            builder.addStroke(strokeAt(x, y, t, hold))
+            builder.addStroke(strokeAt(sx, sy, t, hold))
             t += hold + gapMs
         }
         return PlannedGesture(builder.build(), t + TIMEOUT_MARGIN_MS)
@@ -207,28 +275,40 @@ class GestureEngine {
     }
 
     /**
-     * 拟人点击：DOWN 后 1~2 个亚像素 MOVE（±0.5px）再 UP。
-     * 路径点按弧长在时长内均匀分布，天然形成 DOWN→MOVE→UP 的节奏。
+     * 拟人点击（v3.0.0）：DOWN 后 1~2 个受控微 MOVE 再回到落点附近 UP。
+     *
+     * v2.9.x 的 ±0.5px 亚像素 MOVE 在物理像素上不改变落点，是无意义动画；
+     * 本版改为 ±2px 的真实像素抖动 + 起点/终点回中，形成可观测的微轨迹，
+     * 幅度受控（不偏离目标按钮可点击区）。抖动来自会话安全随机种子，
+     * 每次点击不同——可复现即可预测，对反检测无价值（红方评审结论）。
      */
     private fun strokeHuman(x: Int, y: Int, hold: Long): GestureDescription.StrokeDescription {
         val path = Path().apply {
             moveTo(px(x.toFloat()), py(y.toFloat()))
-            repeat(1 + rng.nextInt(2)) { // 1~2 个 MOVE
-                lineTo(px(x + (rng.nextFloat() - 0.5f)), py(y + (rng.nextFloat() - 0.5f)))
+            val moves = 1 + rng.nextInt(2)
+            repeat(moves) {
+                val jx = x + (rng.nextFloat() - 0.5f) * 2f * HUMAN_JITTER_PX
+                val jy = y + (rng.nextFloat() - 0.5f) * 2f * HUMAN_JITTER_PX
+                lineTo(px(jx), py(jy))
             }
+            // 回到落点附近，保证抬起点仍在目标可点击区内。
+            lineTo(px(x.toFloat()), py(y.toFloat()))
         }
         return GestureDescription.StrokeDescription(path, 0L, hold)
     }
 
     companion object {
         const val MAX_STROKES = 10
-        const val MIN_TAP_MS = 1L
+        /** v3.0.0：1ms 点按在部分 ROM 被判无效手势，下限收敛到 40ms（可配区间 40..120）。 */
+        const val MIN_TAP_MS = 40L
+        /** v3.0.0：点击按压上限，超过退化为长按语义。 */
+        const val MAX_TAP_MS = 120L
         const val LONG_PRESS_MS = 700L
         const val MIN_SWIPE_MS = 10L
         const val MAX_GESTURE_MS = 60_000L
         const val TIMEOUT_MARGIN_MS = 5_000L
 
-        /** 形态随机固定种子：同序列可复现，调试可关。 */
-        private const val FORM_SEED = 0x4E794D4CL
+        /** 拟人微轨迹的最大单轴抖动像素（受控，避免点偏目标）。 */
+        private const val HUMAN_JITTER_PX = 2f
     }
 }

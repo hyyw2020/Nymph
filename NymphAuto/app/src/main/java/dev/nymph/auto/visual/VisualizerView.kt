@@ -14,6 +14,7 @@ import dev.nymph.auto.core.visual.VisualCue
 import dev.nymph.auto.core.visual.VisualCueReducer
 import dev.nymph.auto.core.visual.VisualKind
 import dev.nymph.auto.core.visual.VisualSpec
+import dev.nymph.auto.engine.SceneDebugBox
 
 /**
  * 动作可视化的绘制 View：纯 Canvas 矢量，硬件加速由窗口 flag 提供。
@@ -59,6 +60,18 @@ class VisualizerView(context: Context) : View(context) {
     private val magenta = Color.argb(255, 0xFF, 0x5C, 0xB8)
     private val contrast = Color.argb(200, 0x0A, 0x14, 0x22)
 
+    // v2.9.15 / A5 场景调试覆盖层：命中=青绿、未命中=洋红，深浅底都靠深色对比外描边可读
+    private val sceneHit = Color.argb(255, 0x4C, 0xE0, 0x8A)
+    private val sceneMiss = Color.argb(255, 0xFF, 0x6B, 0x7A)
+
+    /**
+     * 每轮场景观测的 ROI 框（由 VisualizerLayer.onSceneDebug 直接设置）。
+     * 与 cue 动画帧彼此独立：即使没有活跃动画（等待场景出现）也要常驻绘制。
+     * @Volatile：ScriptRunner 每轮写、主线程 onDraw 读。
+     */
+    @Volatile
+    var sceneBoxes: List<SceneDebugBox> = emptyList()
+
     private val dotRadius = dp(5f)
     private val ringStroke = dp(1.8f)
     private val haloStroke = dp(5f)
@@ -72,21 +85,61 @@ class VisualizerView(context: Context) : View(context) {
     }
 
     override fun onDraw(canvas: Canvas) {
-        val f = frame ?: return
-        if (f.isEmpty) return
-        val restrained = currentRestrained
-        for (e in f.elements) {
-            val cue = e.cue
-            val spec = e.spec
-            val alpha = (255 * (1f - e.progress)).toInt().coerceIn(0, 255)
-            val pts = e.points
-            when (cue.kind) {
-                VisualKind.TAP -> drawTap(canvas, cue, spec, e.progress, pts, alpha, restrained)
-                VisualKind.LONG_PRESS -> drawLongPress(canvas, e.progress, pts, alpha, restrained)
-                VisualKind.SWIPE -> drawSwipe(canvas, spec, e.progress, pts, alpha, restrained)
-                VisualKind.MULTI_TOUCH -> drawMulti(canvas, spec, e.progress, pts, alpha, restrained)
-                VisualKind.PREVIEW -> drawPreview(canvas, cue, e.progress, pts, alpha, restrained)
+        val f = frame
+        if (f != null && !f.isEmpty) {
+            val restrained = currentRestrained
+            for (e in f.elements) {
+                val cue = e.cue
+                val spec = e.spec
+                val alpha = (255 * (1f - e.progress)).toInt().coerceIn(0, 255)
+                val pts = e.points
+                when (cue.kind) {
+                    VisualKind.TAP -> drawTap(canvas, cue, spec, e.progress, pts, alpha, restrained)
+                    VisualKind.LONG_PRESS -> drawLongPress(canvas, e.progress, pts, alpha, restrained)
+                    VisualKind.SWIPE -> drawSwipe(canvas, spec, e.progress, pts, alpha, restrained)
+                    VisualKind.MULTI_TOUCH -> drawMulti(canvas, spec, e.progress, pts, alpha, restrained)
+                    VisualKind.PREVIEW -> drawPreview(canvas, cue, e.progress, pts, alpha, restrained)
+                }
             }
+        }
+        // v2.9.15 / A5：场景调试框常驻绘制，与 cue 动画层独立（等待场景出现时也要可见）
+        drawSceneBoxes(canvas)
+    }
+
+    /**
+     * A5 每规则 ROI 框：命中/未命中两色 + 落点圆点 + 规则序号角标。
+     * 全部走预分配的 Paint，绝不 drawText、不读屏幕像素、onDraw 内不 new 对象。
+     * 命中=青绿、未命中=洋红，配合深色对比外描边在深浅背景上都清晰。
+     */
+    private fun drawSceneBoxes(c: Canvas) {
+        val boxes = sceneBoxes
+        if (boxes.isEmpty() || width <= 0 || height <= 0) return
+        for (b in boxes) {
+            val l = (b.roi.leftPct / 100.0 * width).toFloat()
+            val t = (b.roi.topPct / 100.0 * height).toFloat()
+            val r = (b.roi.rightPct / 100.0 * width).toFloat()
+            val bo = (b.roi.bottomPct / 100.0 * height).toFloat()
+            if (r <= l || bo <= t) continue
+            val color = if (b.hit) sceneHit else sceneMiss
+            // 低透明填充：命中更实，未命中更淡
+            fillPaint.color = withAlpha(color, if (b.hit) 34 else 16)
+            c.drawRect(l, t, r, bo, fillPaint)
+            // 双描边：深色对比外 + 主色内
+            linePaint.color = contrast
+            linePaint.alpha = 150
+            linePaint.strokeWidth = dp(3.2f)
+            c.drawRect(l, t, r, bo, linePaint)
+            linePaint.color = color
+            linePaint.alpha = 235
+            linePaint.strokeWidth = dp(1.6f)
+            c.drawRect(l, t, r, bo, linePaint)
+            // 落点圆点（相对匹配坐标校正后的真实点击位置）
+            val cx = (b.clickXPct / 100.0 * width).toFloat().coerceIn(0f, width.toFloat())
+            val cy = (b.clickYPct / 100.0 * height).toFloat().coerceIn(0f, height.toFloat())
+            fillPaint.color = withAlpha(color, 220)
+            c.drawCircle(cx, cy, dp(3f), fillPaint)
+            // 规则序号角标（VectorGlyphs 矢量折线，绝不 drawText）
+            drawBadge(c, (b.index + 1).toString(), l + dp(2f), t + dp(2f), color, 235)
         }
     }
 

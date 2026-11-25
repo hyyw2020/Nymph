@@ -7,6 +7,7 @@ import dev.nymph.auto.core.model.Condition
 import dev.nymph.auto.core.model.ConditionKind
 import dev.nymph.auto.core.model.Listeners
 import dev.nymph.auto.core.model.Region
+import dev.nymph.auto.core.model.SceneRule
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -35,7 +36,7 @@ class FloatingEditorLayoutTest {
         assertEquals(120, collapsed)
         // v2.9.8：220dp → 168dp，168*3=504（占 1080px 屏宽 46.7%）
         assertEquals(504, expandedW)
-        // 对比差评里那个占 94% 屏宽 / 73% 屏高的全屏 AlertDialog：
+        // 对比评估结论中那个占 94% 屏宽 / 73% 屏高的全屏 AlertDialog：
         // 展开态宽度必须 < 屏宽 50%，高度上限必须 < 屏高 42%，折叠态 < 屏宽 15%
         assertTrue("展开宽度应 < 屏宽 50%（实测 ${expandedW * 100 / sw}%）", expandedW * 100 / sw < 50)
         assertTrue("折叠态应 < 屏宽 15%", collapsed * 100 / sw < 15)
@@ -108,6 +109,30 @@ class FloatingEditorLayoutTest {
         assertEquals(0L, p.waitMs)
         // 负值交给 ActionEditGuard.apply 统一 clamp，此处只验证解析不丢
         assertEquals(-1L, p.holdMs)
+    }
+
+    // ------------------------------------------------------------ v2.9.32 判据参数表单
+
+    @Test
+    fun `Form 默认判据配置全空 老调用点零回归`() {
+        val f = FloatingEditorLayout.Form()
+        assertEquals(SceneTuning.Config(), f.tuning)
+        assertFalse(SceneTuning.hasOverride(f.tuning))
+        // toPatch 不得消费 tuning：动作层 Patch 形状保持既有语义
+        val p = FloatingEditorLayout.toPatch(f)
+        assertEquals(50.0, p.x, 0.0)
+        assertEquals(1, p.times)
+    }
+
+    @Test
+    fun `formOf 从既有 SceneRule 回显判据参数且往返恒等`() {
+        val rule = SceneRule(
+            similarity = 91, colorTolerance = 30, evidenceStreak = 5,
+            cooldownMs = 900L, retryTimeoutMs = 2400L, locMaxDeviationPct = 9.0,
+        )
+        val f = FloatingEditorLayout.formOf(Action().copy(sceneRule = rule))
+        assertTrue(SceneTuning.hasOverride(f.tuning))
+        assertEquals(rule, SceneTuning.applyTo(rule, f.tuning))
     }
 
     @Test

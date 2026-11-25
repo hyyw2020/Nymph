@@ -14,11 +14,11 @@ ELF LOAD 段 Align 仍为 0x1000(4KB)，只有其余 4 个第三方 so 是 0x400
 本脚本把「16 KB 兼容」从注释变成可重复的实测：解包 APK，逐个 so 用
 `llvm-readelf -l` 读所有 LOAD 段的 Align，只有全部 >= 0x4000 才算对齐。
 
-## 判定的诚实边界
+## 判定的能力边界（未验证项）
 
 - 自编译 so（`libquickjs-jni.so`）由本工程 CMake 控制，必须对齐，否则 FAIL。
-- 预编译第三方 so 不由本工程编译，若未对齐会如实列为 LEGACY 并给出名字，
-  不冒充已修复、也不偷偷判 PASS；是否需要换运行时由人决定。
+- 预编译第三方 so 不由本工程编译，若未对齐会按实际情况列为 LEGACY 并给出名字，
+  不误标为已修复、也不偷偷判 PASS；是否需要换运行时由人决定。
 - `zipalign -c -P 16` 只查 ZIP 条目对齐，与 ELF 段对齐是两回事，单独查。
 
 用法：
@@ -137,7 +137,7 @@ def main() -> int:
     print(f"\nZIP 条目 16KB 对齐(zipalign -P 16): {data['zipalign_16k']}")
     print(f"自编译 so 全部 16KB 对齐: {data['own_aligned']}")
     if data["third_party_unaligned"]:
-        print(f"第三方预编译 so 未对齐(不由本工程 CMake 控制，如实列出): "
+        print(f"第三方预编译 so 未对齐(不由本工程 CMake 控制，明确列出): "
               f"{', '.join(data['third_party_unaligned'])}")
     if data["error"]:
         print("错误:", data["error"])

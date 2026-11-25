@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 package dev.nymph.auto.core.runner
 
+import java.util.Locale
+
 /**
  * 一次回放的执行统计（core 纯 JVM，可单测）。
  *
@@ -58,13 +60,13 @@ class RunStats {
             total > 1 -> "（共 $total 轮）"
             else -> ""
         }
-        // 纯手势脚本（执行了若干步，但没有任何查找类结果）如实标注口径，
+        // 纯手势脚本（执行了若干步，但没有任何查找类结果）按实际情况标注口径，
         // 不把「没有找图」显示成「什么都没做」。
         val gestureOnly = executed > 0 && hit == 0 && miss == 0 && skip == 0 && fail == 0
         val note = if (gestureOnly) {
             "；本轮为直接派发的坐标手势，无目标校验，命中/失败口径不适用"
         } else ""
         return "执行总结$tail：已执行 $executed 步，${resultText()}$note，" +
-            "耗时 ${"%.1f".format(seconds)}s"
+            "耗时 ${String.format(Locale.US, "%.1f", seconds)}s"
     }
 }

@@ -35,10 +35,11 @@ interface OcrEngine {
  * ML Kit 中文识别实现。
  *
  * 入口（ML Kit 官方约定）：TextRecognition.getClient(ChineseTextRecognizerOptions)
- * ——拉丁件提供入口类，中文件负责切换到中文模型；模型（~2MB）由 Google Play
- * 服务按需下载管理。无 GMS 或模型未就绪时 [available] 为 false，调用方自动
- * 回退节点文本通道，不报错不阻塞。首次识别可能触发模型下载（数秒），
- * 调用方应给足超时（VisionPipeline 给 20s）。
+ * ——拉丁件提供入口类，中文件负责切换到中文模型。依赖坐标
+ * `com.google.mlkit:text-recognition-chinese:16.0.1` 为 **bundled 静态打包**，
+ * 模型随库进入 APK，不依赖 GMS 侧按需下载，也不需要 INTERNET 权限。
+ * [available] 由识别器构造结果判定；构造失败时调用方自动回退节点文本通道，
+ * 不报错不阻塞。调用方仍配置充足超时（VisionPipeline 给 20s）以覆盖首帧加载。
  */
 class MlKitOcrEngine : OcrEngine {
 
@@ -72,8 +73,8 @@ class MlKitOcrEngine : OcrEngine {
                     cont.resume(boxes)
                 }
                 .addOnFailureListener { e ->
-                    // 模型未下载/无 GMS：记一次日志后静默降级（节点通道仍在）
-                    RunLog.w("OCR", "识别失败（模型未就绪或无 GMS，已回退节点文本）：${e.message}")
+                    // bundled 模型随包，失败多为解码/内存异常：记日志后静默降级（节点通道仍在）
+                    RunLog.w("OCR", "识别失败（bundled 引擎异常，已回退节点文本）：${e.message}")
                     cont.resume(emptyList())
                 }
         }

@@ -36,6 +36,9 @@ class ScriptRepository(
 
     init {
         runCatching { history.mkdirs() }
+        // v2.9.42（③）：历史快照写 .naz 也走 AtomicTextFile，崩溃残留是 .naz.tmp-<nano>-<tid>；
+        // 此前 cleanupStale 只在脚本主目录调用，.history 的残留从未被清、持续堆积。这里补上。
+        runCatching { AtomicTextFile.cleanupStale(history) }
     }
 
     /** 保存并返回带新修订号的脚本；旧版本自动进历史。 */
@@ -49,9 +52,12 @@ class ScriptRepository(
 
     /** 某脚本的历史版本（新→旧），不含当前版本。 */
     fun versions(name: String): List<Version> {
-        val prefix = prefixOf(name)
+        // v2.9.35：此前用 startsWith(safeName+".r")，脚本名互为前缀时（"a" 与
+        // "a.r"）会把对方的历史文件也列进来、purge 时误删。改为完整锚定正则，
+        // 精确匹配 <safeName>.r<数字>.naz。
+        val versionRegex = versionRegexOf(name)
         return (history.listFiles() ?: emptyArray())
-            .filter { it.isFile && it.name.startsWith(prefix) && it.name.endsWith(SUFFIX) }
+            .filter { it.isFile && versionRegex.matches(it.name) }
             .mapNotNull { f ->
                 val rev = REV_REGEX.find(f.name)?.groupValues?.get(1)?.toIntOrNull()
                     ?: return@mapNotNull null
@@ -70,9 +76,9 @@ class ScriptRepository(
 
     /** 删除脚本时一并清理其历史，避免残留文件无限增长。 */
     fun purge(name: String) {
-        val prefix = prefixOf(name)
+        val versionRegex = versionRegexOf(name)
         (history.listFiles() ?: emptyArray())
-            .filter { it.isFile && it.name.startsWith(prefix) }
+            .filter { it.isFile && versionRegex.matches(it.name) }
             .forEach { runCatching { it.delete() } }
     }
 
@@ -93,6 +99,10 @@ class ScriptRepository(
     }
 
     private fun prefixOf(name: String): String = ScriptStore.safeName(name) + ".r"
+
+    /** 完整锚定的历史版本文件名正则：^<safeName>.r<数字>.naz$。 */
+    private fun versionRegexOf(name: String): Regex =
+        Regex("^" + Regex.escape(ScriptStore.safeName(name)) + """\.r(\d+)\.naz$""")
 
     companion object {
         private const val SUFFIX = ".naz"

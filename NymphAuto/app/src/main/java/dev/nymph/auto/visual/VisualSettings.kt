@@ -19,6 +19,8 @@ import dev.nymph.auto.service.RunnerService
 object VisualSettings {
 
     private const val K_ENABLED = "visual_enabled"
+    /** v2.9.16：场景诊断覆盖层开关独立持久化，不与手势特效开关共用。 */
+    private const val K_SCENE_DEBUG = "visual_scene_debug"
     private const val K_TAP = "visual_tap"
     private const val K_TRAIL = "visual_trail"
     private const val K_BADGE = "visual_badge"
@@ -32,6 +34,7 @@ object VisualSettings {
         val p = prefs(ctx)
         return VisualConfig(
             enabled = p.getBoolean(K_ENABLED, false),
+            sceneDebugEnabled = p.getBoolean(K_SCENE_DEBUG, false),
             tapEnabled = p.getBoolean(K_TAP, true),
             trailEnabled = p.getBoolean(K_TRAIL, true),
             stepBadgeEnabled = p.getBoolean(K_BADGE, true),
@@ -43,6 +46,7 @@ object VisualSettings {
     fun save(ctx: Context, cfg: VisualConfig) {
         prefs(ctx).edit()
             .putBoolean(K_ENABLED, cfg.enabled)
+            .putBoolean(K_SCENE_DEBUG, cfg.sceneDebugEnabled)
             .putBoolean(K_TAP, cfg.tapEnabled)
             .putBoolean(K_TRAIL, cfg.trailEnabled)
             .putBoolean(K_BADGE, cfg.stepBadgeEnabled)

@@ -8,6 +8,8 @@ import java.io.Closeable
 import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.label.Category
@@ -34,18 +36,19 @@ data class AiHit(
  * 文件路径解析（各版本对"asset 路径还是文件路径"的处理不一致，
  * 显式读字节是确定性的）。
  *
- * 与对方的诚实差异（不夸大）：
+ * 与对方的按实际状态差异（不夸大）：
  *  - 对方用的是自训练模型（960×960 输入，PaddleOCR 系导出），界面元素
  *    描述直接可转类别；我们用公开 COCO 预训练模型，"设置按钮"这类 UI
- *    描述映射不到类别时如实失败（见 [find] 返回 null 的归因日志），
- *    而不是乱点一个框。
+ *    描述映射不到类别时按实际情况失败（见 [find] 返回 null 的归因日志），
+ *    而不是无序触发一个框。
  *  - 模型缺失（so/资源被裁）时 available=false，动作归因 AI_NO_MATCH。
  */
 class AiDetector(private val context: Context) : Closeable {
 
     private var detector: ObjectDetector? = null
     private var modelBuffer: ByteBuffer? = null
-    private var failed = false
+    @Volatile private var failed = false
+    private val loadMutex = Mutex()
 
     val available: Boolean
         get() = !failed
@@ -54,7 +57,13 @@ class AiDetector(private val context: Context) : Closeable {
     private suspend fun ensure(): ObjectDetector? {
         detector?.let { return it }
         if (failed) return null
-        return withContext(Dispatchers.Default) {
+        // v2.9.35：此前无锁，两个协程并发首次 find 会各建一个 ObjectDetector，
+        // 后写覆盖先写、落败实例持有 TFLite 原生内存无人 close → 泄漏。用 Mutex
+        // 串行化加载并在锁内双检，保证至多一个实例。
+        return loadMutex.withLock {
+            detector?.let { return@withLock it }
+            if (failed) return@withLock null
+            withContext(Dispatchers.Default) {
             runCatching {
                 val buffer = loadModel()
                 val options = ObjectDetector.ObjectDetectorOptions.builder()
@@ -72,7 +81,7 @@ class AiDetector(private val context: Context) : Closeable {
             }.onFailure { e ->
                 failed = true
                 // v2.9.0：16 KB 页设备上，TFLite 预编译的 libtask_vision_jni.so
-                // 若未做 ELF 段对齐，dlopen 会抛 UnsatisfiedLinkError。这里如实
+                // 若未做 ELF 段对齐，dlopen 会抛 UnsatisfiedLinkError。这里按实际情况
                 // 归因，避免把「页大小不兼容」误报成「模型损坏」。检测能力降级
                 // 为 AI_NO_MATCH，其余 OCR / 找图 / 节点链路照常可用，不崩溃。
                 val hint = if (e is UnsatisfiedLinkError || e is LinkageError)
@@ -80,6 +89,7 @@ class AiDetector(private val context: Context) : Closeable {
                 else ""
                 RunLog.e("AI", "目标检测模型加载失败（${MODEL_ASSET}）$hint：${e.message}")
             }.getOrNull()
+            }
         }
     }
 
@@ -100,7 +110,7 @@ class AiDetector(private val context: Context) : Closeable {
      * 在 [bmp] 中查找描述对应的目标。
      *
      * @param description 文字描述（如"手机"）；经 [CocoLabels] 映射到 COCO
-     *        类别，映射不到返回 null（如实归因，绝不退化为"随便点一个"）。
+     *        类别，映射不到返回 null（按实际情况归因，绝不退化为"随便点一个"）。
      * @param threshold   置信度阈值（百分制）。
      * @param regionFilter 命中框中心是否落在限定区域（百分比）。
      */

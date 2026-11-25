@@ -58,7 +58,7 @@ class RecordabilityGuardTest {
     }
 
     @Test
-    fun `有窗口事件但零交互判为自绘界面 这是本次真机差评的现场`() {
+    fun `有窗口事件但零交互判为自绘界面 这是本轮装机负向评估对应场景`() {
         // 游戏里切页/弹窗会发 WINDOW_STATE_CHANGED，但按钮不是 View，零点击
         val s = signal(interaction = 0, window = 6, total = 6)
         assertEquals(RecordabilityGuard.Verdict.SELF_DRAWN, RecordabilityGuard.diagnose(s))

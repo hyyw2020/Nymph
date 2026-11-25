@@ -38,10 +38,27 @@ object OcrPostprocess {
      * @param steps 时间步 T
      * @param classes 类别数 C（= keys.size + 1）
      */
-    fun ctcGreedy(logits: FloatArray, steps: Int, classes: Int, keys: List<String>): String {
-        if (steps <= 0 || classes <= 0 || keys.isEmpty()) return ""
+    fun ctcGreedy(logits: FloatArray, steps: Int, classes: Int, keys: List<String>): String =
+        ctcGreedyScored(logits, steps, classes, keys).text
+
+    /**
+     * CTC greedy 解码的详细结果（v2.9.34）：文本 + 置信度。
+     *
+     * 置信度定义（确定性、可声明）：对每个"被采纳"的时间步（非 blank、非连续重复、
+     * 且字符有效）取 max-logit 的 softmax 概率，全部采纳步的算术平均即为整行置信度；
+     * 无采纳步时置信度为 0。softmax 在单帧内对类别维归一，避免不同 logit 尺度失真。
+     *
+     * 该定义随模型/字典版本相关，后续由 manifest 的 confidence_def 声明；本实现是
+     * 默认口径，不改旧签名、不改匹配语义。
+     */
+    data class Decoded(val text: String, val confidence: Double)
+
+    fun ctcGreedyScored(logits: FloatArray, steps: Int, classes: Int, keys: List<String>): Decoded {
+        if (steps <= 0 || classes <= 0 || keys.isEmpty()) return Decoded("", 0.0)
         val sb = StringBuilder()
         var prev = -1
+        var probSum = 0.0
+        var accepted = 0
         for (t in 0 until steps) {
             val off = t * classes
             if (off + classes > logits.size) break
@@ -52,10 +69,27 @@ object OcrPostprocess {
             if (best == 0) { prev = -1; continue }          // CTC blank
             if (best == prev) continue                        // 连续重复合并
             val key = keys.getOrNull(best - 1).orEmpty()       // 类别0=blank，故偏移1
-            if (key.isNotEmpty() && key != " ") sb.append(key)
+            if (key.isNotEmpty() && key != " ") {
+                sb.append(key)
+                probSum += softmaxAt(logits, off, classes, best)
+                accepted++
+            }
             prev = best
         }
-        return sb.toString()
+        val conf = if (accepted > 0) (probSum / accepted).coerceIn(0.0, 1.0) else 0.0
+        return Decoded(sb.toString(), conf)
+    }
+
+    /** 单帧内类别维 softmax，取指定类别概率；数值稳定（减最大值）。 */
+    private fun softmaxAt(logits: FloatArray, off: Int, classes: Int, index: Int): Double {
+        var max = Float.NEGATIVE_INFINITY
+        for (c in 0 until classes) if (logits[off + c] > max) max = logits[off + c]
+        var sum = 0.0
+        for (c in 0 until classes) sum += Math.exp((logits[off + c] - max).toDouble())
+        // v2.9.35：logits 含 NaN 时 sum=NaN，`<=0` 与 `isInfinite` 皆为 false，
+        // 会返回 NaN 置信度并一路传播，导致识别结果被静默丢弃。统一用 isFinite。
+        if (!sum.isFinite() || sum <= 0.0) return if (index == 0) 1.0 else 0.0
+        return Math.exp((logits[off + index] - max).toDouble()) / sum
     }
 
     /**

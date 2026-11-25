@@ -137,10 +137,20 @@ class RecordingSession(
         return try {
             val scale = minOf(1.0, 160.0 / maxOf(w, h))
             val cut = Bitmap.createBitmap(bmp, left, top, w, h)
-            val out = if (scale < 1.0) {
-                Bitmap.createScaledBitmap(cut, (w * scale).toInt().coerceAtLeast(1), (h * scale).toInt().coerceAtLeast(1), true)
-                    .also { if (it !== cut) cut.recycle() }
-            } else cut
+            // v2.9.35：createBitmap 在裁剪区恰好覆盖整帧时会返回 bmp 本身。
+            // 入参 bmp 由 enhance() 的 finally 统一回收，且紧接着还要喂给
+            // ocrNear(bmp,...)，本方法绝不能回收它——否则 OCR 拿到已回收位图。
+            // 只对「本方法新建、且被后续步骤取代」的中间产物负责回收。
+            val cutOwned = cut !== bmp
+            var out = cut
+            if (scale < 1.0) {
+                val scaled = Bitmap.createScaledBitmap(
+                    cut, (w * scale).toInt().coerceAtLeast(1),
+                    (h * scale).toInt().coerceAtLeast(1), true,
+                )
+                if (scaled !== cut && cutOwned) cut.recycle()
+                out = scaled
+            }
             val bytes = java.io.ByteArrayOutputStream().use { bos ->
                 out.compress(Bitmap.CompressFormat.PNG, 90, bos)
                 bos.toByteArray()

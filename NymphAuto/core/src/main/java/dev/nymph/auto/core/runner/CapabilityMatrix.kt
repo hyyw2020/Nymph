@@ -9,7 +9,7 @@ package dev.nymph.auto.core.runner
  *              图片类条件退化为节点通道，闭环不可用
  *  - RESTRICTED 命中 secure 窗口或 accessibilityDataSensitive 页面 →
  *              坐标可跑，语义吸附/命中预览/闭环/断言全部不可用
- *  - UNAVAILABLE AAPM 开启（或无无障碍）→ 自动化永久无豁免，诚实告知
+ *  - UNAVAILABLE AAPM 开启（或无无障碍）→ 自动化永久无豁免，明确告知
  */
 enum class CapabilityTier {
     FULL,
@@ -29,7 +29,7 @@ data class CapabilitySnapshot(
 )
 
 /**
- * 能力矩阵：快照 → 档位 + 人话限制说明。
+ * 能力矩阵：快照 → 档位 + 可读限制说明。
  *
  * 判定优先级（从严）：AAPM > 无无障碍 > secure/sensitive > 截图不可用 > 全功能。
  * 注意 RESTRICTED 与 DEGRADED 是正交的两个维度，但同时出现时 RESTRICTED 优先
@@ -45,7 +45,7 @@ object CapabilityMatrix {
         else -> CapabilityTier.FULL
     }
 
-    /** 档位的人话说明（拾取/回放界面顶部明示用）。 */
+    /** 档位的可读说明（拾取/回放界面顶部明示用）。 */
     fun describe(tier: CapabilityTier): String = when (tier) {
         CapabilityTier.FULL -> "全功能：精确匹配 + 形态随机 + 检查点闭环可用"
         CapabilityTier.DEGRADED -> "降级：截图不可用，图片匹配退化，仅保证坐标点中"

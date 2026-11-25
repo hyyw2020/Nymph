@@ -33,7 +33,7 @@ object ImageFinder {
         for (s in scalesOf(refDpi, curDensity)) {
             val r = matchAtScale(screen, template, leftPct, topPct, rightPct, bottomPct, minSimilar, s, wantBest = false)
                 ?: continue
-            if (r.first != null) return r.first
+            if (r.hit != null) return r.hit
         }
         return null
     }
@@ -53,9 +53,62 @@ object ImageFinder {
         for (s in scalesOf(refDpi, curDensity)) {
             val r = matchAtScale(screen, template, leftPct, topPct, rightPct, bottomPct, 100, s, wantBest = true)
                 ?: continue
-            if (r.second > best) best = r.second
+            if (r.bestScore > best) best = r.bestScore
         }
         return best
+    }
+
+    /** 一次匹配的完整结果：命中点（可能为 null）+ 本次 NCC 遍历得到的全局最佳分数（0~1）。 */
+    data class ScoredHit(val hit: Hit?, val bestScore: Double) {
+        /** v2.9.26：未命中时全局最佳窗口的**原图像素**中心（无可评窗口为 -1），供「元素疑似在场」归因。 */
+        var bestCx: Int = -1
+            private set
+
+        /** 同 [bestCx] 的纵坐标。 */
+        var bestCy: Int = -1
+            private set
+
+        internal fun withBestLoc(cx: Int, cy: Int): ScoredHit {
+            bestCx = cx
+            bestCy = cy
+            return this
+        }
+    }
+
+    /**
+     * v2.9.15 / A5：**一次遍历同时给出「命中位置」与「最佳分数」**（不重写识别引擎，
+     * 只把 [find] / [bestScore] 内部早已算出的 `matchAtScale` 结果完整暴露）。
+     *
+     * 动机：场景驱动每轮日志要求 present / score / loc 三者可观测 —— 用户要能区分
+     * 「没匹配到（差多少分）」与「匹配到但没触发」与「触发点错位」。若命中用 [find]
+     * （提前退出）、未命中再补一次 [bestScore]（全遍历），就是两次 NCC，违背 A6
+     * 「一轮一帧」的省功耗初衷。本方法复用 [find] 同款 `wantBest=false` 单次遍历：
+     * 命中即返回命中点及其分数；未命中时返回全局最佳分（用于诊断「差多少没过阈值」）。
+     *
+     * [find] / [bestScore] 原语义逐字不变（本方法是纯新增），406 例零回归。
+     */
+    fun findDetailed(
+        screen: Image,
+        template: Image,
+        leftPct: Double, topPct: Double, rightPct: Double, bottomPct: Double,
+        minSimilar: Int, refDpi: Double, curDensity: Double,
+    ): ScoredHit {
+        var best = 0.0
+        var bestCx = -1
+        var bestCy = -1
+        for (s in scalesOf(refDpi, curDensity)) {
+            val r = matchAtScale(
+                screen, template, leftPct, topPct, rightPct, bottomPct,
+                minSimilar, s, wantBest = false,
+            ) ?: continue
+            if (r.hit != null) return ScoredHit(r.hit, r.bestScore)
+            if (r.bestScore > best) {
+                best = r.bestScore
+                bestCx = r.bestCx
+                bestCy = r.bestCy
+            }
+        }
+        return ScoredHit(null, best).withBestLoc(bestCx, bestCy)
     }
 
     /** 只判断存在性（条件判断用，可提前退出）。 */
@@ -68,12 +121,20 @@ object ImageFinder {
         return linkedSetOf(ratio, ratio * 0.9, 1.0, ratio * 0.75, ratio * 1.1, ratio * 1.25).toList()
     }
 
-    /** 返回 (命中点或 null, 该尺度最佳分数)；尺度不适用返回 null。 */
+    /** 单尺度匹配结果：命中点（或 null）+ 该尺度最佳分数 + 最佳窗口中心（原图像素，无可评窗口 -1）。 */
+    private data class ScaleOutcome(
+        val hit: Hit?,
+        val bestScore: Double,
+        val bestCx: Int,
+        val bestCy: Int,
+    )
+
+    /** 返回命中点与该尺度最佳分数；尺度不适用返回 null。 */
     private fun matchAtScale(
         screen: Image, template: Image,
         leftPct: Double, topPct: Double, rightPct: Double, bottomPct: Double,
         minSimilar: Int, scale: Double, wantBest: Boolean,
-    ): Pair<Hit?, Double>? {
+    ): ScaleOutcome? {
         val area = screen.width.toLong() * screen.height.toLong()
         // 小模板保真：降采样上限随模板尺寸收紧，防止关键特征被抹掉
         val minTplSide = minOf(template.width, template.height)
@@ -97,10 +158,13 @@ object ImageFinder {
             if (tw < 4 || th < 4 || tw > sw || th > sh) return null
             val positions = ((sw - tw).toLong() * (sh - th).toLong()).coerceAtLeast(1L)
             val cost = positions * tw.toLong() * th.toLong()
-            if (cost <= costCap) {
+            // v2.9.35：此前 ds 已达 dsCap 而 cost 仍超限时直接 return null，导致
+            // 高分辨率屏 + 小模板（dsCap=2）在所有尺度上"降无可降"被整帧放弃——
+            // 找图恒定失败且无任何日志。资源预算不足不应等同于"目标不存在"：
+            // 到降采样极限后仍执行一次匹配（接受较高成本），宁可慢也不能找不到。
+            if (cost <= costCap || ds >= dsCap) {
                 return matchCore(screen, template, sw, sh, tw, th, leftPct, topPct, rightPct, bottomPct, minSimilar, wantBest)
             }
-            if (ds >= dsCap) return null
             ds = min(ds * 2, dsCap)
         }
     }
@@ -110,7 +174,7 @@ object ImageFinder {
         sw: Int, sh: Int, tw: Int, th: Int,
         leftPct: Double, topPct: Double, rightPct: Double, bottomPct: Double,
         minSimilar: Int, wantBest: Boolean,
-    ): Pair<Hit?, Double> {
+    ): ScaleOutcome {
         val grayScreen = grayOf(scaleImage(screen, sw, sh))
         val grayTpl = grayOf(scaleImage(template, tw, th))
 
@@ -122,7 +186,7 @@ object ImageFinder {
         var sumSqT = 0.0
         for (v in t0) sumSqT += v * v
         val denomT = sqrt(sumSqT)
-        if (denomT < 1e-9) return null to 0.0
+        if (denomT < 1e-9) return ScaleOutcome(null, 0.0, -1, -1)
 
         val iw = sw + 1
         val integral = DoubleArray(iw * (sh + 1))
@@ -152,10 +216,12 @@ object ImageFinder {
         ry1 = ry1.coerceIn(ry0 + 1, sh)
         val xEnd = rx1 - tw
         val yEnd = ry1 - th
-        if (xEnd < rx0 || yEnd < ry0) return null to 0.0
+        if (xEnd < rx0 || yEnd < ry0) return ScaleOutcome(null, 0.0, -1, -1)
 
         val threshold = minSimilar.coerceIn(1, 100) / 100.0
         var bestScore = 0.0
+        var bestWx = -1
+        var bestWy = -1
         for (wy in ry0..yEnd) {
             for (wx in rx0..xEnd) {
                 val a = wy * iw
@@ -174,18 +240,39 @@ object ImageFinder {
                     }
                 }
                 val score = num / (denomW * denomT)
-                if (score > bestScore) bestScore = score
+                if (score > bestScore) {
+                    bestScore = score
+                    bestWx = wx
+                    bestWy = wy
+                }
                 if (!wantBest && num >= threshold * denomW * denomT) {
-                    return Hit(
-                        cx = ((wx + tw / 2) * screen.width / sw),
-                        cy = ((wy + th / 2) * screen.height / sh),
-                        score = score,
-                    ) to score
+                    return ScaleOutcome(
+                        Hit(
+                            cx = ((wx + tw / 2) * screen.width / sw),
+                            cy = ((wy + th / 2) * screen.height / sh),
+                            score = score,
+                        ),
+                        score,
+                        toOrigCx(screen, sw, wx, tw),
+                        toOrigCy(screen, sh, wy, th),
+                    )
                 }
             }
         }
-        return null to bestScore
+        return ScaleOutcome(
+            null,
+            bestScore,
+            toOrigCx(screen, sw, bestWx, tw),
+            toOrigCy(screen, sh, bestWy, th),
+        )
     }
+
+    /** 降采样窗口坐标 → 原图像素中心（窗口未评分为 -1）。 */
+    private fun toOrigCx(screen: Image, sw: Int, wx: Int, tw: Int): Int =
+        if (wx < 0) -1 else (wx + tw / 2) * screen.width / sw
+
+    private fun toOrigCy(screen: Image, sh: Int, wy: Int, th: Int): Int =
+        if (wy < 0) -1 else (wy + th / 2) * screen.height / sh
 
     /** 平台无关图像载体（Android 层用 Bitmap 适配，JVM 测试用纯数组）。 */
     data class Image(val width: Int, val height: Int, val argb: IntArray) {

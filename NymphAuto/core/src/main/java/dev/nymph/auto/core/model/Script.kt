@@ -50,6 +50,58 @@ data class Script(
      * null = 不设中止条件。导入的 .zjs 无此字段时为 null。
      */
     val abortCondition: Condition? = null,
+
+    /**
+     * v2.9.14：**场景驱动**开关。默认 false = 老行为逐字不变（`pc++` 顺序执行动作链），
+     * 录制 / 导入 / 手写脚本与全部历史回放零回归。
+     *
+     * true 时，[actions] 不再是「步骤序列」，而是「场景 → 触发」规则集合：执行引擎
+     * 改为持续监视所有规则，`dev.nymph.auto.core.editor.SceneTrigger.planSceneFiring`
+     * 决定「谁的场景出现就触发谁」，而非按索引顺序无画面校验的顺序触发。悬浮编辑器用屏幕拾取装配
+     * 出的脚本置 true；每条规则带一个以拾取点为中心自动框选的 ROI 模板门控。
+     *
+     * 带默认值 + 宽容序列化（ignoreUnknownKeys/encodeDefaults），老 JSON 缺此字段
+     * 自动补 false，schemaVersion 保持 1，无需迁移链。
+     */
+    val sceneDriven: Boolean = false,
+
+    /**
+     * v2.9.15 / A3：**同轮最多触发 K 条**（冲突仲裁的脚本级上限，K=1 最安全，默认 1）。
+     *
+     * 常驻监视下同一帧可能有多条规则的场景同时出现（例如多个弹窗），若不限流就会
+     * 一轮连点 K 个坐标 —— 需求约束要求同轮多规则并发场景必须纳入仲裁上限。
+     * 带优先级（`SceneRule.priority`）与互斥组（`SceneRule.mutexGroup`）仲裁后，
+     * 由 `SceneTrigger.planSceneFiringStateful` 取前 K 条。默认值 1 → 老脚本
+     * （sceneDriven=false，不读取本字段）零回归；压缩容器 encodeDefaults=false
+     * 连默认值都不写，存量脚本落盘逐字不变。
+     */
+    val sceneMaxFiringPerRound: Int = 1,
+
+    /**
+     * v3.0.2 / 场景画布：一次「截取原画质截图当画布 → 在画布上框坐标与特征」会话的完整快照。
+     * null = 从未使用画布（老脚本 / 仍走实时屏幕拾取的脚本），行为与 v3.0.1 逐字一致。
+     * 底图与特征模板走 [assets] 资源池，本字段只存几何/阈值/key，不内嵌大图。
+     * 带默认值 + 宽容序列化，schemaVersion 保持 1，无迁移链。
+     */
+    val canvas: dev.nymph.auto.core.design.SceneCanvas? = null,
+
+    // ------------------------------------------------ v3.0.3 S4 整图校验基线（脚本级全局字段）
+    /**
+     * 整图缩放 NCC 的基线模板在 [assets] 中的 key（形如 `global:<16hex>`，指向拾取会话的
+     * 原画质整帧底图 PNG base64）。空 = 未配置整图校验 → 运行链跳过整图门、只走局部特征门，
+     * 老脚本逐字零回归。与合取门控无关，合取标记只落 `Condition(COMBINE,ALL/N,children)`。
+     *
+     * 生效边界（写死）：仅「同宽高比 + 同方向 + 同 UI」生效。跨宽高比 / 转方向由
+     * `SceneEvidence.geometryMatches` 2% 门 fail-closed，列已知未覆盖、排后续阶段。
+     */
+    val globalFingerprint: String = "",
+    /** 整图校验方法。OFF=不启用（默认，零回归）；NCC=整图缩放归一化互相关。 */
+    val globalMethod: GlobalVerifyMethod = GlobalVerifyMethod.OFF,
+    /**
+     * 整图门相似度阈值（百分制）。**保守初值，待真机回调**——宁可不点非提高命中：
+     * 收紧只会把「疑似错位」判为 fail-closed 不派发，牺牲覆盖换准确性。
+     */
+    val globalVerifySimilarity: Int = DEFAULT_GLOBAL_VERIFY_SIMILARITY,
 ) {
     /**
      * 含嵌套 children 与监听钩子的总动作数（UI/日志展示口径）。
@@ -63,8 +115,27 @@ data class Script(
         1 + countActions(a.children) + countActions(a.listeners.all())
     }
 
+    /**
+     * 脚本是否依赖文字识别通道（纯 JVM，v2.9.33）。
+     *
+     * 用于离线 OCR 不可用时的可见告警判定：仅当脚本确实用到文字锚点时才提示，
+     * 避免与文字无关的运行被无谓打扰。递归覆盖嵌套动作、条件树与监听钩子。
+     */
+    fun dependsOnText(): Boolean {
+        fun cond(c: Condition?): Boolean = c != null &&
+            (c.kind == ConditionKind.APPEAR_TEXT || c.children.any { cond(it) })
+        fun walk(list: List<Action>): Boolean = list.any { a ->
+            a.type == ActionType.CLICK_TEXT ||
+                cond(a.condition) || cond(a.postCondition) ||
+                walk(a.children) || walk(a.listeners.all())
+        }
+        return walk(actions)
+    }
+
     companion object {
         const val SCHEMA_VERSION = 1
+        /** v3.0.3 S4 整图门保守初值（百分制）：待真机回调，宁可不点非提高命中。 */
+        const val DEFAULT_GLOBAL_VERIFY_SIMILARITY = 70
     }
 }
 
@@ -100,6 +171,10 @@ enum class ActionType {
     @SerialName("toast") TOAST,
     @SerialName("varDialog") VAR_DIALOG,
 }
+
+/** v3.0.3 S4：整图校验方法。OFF 保持老脚本零回归；NCC = 整图缩放归一化互相关。 */
+@Serializable
+enum class GlobalVerifyMethod { OFF, NCC }
 
 @Serializable
 enum class CoordUnit { PCT, DP, PX }
@@ -156,7 +231,7 @@ data class Action(
     // ---- AI 找目标参数（CLICK_AI / APPEAR_AI；对标自动精灵"AI 识别"）----
     // 文字描述（如"点击右上角的设置按钮"）：本地目标检测模型把描述映射到
     // 可识别类别（COCO 80 类中文别名，见 core.vision.CocoLabels），
-    // 命中类别框的中心点即目标坐标。模型缺失/无匹配类别时如实失败归因。
+    // 命中类别框的中心点即目标坐标。模型缺失/无匹配类别时按实际情况失败归因。
     val aiLabel: String = "",
     val aiThreshold: Int = 50,        // 置信度阈值（百分制）
 
@@ -213,6 +288,17 @@ data class Action(
     // （目标 App 界面逻辑变了，需重拾取），区别于"坐标未命中"。
     // 导入的 .zjs 无此字段（为 null）；机制先行，UI 接入后可由用户补录。
     val postCondition: Condition? = null,
+
+    /**
+     * v2.9.15：**场景规则落盘格式**（模板结构 / 坐标语义 / 触发语义三处锁定项）。
+     *
+     * null（默认）= 老动作或 v2.9.14 过渡格式（整块 ROI 模板 + 绝对坐标 + 布尔边沿），
+     * 走兼容执行语义；非 null = 本版起拾取装配的新格式（稳定局部锚点 + 相对匹配坐标 +
+     * 带状态触发机）。缺省 null 保证全部历史脚本 / 录制 / 导入 / golden 测试零回归，
+     * 压缩容器 encodeDefaults=false 连 null 都不写，存量落盘逐字不变。
+     * 详见 dev.nymph.auto.core.model.SceneRule 的类注释与 ADR-031。
+     */
+    val sceneRule: SceneRule? = null,
 )
 
 @Serializable

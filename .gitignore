@@ -1,0 +1,28 @@
+# Gradle / Kotlin 构建缓存
+.gradle/
+.kotlin/
+build/
+**/build/
+.cxx/
+**/.cxx/
+
+# IDE
+.idea/
+*.iml
+local.properties
+
+# 构建产物 / 签名密钥（绝不入库）
+*.apk
+*.aab
+*.idsig
+*.jks
+*.keystore
+*.p12
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 凭据（绝不入库）
+*_token
+git-credentials

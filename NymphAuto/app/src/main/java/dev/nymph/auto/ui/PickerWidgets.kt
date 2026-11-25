@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 package dev.nymph.auto.ui
 
+import java.util.Locale
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
@@ -15,6 +16,7 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import dev.nymph.auto.core.vision.PointerTouchTarget
 
 /** 拾取模式：点拾取 / 框选区域（找图 ROI、找色范围、模板截取）。 */
 enum class PickerMode { POINT, REGION }
@@ -23,6 +25,10 @@ enum class PickerMode { POINT, REGION }
 internal enum class HandleAction {
     CONFIRM, CANCEL, MODE, MAGNIFIER, SNAP, RULER,
     UP, DOWN, LEFT, RIGHT,
+    /** v2.9.49：多特征框会话——把当前框落定并再开一个空框。 */
+    ADD_BOX,
+    /** v2.9.49：多特征框会话——撤销最近落定的一个框。 */
+    DEL_BOX,
 }
 
 /**
@@ -43,6 +49,8 @@ internal class PickerOverlayView(context: Context) : View(context) {
     var mode = PickerMode.POINT
     var regionA: FloatArray? = null
     var regionB: FloatArray? = null
+    /** v2.9.49：多框会话已落定的框（屏幕绝对像素四元组 l,t,r,b），淡色显示。 */
+    var confirmedRects: List<FloatArray> = emptyList()
     var rulersEnabled = false
     var magnifierEnabled = false
     var magnifierBitmap: Bitmap? = null
@@ -63,6 +71,16 @@ internal class PickerOverlayView(context: Context) : View(context) {
     }
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0x22FB7185.toInt(); style = Paint.Style.FILL
+    }
+    /** v2.9.49：已落定特征框——青色淡填充 + 描边，与当前正在拖的红框区分。 */
+    private val confirmedFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0x184ADE9F.toInt(); style = Paint.Style.FILL
+    }
+    private val confirmedStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xCC4ADE9F.toInt(); style = Paint.Style.STROKE; strokeWidth = 2f
+    }
+    private val confirmedNum = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF4ADE9F.toInt(); textSize = 11f * d; style = Paint.Style.FILL
     }
     private val rulerLine = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0x66FFFFFF.toInt(); strokeWidth = 1f
@@ -99,7 +117,18 @@ internal class PickerOverlayView(context: Context) : View(context) {
         c.drawLine(0f, crossY, w, crossY, line)
         c.drawLine(crossX, 0f, crossX, h, line)
 
-        if (mode == PickerMode.REGION) drawRegion(c, w, h)
+        if (mode == PickerMode.REGION) {
+            // v2.9.49：先画已落定的框（编号 1..N），再画当前正在拖的框
+            confirmedRects.forEachIndexed { i, rc ->
+                if (rc.size >= 4) {
+                    box.set(rc[0], rc[1], rc[2], rc[3])
+                    c.drawRect(box, confirmedFill)
+                    c.drawRect(box, confirmedStroke)
+                    c.drawText("#${i + 1}", rc[0] + 3f * d, rc[1] + 13f * d, confirmedNum)
+                }
+            }
+            drawRegion(c, w, h)
+        }
         else drawCross(c)
 
         drawReadout(c, w, h)
@@ -151,7 +180,7 @@ internal class PickerOverlayView(context: Context) : View(context) {
         val line1 = "X $px  Y $py"
         val xp = if (screenW > 0) 100.0 * px / screenW else 0.0
         val yp = if (screenH > 0) 100.0 * py / screenH else 0.0
-        val line2 = "%.4f%%  %.4f%%".format(xp, yp) + if (snapOn) "  ⌖" else ""
+        val line2 = String.format(Locale.US, "%.4f%%  %.4f%%", xp, yp) + if (snapOn) "  ⌖" else ""
         val bw = max(tagText.measureText(line1), tagSub.measureText(line2)) + 16f * d
         val bh = 40f * d
         var left = crossX + 20f * d
@@ -224,7 +253,7 @@ internal class PickerOverlayView(context: Context) : View(context) {
 }
 
 /**
- * 极小可拖动控制手柄（v2.7.0，替代 v2.6.0 的「傻大粗」全屏按钮组）。
+ * 极小可拖动控制手柄（v2.7.0，替代 v2.6.0 的「尺寸与视觉密度超标」全屏按钮组）。
  *
  * 收起态只有一个 30dp 半透明圆点，几乎不遮挡；点一下展开 196×156dp 的
  * 极简工具条（读数 / 模式 / 放大镜 / 吸附 / 标尺 / ±1px / 确认 / 取消）。
@@ -245,6 +274,10 @@ internal class PickerHandleView(context: Context) : View(context) {
     var snapOn = false
     var rulersOn = false
     var readout = ""
+    /** v2.9.49：多特征框会话（REGION + multiBox）时，工具条把方向键换成加框/删框。 */
+    var multiBox = false
+    /** 已落定的特征框数量（仅为工具条显示，真源在 PickerSession）。 */
+    var boxCount = 0
 
     /**
      * v2.9.5：抓取通知（按下瞬间）。会话据此记录「手指屏幕绝对坐标 − 准星真值」
@@ -256,8 +289,8 @@ internal class PickerHandleView(context: Context) : View(context) {
      * v2.9.5：**绝对定位**拖动（传手指的屏幕绝对坐标）。
      *
      * 旧版传的是相对窗口的增量（`e.x - lastX`），而手柄窗口自身在跟随手指
-     * 移动 —— 窗口每动一次，下一帧的相对增量就被抵消掉，手柄于是「一顿一顿」
-     * 地滞后跳动（真机录屏可复现：手柄与准星明显不重合，就是用户说的抽搐）。
+     * 移动 —— 窗口每动一次，下一帧的相对增量就被抵消掉，手柄于是「周期性」
+     * 地滞后跳动（真机录屏可复现：手柄与准星明显不重合，即周期性位置抖动）。
      * 改为传屏幕绝对坐标，由会话用抓取偏移反算目标位置，与窗口位置无关。
      */
     var onDragTo: ((rawX: Float, rawY: Float) -> Unit)? = null
@@ -310,10 +343,45 @@ internal class PickerHandleView(context: Context) : View(context) {
         }
     }
 
+    /**
+     * v2.9.29：抓手在窗口内的绘制位置（相对窗口左上角）。
+     *
+     * 窗口边长放宽到 48dp 命中区后，窗口贴边会被夹在屏内，圆心若仍画在窗口中心，
+     * 就会与准星真值分离——准星在 0% 时圆却显示在 48dp/2 处，同一屏出现两个位置。
+     * 这里由会话每帧写入「真值 − 窗口左上角」，圆始终压在准星上。
+     */
+    var crossInWindowX: Float? = null
+    var crossInWindowY: Float? = null
+
+    /** 放行态：捕获层让路给背后应用，抓手转暗提示当前不能拖。 */
+    var released = false
+
+    /** 长按抓手：临时放行。 */
+    var onLongPress: (() -> Unit)? = null
+
+    private var longPressFired = false
+    private val longPressRunnable = Runnable {
+        if (!dragging) {
+            longPressFired = true
+            cancelRepeat()
+            onLongPress?.invoke()
+        }
+    }
+
     companion object {
-        fun collapsedSize(d: Float): Int = (30 * d).toInt()
+        /**
+         * 抓手窗口边长（命中区）。
+         *
+         * 取 48dp 而不是视觉直径 30dp：Android 无障碍与 Material 的最小触摸目标
+         * 都是 48dp，30dp 在边缘处实际可触面积不足一半，用户必须精确瞄准才能拖。
+         * 视觉圆仍按 [VISUAL_RADIUS_DP] 绘制，窗口多出的部分是透明命中余量。
+         */
+        fun collapsedSize(d: Float): Int = (PointerTouchTarget.MIN_TOUCH_DP * d).toInt()
         fun expandedW(d: Float): Int = (196 * d).toInt()
         fun expandedH(d: Float): Int = (156 * d).toInt()
+
+        /** 折叠态视觉圆半径，与命中区解耦后固定为该值。 */
+        private const val VISUAL_RADIUS_DP = 13f
     }
 
     fun setExpanded(v: Boolean) {
@@ -328,12 +396,21 @@ internal class PickerHandleView(context: Context) : View(context) {
         val w = width.toFloat()
         val h = height.toFloat()
         if (!expanded) {
-            val cx = w / 2f
-            val cy = h / 2f
-            c.drawCircle(cx, cy, min(cx, cy) - 2f, dot)
-            c.drawCircle(cx, cy, min(cx, cy) - 2f, dotRing)
+            val cx = crossInWindowX ?: (w / 2f)
+            val cy = crossInWindowY ?: (h / 2f)
+            val r = VISUAL_RADIUS_DP * d
+            // 放行态整体降透明度：抓手位置不变，但当前不接管触摸，避免被误认为拖动失效。
+            val a = if (released) 80 else 255
+            dot.alpha = a
+            dotRing.alpha = a
+            cross.alpha = a
+            c.drawCircle(cx, cy, r, dot)
+            c.drawCircle(cx, cy, r, dotRing)
             c.drawLine(cx - 5f * d, cy, cx + 5f * d, cy, cross)
             c.drawLine(cx, cy - 5f * d, cx, cy + 5f * d, cross)
+            dot.alpha = 255
+            dotRing.alpha = 255
+            cross.alpha = 255
             return
         }
         c.drawRoundRect(1f, 1f, w - 1f, h - 1f, 10f * d, 10f * d, panel)
@@ -349,15 +426,25 @@ internal class PickerHandleView(context: Context) : View(context) {
             Triple(HandleAction.SNAP, "吸附", snapOn),
             Triple(HandleAction.RULER, "标尺", rulersOn),
         ))
-        // ±1px 十字（长按连发）
-        val cs = 30f * d
-        val cx = w / 2f
-        chip(c, RectF(cx - cs / 2, y + cs + 2f * d, cx + cs / 2, y + 2 * cs + 2f * d), HandleAction.DOWN, "▼", false)
-        chip(c, RectF(cx - cs / 2, y, cx + cs / 2, y + cs), HandleAction.UP, "▲", false)
-        chip(c, RectF(cx - cs * 1.6f, y + cs, cx - cs * 0.6f, y + 2 * cs), HandleAction.LEFT, "◀", false)
-        chip(c, RectF(cx + cs * 0.6f, y + cs, cx + cs * 1.6f, y + 2 * cs), HandleAction.RIGHT, "▶", false)
-        c.drawText("±1px 长按连发", 8f * d, y + cs + 10f * d, sub)
-        y += 2 * cs + 8f * d
+        if (multiBox && mode == PickerMode.REGION) {
+            // v2.9.49：框选态的方向键由「新增特征框」承接；点拾取态方向键完全不变。
+            val cs = 30f * d
+            val bw = (w - 24f * d) / 2f
+            chip(c, RectF(8f * d, y, 8f * d + bw - 3f * d, y + cs), HandleAction.ADD_BOX, "＋加框", false)
+            chip(c, RectF(12f * d + bw, y, 12f * d + 2 * bw, y + cs), HandleAction.DEL_BOX, "−删框", false)
+            c.drawText("已落定 $boxCount 框 · 拖两角定当前框再加", 8f * d, y + cs + 12f * d, sub)
+            y += cs + 16f * d
+        } else {
+            // ±1px 十字（长按连发）——点拾取 / 单框 REGION 保持 v2.9.48 逐字不变
+            val cs = 30f * d
+            val cx = w / 2f
+            chip(c, RectF(cx - cs / 2, y + cs + 2f * d, cx + cs / 2, y + 2 * cs + 2f * d), HandleAction.DOWN, "▼", false)
+            chip(c, RectF(cx - cs / 2, y, cx + cs / 2, y + cs), HandleAction.UP, "▲", false)
+            chip(c, RectF(cx - cs * 1.6f, y + cs, cx - cs * 0.6f, y + 2 * cs), HandleAction.LEFT, "◀", false)
+            chip(c, RectF(cx + cs * 0.6f, y + cs, cx + cs * 1.6f, y + 2 * cs), HandleAction.RIGHT, "▶", false)
+            c.drawText("±1px 长按连发", 8f * d, y + cs + 10f * d, sub)
+            y += 2 * cs + 8f * d
+        }
         // 确认 / 取消
         val bw = (w - 20f * d) / 2f
         chip(c, RectF(8f * d, y, 8f * d + bw - 3f * d, y + 26f * d), HandleAction.CANCEL, "取消", false, chipOff)
@@ -393,6 +480,10 @@ internal class PickerHandleView(context: Context) : View(context) {
                 // v2.9.5：把「手指屏幕坐标」交给会话去记抓取偏移。
                 onGrab?.invoke(e.rawX, e.rawY)
                 downHot = if (expanded) hot.entries.firstOrNull { it.value.contains(e.x, e.y) }?.key else null
+                // v2.9.29：折叠态长按 = 临时放行；展开态长按无意义（面板本身不挡操作）。
+                longPressFired = false
+                cancelLongPressWatch()
+                if (!expanded) postDelayed(longPressRunnable, 550L)
                 if (downHot in setOf(HandleAction.UP, HandleAction.DOWN, HandleAction.LEFT, HandleAction.RIGHT)) {
                     repeatAction = downHot
                     postDelayed(repeatRunnable, 400L)
@@ -408,15 +499,18 @@ internal class PickerHandleView(context: Context) : View(context) {
                 if (canDrag && moved > 4f * d) {
                     dragging = true
                     cancelRepeat()
+                    cancelLongPressWatch()
                     onDragTo?.invoke(e.rawX, e.rawY)
                 }
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 cancelRepeat()
+                cancelLongPressWatch()
                 val moved = abs(e.rawX - downRawX) + abs(e.rawY - downRawY)
                 if (dragging) onDragEnd?.invoke()
-                if (!dragging && moved < 8f * d) {
+                // 长按已触发放行时不再当作单击，否则松手会顺带展开面板。
+                if (!dragging && !longPressFired && moved < 8f * d) {
                     if (!expanded) {
                         if (allowExpand) setExpanded(true)
                     } else downHot?.let { onAction?.invoke(it) } ?: setExpanded(false)
@@ -430,5 +524,9 @@ internal class PickerHandleView(context: Context) : View(context) {
     private fun cancelRepeat() {
         repeatAction = null
         removeCallbacks(repeatRunnable)
+    }
+
+    private fun cancelLongPressWatch() {
+        removeCallbacks(longPressRunnable)
     }
 }

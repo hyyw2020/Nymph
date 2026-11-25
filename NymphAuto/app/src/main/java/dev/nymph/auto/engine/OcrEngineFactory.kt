@@ -9,8 +9,8 @@ import dev.nymph.auto.core.log.RunLog
  *
  * 1. **ONNX Runtime 1.31.1 + 可插拔 PP-OCRv5 ONNX 模型**：模型在本机、
  *    纯 CPU、不联网、不依赖 GMS —— 最符合本工程「无 INTERNET 权限」的承诺。
- * 2. **ML Kit 中文**：仅当设备有 GMS 且模型已由 Play 服务缓存时可用；
- *    作为兼容兜底（无 GMS / 无网络时其 available 会回落）。
+ * 2. **ML Kit 中文（bundled）**：`com.google.mlkit:text-recognition-chinese`
+ *    为静态打包坐标，模型随库进入 APK，不依赖 GMS 侧按需下载；作为兼容兜底。
  * 3. **null**：两者皆不可用，VisionPipeline 回退到无障碍节点文本通道，
  *    录制依旧能产出节点/模板/坐标锚点，功能不中断。
  *
@@ -32,7 +32,7 @@ object OcrEngineFactory {
 
         val mlkit = runCatching { MlKitOcrEngine() }.getOrNull()
         if (mlkit != null && mlkit.available) {
-            RunLog.i("Ocr", "采用 ML Kit 中文兜底（需 GMS 已缓存模型）")
+            RunLog.i("Ocr", "采用 ML Kit 中文兜底（bundled 静态打包，无 GMS 依赖）")
             return mlkit
         }
         runCatching { mlkit?.close() }

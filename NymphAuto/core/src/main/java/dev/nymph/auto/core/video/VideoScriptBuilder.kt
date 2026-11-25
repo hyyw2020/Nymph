@@ -14,7 +14,7 @@ import dev.nymph.auto.core.model.Script
  * 在这里落脚本。生成的是**特征锚定**动作（CLICK_IMAGE 找图点击），而不是
  * 固定坐标回放——目标移动、换分辨率、界面轻微改版时仍会重新定位。
  *
- * 模板截取失败的动作如实降级为坐标点击（TAP），不假装成找图。
+ * 模板截取失败的动作显式降级为坐标点击（TAP），不误报成找图。
  *
  * v2.9.2：新增 [build] 的 `repeatCount` 参数（默认 1，老调用零回归）。
  * 用户录的往往是一段「重复操作」（如游戏连续扫荡），若生成脚本只跑一遍，
@@ -103,7 +103,7 @@ object VideoScriptBuilder {
         val loop = LoopPolicy.normalize(repeatCount)
         val mode = if (opts.waitForAppearance) {
             "门控模式：${WaitGate.description()}；$gated 个找图动作等待画面出现，" +
-                "${ordered.size - gated} 个模板缺失动作按坐标+固定延时兜底（如实降级）"
+                "${ordered.size - gated} 个模板缺失动作按坐标+固定延时兜底（显式降级）"
         } else {
             "固定延时模式：按视频触点时间间隔回放（v2.9.5 行为）"
         }

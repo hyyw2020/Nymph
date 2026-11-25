@@ -35,6 +35,9 @@ class ScriptStore(private val dir: File) {
         // v2.9.0 启动恢复：清掉上次写入在 rename 之前被中断遗留的半成品，
         // 它们绝不能被当脚本加载（本来 list() 也只认 .json，这里显式清理）。
         runCatching { AtomicTextFile.cleanupStale(dir) }
+        // v2.9.39 启动迁移：消除「不同文件解码出相同 name」的脏数据。否则 UI 以
+        // name 作 LazyColumn key 会崩、按 name 删除/编辑会串台。幂等，无重复零改动。
+        runCatching { migrateDuplicateNames() }
     }
 
     /** 全部脚本（按保存时间倒序；坏文件跳过）。 */
@@ -51,6 +54,73 @@ class ScriptStore(private val dir: File) {
             )
         }
         .sortedByDescending { it.savedAt }
+
+    /**
+     * v2.9.39：幂等迁移，消除「不同文件解码出相同 name」的脏数据。
+     *
+     * 成因：v2.9.35 之前 [safeName] 把所有中文名折叠成单个 `script.json`；升级到
+     * v2.9.35 后中文名按原样落盘。若老版本遗留的 `script.json`（内部 name 仍为
+     * 「未命名脚本」）与新版本 `未命名脚本.json` 并存，[list] 会解出两个同名项：
+     * Compose 列表以 name 作 key 直接崩溃，按 name 删除/编辑也会互相串台。
+     *
+     * 处理：保留每个 name 最新的一项原名不变（[list] 已按 savedAt 倒序），其余同名
+     * 旧项改名为 `<原名> (2)`、`<原名> (3)`…直到不与任何现有 name 冲突，并连同
+     * 文件名一起写回。改名项的动作体、revision 全部保留，只改展示名/文件名。
+     * 幂等：全部 name 唯一时零写入。坏文件由 [list] 自动跳过，不参与迁移。
+     *
+     * @return 实际改名的文件数。
+     */
+    fun migrateDuplicateNames(): Int = synchronized(lock) {
+        val items = list()
+        if (items.isEmpty()) return@synchronized 0
+        val used = HashSet<String>()
+        var renamed = 0
+        // list() 已按 savedAt 倒序：每个 name 的首次出现（最新）保留原名。
+        for (item in items) {
+            if (used.add(item.name)) continue
+            val script = runCatching { ScriptCodec.decode(item.file.readText()) }.getOrNull()
+                ?: continue
+            var suffix = 2
+            var candidate: String
+            do {
+                candidate = "${item.name} ($suffix)"
+                suffix++
+            } while (used.contains(candidate) || File(dir, safeName(candidate) + SUFFIX).exists())
+            used.add(candidate)
+            val target = File(dir, safeName(candidate) + SUFFIX)
+            val ok = runCatching {
+                AtomicTextFile.write(target, ScriptCodec.encode(script.copy(name = candidate)))
+            }.getOrDefault(false)
+            if (ok) {
+                // 沿用旧文件的时间戳，避免迁移把改名项顶到列表最前、打乱保存顺序。
+                runCatching { target.setLastModified(item.savedAt) }
+                if (target.absolutePath != item.file.absolutePath) {
+                    // v2.9.41（④）：此前 runCatching{delete()} 吞掉失败且无告警——旧文件
+                    // 仍以 .json 结尾残留时，下次启动 list() 会再次解出重复 name，再生成
+                    // (3)/(4)…，与「幂等」声明不符。改为：删除失败先告警，再兜底把旧文件
+                    // 改名为 .json.orphan-<nano>（脱离 .json 识别、list() 不再加载、清理器
+                    // 也不会误删），彻底封死重复迁移死角；两步都失败则 ERROR 告警，数据未丢。
+                    val deleted = runCatching { item.file.delete() }.getOrDefault(false)
+                    if (!deleted && item.file.exists()) {
+                        dev.nymph.auto.core.log.RunLog.w(
+                            "ScriptStore",
+                            "重名迁移：已写入 ${target.name}，但旧文件 ${item.file.name} 删除失败，尝试改名隔离",
+                        )
+                        val orphan = File(item.file.path + ".orphan-" + System.nanoTime().toString(36))
+                        val quarantined = runCatching { item.file.renameTo(orphan) }.getOrDefault(false)
+                        if (!quarantined) {
+                            dev.nymph.auto.core.log.RunLog.e(
+                                "ScriptStore",
+                                "重名迁移：旧文件 ${item.file.name} 删除与改名隔离均失败，仍以原名残留",
+                            )
+                        }
+                    }
+                }
+                renamed++
+            }
+        }
+        renamed
+    }
 
     /**
      * 保存（写入/覆盖），返回文件。
@@ -101,7 +171,12 @@ class ScriptStore(private val dir: File) {
                 s.forEach { c ->
                     append(
                         when {
-                            c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9' || c in "._-一-龥（）()【】" -> c
+                            c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9'
+                                || c in "._-（）()【】"
+                                // v2.9.35：原写法 `c in "._-一-龥..."` 里 "一-龥" 只是
+                                // 三个孤立字符，并非 CJK 区间——中文名全被替换成 '_'，
+                                // trim 后回退 "script"，多个中文脚本互相覆盖、数据丢失。
+                                || c in '\u4E00'..'\u9FFF' -> c
                             else -> '_'
                         },
                     )

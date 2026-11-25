@@ -69,7 +69,7 @@ class RecordPanel(context: Context) : LinearLayout(context) {
         }
 
         tvStatus = TextView(context).apply {
-            text = "● 录制中 · 0 步"
+            text = "● 录制中 · 0 条事件"
             textSize = 13f
             setTextColor(OverlayTheme.DANGER)
             gravity = Gravity.CENTER
@@ -84,7 +84,7 @@ class RecordPanel(context: Context) : LinearLayout(context) {
                 bottomMargin = (4 * d).toInt()
             }
         }
-        val btnUndo = button("撤销上一步", OverlayTheme.BTN_BG)
+        val btnUndo = button("撤销上一条", OverlayTheme.BTN_BG)
         val btnStop = button("停止并保存", OverlayTheme.DANGER_STRONG)
 
         addView(tvStatus)
@@ -96,7 +96,7 @@ class RecordPanel(context: Context) : LinearLayout(context) {
     }
 
     fun setCount(n: Int, elapsedSec: Long) {
-        tvStatus.text = "● 录制中 · $n 步 · ${elapsedSec}s"
+        tvStatus.text = "● 录制中 · $n 条事件 · ${elapsedSec}s"
     }
 
     /**
@@ -119,7 +119,7 @@ class RecordPanel(context: Context) : LinearLayout(context) {
     // v2.9.4 修复两处真 bug（状态机细节见 core DragGesture）：
     //  1. onTouchEvent 对 ACTION_DOWN 必须返回 true。落点在状态/提示文字这类
     //     非 clickable 区域时，DOWN 若不消费，面板不会成为 touch target，后续
-    //     MOVE 根本不再派发过来 —— 旧版面板实际拖不动；
+    //     MOVE 不再派发过来 —— 旧版面板实际无位移响应；
     //  2. 增量基准只在真正产生位移时更新，不再被 onInterceptTouchEvent 反复覆盖。
 
     override fun onInterceptTouchEvent(e: MotionEvent): Boolean = when (e.actionMasked) {

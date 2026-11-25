@@ -34,7 +34,7 @@ class CocoLabelsTest {
 
     @Test
     fun `无法映射的描述返回 null 而非乱猜`() {
-        assertNull("UI 描述不在 COCO 80 类内，必须如实为空", CocoLabels.resolve("设置按钮"))
+        assertNull("UI 描述不在 COCO 80 类内，必须按实际情况为空", CocoLabels.resolve("设置按钮"))
         assertNull(CocoLabels.resolve("右上角的确认"))
         assertNull(CocoLabels.resolve(""))
         assertNull(CocoLabels.resolve("   "))

@@ -75,6 +75,8 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
     var historyFor by remember { mutableStateOf<String?>(null) }
     // v2.7.0：从 mp4 半自动生成特征脚本的工作台
     var showVideoImport by remember { mutableStateOf(false) }
+    // v3.0.0：轻量定点点击快路径（三步：坐标→间隔→运行）
+    var showSimpleTap by remember { mutableStateOf(false) }
 
     fun toast(msg: String) {
         Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
@@ -113,7 +115,7 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
     /**
      * v2.8.0：把「编辑动作」切到系统级悬浮窗（TYPE_APPLICATION_OVERLAY + 前台服务）。
      * 与 [run] 一样主动把本 Activity 退到后台，让用户直接看到浮在其他 APP
-     * 界面之上的编辑器——这才是差评要的「脱离 NymphAuto 运行」。
+     * 界面之上的编辑器——这才是评估结论指向的「脱离 NymphAuto 运行」。
      */
     fun floatEdit(name: String) {
         if (!Settings.canDrawOverlays(context)) {
@@ -140,8 +142,8 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
         LogScreen(
             loadLines = { vm.logTail() },
             onBack = { showLogs = false },
-            onShare = { vm.shareLogs()?.let(::toast) },
-            onExport = { vm.exportBundle()?.let(::toast) },
+            onShare = { vm.shareLogs { err -> err?.let(::toast) } },
+            onExport = { vm.exportBundle { err -> err?.let(::toast) } },
             onClear = { vm.clearLogs() },
         )
         return
@@ -173,10 +175,10 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
             TopAppBar(
                 title = {
                     Column {
-                        Text("NymphAuto", style = MaterialTheme.typography.titleLarge)
+                        Text("NymphAuto", style = Ds.Title)
                         Text(
                             "本地 · 离线 · 不占录屏权限",
-                            style = MaterialTheme.typography.labelSmall,
+                            style = Ds.Label,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
@@ -237,8 +239,9 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
                             onQuery = vm::setQuery,
                             onRun = ::run,
                             onEdit = { name ->
-                                vm.loadScript(name)?.let { editing = it }
-                                    ?: toast("脚本加载失败")
+                                vm.loadScript(name) { script ->
+                                    script?.let { editing = it } ?: toast("脚本加载失败")
+                                }
                             },
                             onFloatEdit = ::floatEdit,
                             onCreate = { editing = Script(name = "未命名脚本") },
@@ -247,6 +250,8 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
                             onDelete = { pendingDelete = it },
                             onImport = onPickImport,
                             onVideoImport = { showVideoImport = true },
+                            // ADR-075 D7：停用「轻量定点点击」第 4 弹窗，统一引导到工作台建档。
+                            onSimpleTap = { editing = Script(name = "未命名脚本") },
                             onStopRun = { vm.stopRunning(); toast("正在停止…") },
                         )
                     }
@@ -291,7 +296,7 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
                             notifyLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                         }
                     },
-                    onExportBundle = { vm.exportBundle()?.let(::toast) },
+                    onExportBundle = { vm.exportBundle { err -> err?.let(::toast) } },
                     onClearLogs = { vm.clearLogs(); toast("日志已清空") },
                     onRefresh = { vm.refresh(); toast("已重新检测") },
                     onVisual = vm::setVisual,
@@ -315,7 +320,7 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
             text = {
                 Column {
                     Text(
-                        "该脚本含「运行 JS 代码」动作，可调用设备能力、读写变量。" +
+                        "该脚本含「运行 JS 代码」场景，可调用设备能力、读写变量。" +
                             "只在你信任脚本来源时允许。",
                         style = MaterialTheme.typography.bodyMedium,
                     )
@@ -342,13 +347,16 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
         )
     }
 
+    // ADR-075 D7：SimpleTapDialog 调用已停用（第 4 弹窗移除，统一走工作台）。
+    // 文件保留不删；showSimpleTap 状态保留仅为编译兼容，不再有弹窗消费。
+
     if (showVideoImport) {
         VideoImportDialog(
             onDismiss = { showVideoImport = false },
             onSave = { script ->
                 val err = vm.saveScript(script)
                 vm.refresh()
-                if (err == null) toast("已从视频生成「${script.name}」（${script.actions.size} 个特征动作）")
+                if (err == null) toast("已从视频生成「${script.name}」（${script.actions.size} 个特征场景）")
                 else toast(err)
             },
         )
@@ -364,7 +372,7 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
                     if (versions.isEmpty()) {
                         Text(
                             "暂无历史版本。每次保存会自动留存上一版（最多最近 8 版），" +
-                                "误删动作或自动覆盖后可在这里回滚。",
+                                "误删场景或自动覆盖后可在这里回滚。",
                             style = MaterialTheme.typography.bodySmall,
                         )
                     } else {
@@ -380,7 +388,7 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
                                 else toast(err)
                                 historyFor = null
                             }) {
-                                Text("r${v.revision} · ${v.steps} 步 · ${fmtHistoryTime(v.savedAt)}")
+                                Text("r${v.revision} · ${v.steps} 个场景 · ${fmtHistoryTime(v.savedAt)}")
                             }
                         }
                     }

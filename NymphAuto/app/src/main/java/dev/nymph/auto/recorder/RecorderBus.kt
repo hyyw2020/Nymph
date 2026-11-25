@@ -31,7 +31,7 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * ## 可观测性（v1.2.1）
  *
- * 早期版本事件链路完全静默：只要没有悬浮窗权限，用户既看不到步数、也看不到日志，
+ * 早期版本事件链路完全静默：只要没有悬浮窗权限，界面既不呈现步数、也不呈现日志，
  * 无法区分「系统没发事件」和「事件被丢弃」。这里补上**严格节流**的诊断计数与日志：
  * 前 5 条逐条打印，之后每 20 条打印一次汇总，结束时由 [diagnostics] 给出完整统计。
  * 计数用原子量、日志用固定间隔，不在回调里做任何可能阻塞的操作。
@@ -47,9 +47,20 @@ object RecorderBus {
     var sink: ((RecordEvent) -> Unit)? = null
         private set
 
-    /** 录制参考屏幕坐标系，由会话启动时设置。 */
+    /** 录制参考屏幕坐标系，由会话启动时设置（仅作 provider 缺席时的兜底）。 */
     @Volatile
     var frame: Frame? = null
+        private set
+
+    /**
+     * v2.9.27：每个事件转换时读取「当前」屏幕坐标系的提供者。
+     *
+     * 旧实现把 frame 在会话启动时快照一次，录制过程中若屏幕方向 / 尺寸变化
+     * （现场日志：启动 1280×2800，运行 2800×1280），后续手势的绝对像素仍按
+     * 旧分母换算百分比，AnchorSelector.pct 把越界值收敛到边缘，坐标静默错乱。
+     */
+    @Volatile
+    var currentFrameProvider: (() -> Frame?)? = null
         private set
 
     /**
@@ -101,8 +112,9 @@ object RecorderBus {
      * [selfPkg] 非空时启用「过滤本应用事件 + 待命」双保险。
      * 老调用点不传则完全等同 v2.6.0。
      */
-    fun start(frame: Frame?, selfPkg: String = "") {
+    fun start(frame: Frame?, selfPkg: String = "", currentFrameProvider: (() -> Frame?)? = null) {
         this.frame = frame
+        this.currentFrameProvider = currentFrameProvider
         gate = RecordGate(selfPkg)
         startedAtMs = SystemClock.elapsedRealtime()
         seq = 0
@@ -124,6 +136,7 @@ object RecorderBus {
     fun stop() {
         sink = null
         frame = null
+        currentFrameProvider = null
         gate = RecordGate()
         onArmedChanged = null
     }
@@ -285,7 +298,7 @@ object RecorderBus {
             lastScrollY = sy
         }
 
-        val f = frame
+        val f = runCatching { currentFrameProvider?.invoke() }.getOrNull() ?: frame
         val at = SystemClock.elapsedRealtime() - startedAtMs
         val s = ++seq
         return RecordEvent(

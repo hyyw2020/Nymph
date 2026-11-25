@@ -113,4 +113,49 @@ class ImageFinderTest {
         assertNotNull("按 1.5 尺度应命中", hit)
     }
 
+    // ===== v2.9.26：未命中的最佳窗口位置可观测（现场归因依据） =====
+
+    @Test
+    fun `未命中时最佳窗口位置落在搜索窗内`() {
+        val screen = noise(300, 300, seed = 41)
+        val tpl = noise(40, 40, seed = 42)
+        val r = ImageFinder.findDetailed(screen, tpl, 25.0, 40.0, 75.0, 80.0, 82, 0.0, 1.0)
+        assertNull(r.hit)
+        assertTrue("score=${r.bestScore}", r.bestScore >= 0.0)
+        // 搜索窗像素范围：x 75~225，y 120~240；最佳窗口中心必须落在其中
+        assertTrue("bestCx=${r.bestCx}", r.bestCx in 75..225)
+        assertTrue("bestCy=${r.bestCy}", r.bestCy in 120..240)
+    }
+
+    @Test
+    fun `元素在场但外观失真时未命中且最佳窗口仍在原位`() {
+        val screen = noise(400, 300, seed = 51)
+        val tpl = crop(screen, 200, 120, 40, 40)
+        // 复刻现场：元素出现了，但渲染内容与拾取快照不同（一半像素被换掉）
+        val distorted = screen.copy(argb = screen.argb.copyOf())
+        val rnd = Random(52)
+        for (j in 0 until 40) for (i in 0 until 40) {
+            val idx = (120 + j) * screen.width + (200 + i)
+            val orig = screen.argb[idx]
+            val nv = rnd.nextInt(256)
+            val mixed = ((orig and 0xFF) + nv) / 2
+            distorted.argb[idx] = (0xFF shl 24) or (mixed shl 16) or (mixed shl 8) or mixed
+        }
+        val r = ImageFinder.findDetailed(distorted, tpl, 0.0, 0.0, 100.0, 100.0, 82, 0.0, 1.0)
+        // 半失真不足以过 0.82 阈值 → fail-closed 不命中；但最佳窗口必须仍指向元素原位
+        assertNull("score=${r.bestScore}", r.hit)
+        assertTrue("score=${r.bestScore}", r.bestScore < 0.82)
+        assertTrue("bestCx=${r.bestCx}", kotlin.math.abs(r.bestCx - 220) <= 10)
+        assertTrue("bestCy=${r.bestCy}", kotlin.math.abs(r.bestCy - 140) <= 10)
+    }
+
+    @Test
+    fun `无可评窗口时最佳位置为 -1`() {
+        val screen = solid(100, 100, 0xFF808080.toInt())
+        val tpl = solid(10, 10, 0xFF808080.toInt())
+        val r = ImageFinder.findDetailed(screen, tpl, 0.0, 0.0, 100.0, 100.0, 82, 0.0, 1.0)
+        assertNull(r.hit)
+        assertEquals(-1, r.bestCx)
+        assertEquals(-1, r.bestCy)
+    }
 }

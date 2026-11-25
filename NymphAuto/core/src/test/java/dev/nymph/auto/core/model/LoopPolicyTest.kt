@@ -74,4 +74,52 @@ class LoopPolicyTest {
         repeat(1000) { n -> assertFalse(LoopPolicy.isFinished(n, 0)) }
         assertFalse(LoopPolicy.isFinished(Int.MAX_VALUE, 0))
     }
+
+    // ------------------------------------------------------------ v2.9.20 范式作用域
+
+    @Test
+    fun `范式作用域由 sceneDriven 唯一决定`() {
+        assertEquals(LoopPolicy.LoopScope.SEQUENTIAL, LoopPolicy.scopeOf(false))
+        assertEquals(LoopPolicy.LoopScope.SCENE_DRIVEN, LoopPolicy.scopeOf(true))
+        assertTrue(LoopPolicy.appliesTo(LoopPolicy.LoopScope.SEQUENTIAL))
+        assertFalse(LoopPolicy.appliesTo(LoopPolicy.LoopScope.SCENE_DRIVEN))
+    }
+
+    @Test
+    fun `顺序范式文案沿用既有轮次语义`() {
+        assertEquals(LoopPolicy.label(5), LoopPolicy.labelFor(5, LoopPolicy.LoopScope.SEQUENTIAL))
+        assertEquals("无限循环", LoopPolicy.labelFor(0, LoopPolicy.LoopScope.SEQUENTIAL))
+    }
+
+    @Test
+    fun `场景范式文案不呈现循环次数数值`() {
+        val scoped = LoopPolicy.labelFor(5, LoopPolicy.LoopScope.SCENE_DRIVEN)
+        assertEquals(LoopPolicy.SCENE_DRIVEN_LABEL, scoped)
+        assertEquals(scoped, LoopPolicy.labelFor(0, LoopPolicy.LoopScope.SCENE_DRIVEN))
+        assertEquals(scoped, LoopPolicy.labelFor(9999, LoopPolicy.LoopScope.SCENE_DRIVEN))
+        assertFalse(scoped.contains("5"))
+    }
+
+    @Test
+    fun `场景范式说明显式声明字段作用域与结束条件`() {
+        val notice = LoopPolicy.sceneDrivenNotice()
+        assertTrue(notice.contains("不约束本范式主循环"))
+        assertTrue(notice.contains("中止条件"))
+        assertTrue(notice.contains("通知栏停止"))
+    }
+
+    @Test
+    fun `范式扩展不改变既有刹停语义`() {
+        assertTrue(LoopPolicy.isFinished(5, 5))
+        assertFalse(LoopPolicy.isFinished(4, 5))
+        assertEquals(LoopPolicy.INFINITE, LoopPolicy.parse("无限"))
+        assertNull(LoopPolicy.parse("非数字输入"))
+    }
+
+    @Test
+    fun `场景范式说明提供按次数停止的可操作指引`() {
+        val notice = LoopPolicy.sceneDrivenNotice()
+        assertTrue(notice.contains("不提供次数维度上限"))
+        assertTrue(notice.contains("配置中止条件"))
+    }
 }

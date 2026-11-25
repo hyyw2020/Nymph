@@ -62,6 +62,12 @@ data class VisualCue(
  */
 data class VisualConfig(
     val enabled: Boolean = false,
+    /**
+     * **场景规则诊断覆盖层独立开关**（v2.9.16）。
+     * 与 [enabled]（手势特效）解耦：单独开启时只显示每条场景规则的 ROI 框、
+     * 命中状态与落点，不叠加手势特效、不启动帧循环。默认 false，零回归。
+     */
+    val sceneDebugEnabled: Boolean = false,
     val tapEnabled: Boolean = true,
     val trailEnabled: Boolean = true,
     val stepBadgeEnabled: Boolean = true,

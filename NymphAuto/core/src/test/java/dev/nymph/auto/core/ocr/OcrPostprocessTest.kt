@@ -27,6 +27,50 @@ class OcrPostprocessTest {
     }
 
     @Test
+    fun `带置信度解码文本与旧签名一致`() {
+        val keys = listOf("A", "B")
+        val classes = 3
+        val logits = FloatArray(5 * classes)
+        fun set(t: Int, c: Int) { logits[t * classes + c] = 10f }
+        set(0, 1); set(1, 1); set(2, 0); set(3, 2); set(4, 2)
+        val scored = OcrPostprocess.ctcGreedyScored(logits, 5, classes, keys)
+        assertEquals("AB", scored.text)
+        assertEquals(OcrPostprocess.ctcGreedy(logits, 5, classes, keys), scored.text)
+    }
+
+    @Test
+    fun `高置信 logit 的解置信度接近一`() {
+        // 每帧采纳类别 logit=10，其余=0 → softmax≈1 → 平均≈1
+        val keys = listOf("A")
+        val classes = 2
+        val logits = FloatArray(3 * classes)
+        for (t in 0 until 3) logits[t * classes + 1] = 10f
+        val conf = OcrPostprocess.ctcGreedyScored(logits, 3, classes, keys).confidence
+        assertTrue("置信度应接近 1，实际 $conf", conf > 0.99 && conf <= 1.0)
+    }
+
+    @Test
+    fun `低区分度 logit 的解置信度接近类别均分`() {
+        // 3 类：blank(0) logit=0，A(1)/B(2) logit 相等且更高 → best=1，softmax(A)=0.5
+        val keys = listOf("A", "B")
+        val classes = 3
+        val logits = FloatArray(3 * classes)
+        for (t in 0 until 3) { logits[t * classes + 1] = 5f; logits[t * classes + 2] = 5f }
+        val decoded = OcrPostprocess.ctcGreedyScored(logits, 3, classes, keys)
+        assertEquals("A", decoded.text)
+        assertTrue("置信度应接近 0.5，实际 ${decoded.confidence}", decoded.confidence in 0.49..0.51)
+    }
+
+    @Test
+    fun `无采纳字符时置信度为零`() {
+        val classes = 2
+        val logits = FloatArray(3 * classes) // 全 0 → best 恒为 blank(0)
+        val decoded = OcrPostprocess.ctcGreedyScored(logits, 3, classes, listOf("A"))
+        assertEquals("", decoded.text)
+        assertEquals(0.0, decoded.confidence, 0.0)
+    }
+
+    @Test
     fun `字典加载去掉回车与末尾空行`() {
         val keys = OcrPostprocess.loadKeys("中\r\n文\r\nA\n")
         assertEquals(listOf("中", "文", "A"), keys)

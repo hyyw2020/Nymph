@@ -1,14 +1,27 @@
 package dev.nymph.auto.runner
 
+import java.util.Locale
+import dev.nymph.auto.core.editor.MismatchGuard
+import dev.nymph.auto.core.editor.NodeFallback
+import dev.nymph.auto.core.editor.SceneTrigger
+import dev.nymph.auto.core.editor.SceneEvidence
+import dev.nymph.auto.core.editor.SceneAssist
+import dev.nymph.auto.core.model.TriggerMode
 import dev.nymph.auto.core.expr.ConditionEvaluator
 import dev.nymph.auto.core.expr.ExprEngine
 import dev.nymph.auto.core.model.Action
 import dev.nymph.auto.core.model.ActionType
 import dev.nymph.auto.core.model.CoordUnit
+import dev.nymph.auto.core.model.Combine
 import dev.nymph.auto.core.model.Condition
+import dev.nymph.auto.core.model.ConditionKind
 import dev.nymph.auto.core.model.ListOrder
 import dev.nymph.auto.core.model.LoopPolicy
 import dev.nymph.auto.core.model.Region
+import dev.nymph.auto.core.model.SceneClickResolution
+import dev.nymph.auto.core.model.SceneFiringState
+import dev.nymph.auto.core.model.SceneObservation
+import dev.nymph.auto.core.model.SceneRule
 import dev.nymph.auto.core.model.Script
 import dev.nymph.auto.core.model.TargetPackages
 import dev.nymph.auto.core.log.RunLog
@@ -17,7 +30,11 @@ import dev.nymph.auto.core.runner.CapabilityMatrix
 import dev.nymph.auto.core.runner.CapabilityTier
 import dev.nymph.auto.core.runner.DriftTracker
 import dev.nymph.auto.core.runner.PollMode
+import dev.nymph.auto.core.runner.AnnouncePolicy
+import dev.nymph.auto.core.runner.HaltReport
 import dev.nymph.auto.core.runner.RecognitionTuning
+import dev.nymph.auto.core.runner.RestorePolicy
+import dev.nymph.auto.core.runner.SceneFramePolicy
 import dev.nymph.auto.core.runner.FailReason
 import dev.nymph.auto.core.runner.JitterSampler
 import dev.nymph.auto.core.runner.RunStats
@@ -33,6 +50,8 @@ import dev.nymph.auto.engine.AutoClickService
 import dev.nymph.auto.engine.Frame
 import dev.nymph.auto.engine.GestureEngine
 import dev.nymph.auto.engine.NodeFinder
+import dev.nymph.auto.engine.SceneDebugBox
+import dev.nymph.auto.engine.TemplateSpec
 import dev.nymph.auto.engine.VisionPipeline
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -43,6 +62,15 @@ import kotlin.random.Random
 import java.io.File
 import java.io.FileOutputStream
 import kotlin.math.abs
+
+// v3.0.0 fail-loud：面向用户的「不点击」原因节流参数。
+private const val LOUD_SKIP_THROTTLE_MS = 2_000L
+private const val LOUD_SKIP_MAX_KEYS = 64
+
+// S3：画布编译产物的 Action.desc 前缀（值同编辑态画布产物的稳定 tag 常量）。
+// 运行链按此前缀圈定「同一批编译产物」并按 actions 下标升序展开为 N 点位；
+// 不在运行链引用任何画布模型符号，零引用断言保持成立。
+private const val CANVAS_ACTION_TAG_LOCAL = "画布·"
 
 /**
  * 脚本执行器：动作 / 条件 / 监听 / 变量 / 跳转 / 子脚本 的统一编排。
@@ -73,18 +101,81 @@ class ScriptRunner(
     var onAbnormal: ((String) -> Unit)? = null
 
     /**
+     * v3.0.0 fail-loud：把「本次不点击」从仅写日志升级为可见原因。
+     *
+     * 场景驱动是高频循环，同一原因可能每帧复现；这里按「原因键」做有界节流
+     * （同一键 2 秒内只上报一次），既不刷屏，也保证无人值守时用户能看到
+     * 「为什么没点」。onLog 仍逐帧记录，去重只针对面向用户的 onAbnormal 出口。
+     */
+    private val loudSkipLastAtMs = HashMap<String, Long>()
+    private fun failLoudSkip(key: String, msg: String) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val last = loudSkipLastAtMs[key] ?: Long.MIN_VALUE
+        if (now - last >= LOUD_SKIP_THROTTLE_MS) {
+            loudSkipLastAtMs[key] = now
+            onLog("⚠ $msg")
+            onAbnormal?.invoke("⚠ $msg")
+        }
+        // 有界：超过上限清最旧的一半，避免长跑累积无界键。
+        if (loudSkipLastAtMs.size > LOUD_SKIP_MAX_KEYS) {
+            loudSkipLastAtMs.entries.sortedBy { it.value }.take(LOUD_SKIP_MAX_KEYS / 2)
+                .forEach { loudSkipLastAtMs.remove(it.key) }
+        }
+    }
+
+    // ---------------------------------------------------------------- v2.9.30 预告与终止
+    //
+    // 预告分级：只对「有落点」的动作生效，且已确认的重复循环零阻塞。
+    // 这样高频循环的吞吐不被撤销窗口吃掉，而首次 / 新场景 / 高风险仍然逐步确认。
+    // 详见 core.runner.AnnouncePolicy 的取值理由。
+
+    /** 预告出口：需要阻塞的 FULL 级预告。null = 不预告（旧行为，零开销）。 */
+    var onAnnounce: ((AnnouncePolicy.Decision, String) -> Unit)? = null
+
+    /** 常驻「下一步」出口；空串表示清除。无阻塞，供悬浮面板常显。 */
+    var onNext: ((String) -> Unit)? = null
+
+    /** 本次是否为该脚本首次运行（决定首次预告窗口长度）。 */
+    var firstRun: Boolean = false
+
+    /** 从未完成处继续时的起始步（0-based）；用完即清零。 */
+    var resumeFromPc: Int = 0
+
+    /** 终止报告出口：说清为什么停、停在哪、能做什么。 */
+    var onHalt: ((HaltReport.Report) -> Unit)? = null
+
+    /** 撤销请求（由界面按钮置位）；每次 FULL 预告开始时清零。 */
+    @Volatile
+    var undoRequested: Boolean = false
+
+    /** 用户显式标记为高风险的动作键（本进程内，不落盘、不改脚本格式）。 */
+    val riskyActions: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    private val confirmedActions = HashSet<String>()
+
+    private val seenScenes = HashSet<Int>()
+
+    private var lastFullEndAt = 0L
+
+    /**
      * v2.9.1：执行前的**非阻断**界面风险提示（区别于 [onAbnormal] 的错误中止）。
      * 用户可继续运行，但必须被告知「同包名不等于同界面、被动录制无法还原页面」。
      * app 层接线为日志 + toast，确保告警真正送达而不是只写进脚本 description。
      */
     var onSceneNotice: ((String) -> Unit)? = null
 
+    /**
+     * v2.9.31：「疑似在场」持续未达阈值时升级为全局可见状态（面板 + 通知），
+     * 不再静默轮询到用户手动停止。app 层复用通知三键，零新增权限。
+     */
+    var onSuspectedPresent: ((String) -> Unit)? = null
+
     /** 点击类动作未命中时的轮询重试窗口（毫秒）；0 = 不重试（保持旧秒跳行为）。 */
     var retryWindowMs: Long = 2000
 
     /**
      * v2.7.0 识别调度参数：默认 33ms 帧同步（旧版固定 300ms），可一键退回
-     * [RecognitionTuning.LEGACY]。见 core.runner.RecognitionTuning 的诚实边界说明。
+     * [RecognitionTuning.LEGACY]。见 core.runner.RecognitionTuning 的能力边界（未验证项）说明。
      */
     var recognitionTuning: RecognitionTuning = RecognitionTuning()
 
@@ -118,7 +209,7 @@ class ScriptRunner(
     var pauseOnFail: Boolean = false
 
     /**
-     * 失败四类归因回调（裁定阶段 4）：分类 + 人话说明 + 顶层步号（1-based，0=监听/子级上下文）。
+     * 失败四类归因回调（裁定阶段 4）：分类 + 可读说明 + 顶层步号（1-based，0=监听/子级上下文）。
      * UI 据此给出对应动作，并能一键定位到失败步（定点重拾取的第一步）。
      */
     var onFail: ((FailReason, String, Int) -> Unit)? = null
@@ -136,19 +227,42 @@ class ScriptRunner(
     /** 可视化 cue 出口；null = 未接线/关闭，所有可视化调用立即短路。 */
     var onVisualCue: ((VisualCue) -> Unit)? = null
 
+    /**
+     * v2.9.15 / A5：场景调试覆盖层出口。每轮每规则一个 [SceneDebugBox]（ROI 框 +
+     * 命中颜色 + score + 落点 + 决策）。null = 调试开关关闭，短路零开销。
+     * 由 RunnerService 从 SharedPreferences 的 debug 开关接线；关闭时不产生任何回调、
+     * 不增加任何延迟，与 v2.9.14 行为一致。
+     */
+    var onSceneDebug: ((List<SceneDebugBox>) -> Unit)? = null
+
+    /** 上一轮可观测摘要（用于 UI 日志节流：状态不变不重复刷屏）。 */
+    private var lastSceneSummary: String = ""
+
+    /** v2.9.28：本次场景监视累计判定帧数（心跳与收尾总结的证据口径）。 */
+    private var sceneFrameCount = 0L
+
+    /** 上次写出逐帧明细的时刻（elapsedRealtime），0 = 尚未写出。 */
+    private var lastSceneLogAt = 0L
+
+    /** 上次写出逐帧明细时的累计帧数，用于计算本周期实际判定帧数。 */
+    private var lastSceneLogFrame = 0L
+
+    /** 上次刷新等待浮层的时刻，避免逐帧更新界面文本。 */
+    private var lastWaitStatusAt = 0L
+
     private var cueSeq = 0L
     private var totalSteps = 0
 
     /**
      * 进度心跳（elapsedRealtime）。每个顶层动作开始/结束时刷新，
-     * 供 RunnerService 的看门狗区分「脚本在慢慢跑」与「协程已卡死」。
+     * 供 RunnerService 的看门狗区分「脚本在正常推进」与「协程已卡死」。
      * volatile：看门狗在另一条协程读，写入在脚本线程。
      */
     @Volatile
     var lastProgressAt: Long = android.os.SystemClock.elapsedRealtime()
         private set
 
-    /** 当前步的人话描述（卡死时写进日志，便于定位是哪一步）。 */
+    /** 当前步的可读描述（卡死时写进日志，便于定位是哪一步）。 */
     @Volatile
     var currentStepDesc: String = ""
         private set
@@ -164,6 +278,14 @@ class ScriptRunner(
      */
     val vars = VariableStore(js)
     private val evaluator = ConditionEvaluator(js)
+
+    /**
+     * v2.9.35：zdjl.check() 经由 runBlockingSync 在 Default 线程上调，若被查条件
+     * 是 JS_EXPR，绝不能重入主 QuickJS runtime（同一 ptr 被两线程持有 = native 数据
+     * 竞争/未定义行为）。此隔离求值器用纯 JVM 内存引擎求值，只服务 check 回调路径，
+     * 与主 runtime 物理隔离；复杂 JS 会降级（SimpleExpr 能力内），换取 native 安全。
+     */
+    private val checkEvaluator = ConditionEvaluator(InMemoryEngine())
     private val runCounts = mutableMapOf<String, Int>()
     private var frame: Frame? = null
     private var depth = 0
@@ -188,6 +310,10 @@ class ScriptRunner(
     private var currentStep = 0
 
     suspend fun run(script: Script): Boolean {
+        // v2.9.14 范式分流：场景驱动脚本改走「场景命中 → 触发」事件循环，
+        // 不再进入下面 pc++ 顺序推进的动作链。老脚本 sceneDriven=false 时
+        // 这一行恒为 false，原有顺序执行语义逐字不变（391 单测零回归）。
+        if (script.sceneDriven) return runSceneDriven(script)
         currentScript = script
         frame = AutoClickService.live()?.frame()
         if (frame == null) {
@@ -226,18 +352,17 @@ class ScriptRunner(
             .associate { it.value.label to it.index }
 
         var loops = 0
-        var pc = 0
+        // v2.9.30：从未完成处继续。步号越界时退回从头，宁可重跑也不越界。
+        var pc = resumeFromPc.coerceIn(0, actions.size).also { resumeFromPc = 0 }
         try {
             while (true) {
                 kotlin.coroutines.coroutineContext.ensureActive()
                 awaitIfPaused()
-                // 旋转校验：参考方向不一致时中止（百分比坐标在旋转后会错位）
-                frame?.let { f ->
-                    if (script.refRotation != 0 && f.rotation != script.refRotation) {
-                        onAbnormal?.invoke("屏幕方向与脚本不一致，已中止")
-                        return false
-                    }
-                }
+                // v2.9.35：此前 frame 只在 run() 启动时取一次，顺序链全程复用过期帧——
+                // 运行中旋转屏幕/显示尺寸变化时，PCT 坐标按旧宽高换算、模板尺度按旧
+                // refDpi 比例，落点系统性错位。每轮刷新（与 runSceneDriven:532 一致），
+                // 方向无关换算在 resolveXY/imageScale 内按当前帧实时进行。
+                AutoClickService.live()?.frame()?.let { frame = it }
                 if (pc >= actions.size) {
                     // v2.9.4：空脚本 + 无限循环曾在此处无限空转 —— pc 永远 >= 0、
                     // repeatCount=0 永远不满足结束条件，协程不结束、afterScript
@@ -274,9 +399,13 @@ class ScriptRunner(
             // 已由 evaluateCondition 记日志 + onFail(ABORT_HIT) 归因，
             // 这里收尾（afterScript 监听与总结在 finally 执行）并标记未跑完。
             onLog(e.message ?: "中止条件命中，脚本中止")
+            // v2.9.30：中止条件是用户设定的，停在哪一步要说清楚，并给「从这步继续」。
+            emitHalt(HaltReport.Kind.USER_STOP, e.message ?: "中止条件命中")
             return false
         } catch (e: ScriptAbort) {
             // 致命错误（如屏幕尺寸不可用）：已由 onAbnormal 提示，中止并标记未完成
+            // 脚本自身有错，继续只会重复失败，因此不给恢复入口。
+            emitHalt(HaltReport.Kind.SCRIPT_ERROR, e.message ?: e.javaClass.simpleName)
             return false
         } finally {
             onWaitStatus?.invoke(null) // 清除等待浮层
@@ -284,6 +413,694 @@ class ScriptRunner(
             if (script.repeatCount != 1 || pc > 0) {
                 onLog(roundSummary(loops + 1, script.repeatCount, final = true))
             }
+        }
+    }
+
+    /**
+     * v2.9.15 **场景驱动执行**（消除「步骤」概念的核心，回应「什么场景出现了，
+     * 该触发某个高精度位置的点击或者动作」）。
+     *
+     * 与 [run] 的顺序链本质区别：这里没有 `pc++`，不按索引顺序推进动作。每轮
+     * **一次抓帧共享给全部规则**（A6），每条规则用稳定局部锚点在搜索 ROI 内匹配，
+     * 得到带分数/位置的观测；[SceneTrigger.planSceneFiringStateful] 用带状态调度
+     * （三种 triggerMode / 迟滞 / cooldown / retryTimeout / 仲裁 / 同轮 K 上限）挑出
+     * 该触发的规则；命中规则用**相对匹配坐标 + 二次校验**校正真实落点（A2）。
+     *
+     * ## v2.9.15 相对 v2.9.14 的四处修正
+     *  - **A1 根因**：模板从「整块 ROI」换成「稳定局部锚点」，ROI 退回搜索范围 +
+     *    动态掩码，切断「点击改变 ROI → 判消失 → 判再现 → 边沿再点火」自激振荡。
+     *  - **A2 落点**：命中后不再用裸绝对坐标，改用匹配中心 + 相对偏移；偏离预期
+     *    超阈值判「场景疑似错位」不点（相较无校验触发更安全）。
+     *  - **A3 调度**：布尔边沿升级为带状态纯函数，retryTimeout 修「点击未使场景
+     *    消失即持续停滞」P0，cooldown 抑制连点，K 上限限制单轮多弹窗触发次数。
+     *  - **A4 fail-closed**：无可用画面模板时**不再回退 `pc++` 顺序链**（那恰恰变回
+     *    用户最反对的「无画面校验的顺序触发」），改为该规则不触发 + 日志/状态显式提示，
+     *    或整脚本无一条门控时明确中止。不误报等待状态。
+     *
+     * 只在 `Script.sceneDriven=true` 时进入；老脚本走 [run] 的 `pc++` 链，零回归。
+     * v2.9.14 过渡格式（`sceneRule=null` 但仍带 APPEAR_IMAGE 门控）按兼容语义执行：
+     * 用默认 `SceneRule()`（ON_APPEAR、无迟滞/冷却/重试）+ 绝对坐标，行为与旧版一致。
+     */
+    private suspend fun runSceneDriven(script: Script): Boolean {
+        currentScript = script
+        frame = AutoClickService.live()?.frame()
+        if (frame == null) {
+            onAbnormal?.invoke("无法获取屏幕尺寸（无障碍服务未连接或显示信息不可用）")
+            return false
+        }
+        warnIfOrientationMismatch(script)
+        if (!checkStartScene(script)) return false
+        scriptRefW = script.refWidth
+        scriptRefH = script.refHeight
+        script.variables.forEach { v -> vars.declare(v.name, v.type, v.expression, v.value) }
+        val actions = script.actions
+        if (actions.isEmpty()) {
+            onAbnormal?.invoke("脚本为空，已中止")
+            return false
+        }
+        totalSteps = actions.size
+        stats.reset()
+        consecutiveMiss = 0
+        missDumpCounts.clear()
+        scriptStartAt = android.os.SystemClock.elapsedRealtime()
+        jitter = JitterSampler(jitterSeed)
+        drift.reset()
+        anchorLast.clear()
+        motionByKey.clear()
+
+        // S3（ADR-074 确认 1/2）：规则槽位 = 挂了门控的 Action 子集。
+        // - 单 APPEAR_IMAGE 门控：1 槽 → 1 spec（老行为逐字不变）。
+        // - COMBINE 合取门控：1 槽 → m 条 spec（children 逐条展开，进同一次 findTemplates/同帧）。
+        // - 无 condition 的 Action（画布 N−1 点位）：不进 rules/specs、不参与 planSceneFiringStateful，
+        //   命中后由载体按 desc tag + 下标升序展开、共享载体同帧观测。
+        // 关键：rules/observations/state 数组一律按「槽位」索引，槽位→Action 下标用 ruleActions 映射。
+        // v3.0.3 S4：整图缩放 NCC 基线（脚本级 globalFingerprint = assets 里的整帧底图 key）。
+        // 编辑态画布保存时写入；运行态只读脚本级字段与 assets，不读 script.canvas（零引用断言）。
+        val wholeFrameBaselineB64 = script.globalFingerprint.takeIf { it.isNotBlank() }
+            ?.let { script.assets[it] }.orEmpty()
+        val (rd, cd) = imageScale()
+        val ruleActions = ArrayList<Int>()                  // slot -> action index
+        val rules = ArrayList<SceneRule>()                  // slot
+        val evidence = ArrayList<SceneEvidence.Evidence>()  // slot
+        val specs = ArrayList<TemplateSpec>()               // flat: 1 门控槽 -> m spec
+        val ruleSpecStart = ArrayList<Int>()                // slot -> 首个 spec 下标
+        val ruleSpecCount = ArrayList<Int>()                // slot -> spec 条数（1 或 m）
+        val ruleCombines = ArrayList<Combine?>()            // slot -> 合取方式（null=单门控）
+        val ruleMinCounts = ArrayList<Int>()                // slot -> N 组合阈值
+        for (aIdx in actions.indices) {
+            val a = actions[aIdx]
+            val gate = SceneTrigger.sceneGateOf(a)
+            val templates = SceneTrigger.gateTemplatesOf(a)
+            // 无门控：画布 N−1 点位与其它 ungated Action 都不进规则集（S3 确认 3）。
+            if (gate == null || templates.isEmpty()) continue
+            val rule = a.sceneRule ?: SceneRule()   // 默认 = ON_APPEAR / 绝对坐标 / 无冷却重试
+            // v2.9.31：装配期证据优先取 SceneRule 新字段；缺省时从 Action 的
+            // color / colorSimilarity / region 回填（v2.9.21 起装配本就写过这三个
+            // 字段），使存量脚本升级后同样进入同源判据，不必重新拾取。
+            val evColor = if (rule.colorArgb != 0) rule.colorArgb else a.color.toInt()
+            val evTol = if (rule.colorTolerance > 0) rule.colorTolerance
+                else if (a.color != 0L) a.colorSimilarity else 0
+            val evRoi = rule.convergedRoi ?: a.region.takeIf { !SceneAssist.isEmptyRoi(it) }
+            val pick = SceneEvidence.recoverPickPoint(rule)
+            val ev = SceneEvidence.Evidence(
+                colorArgb = evColor,
+                colorTolerance = evTol,
+                convergedRoi = evRoi,
+                srcW = rule.templateSrcW,
+                srcH = rule.templateSrcH,
+                streak = rule.evidenceStreak.coerceAtLeast(1),
+            )
+            val slot = rules.size
+            ruleActions.add(aIdx)
+            rules.add(rule)
+            evidence.add(ev)
+            ruleSpecStart.add(specs.size)
+            val isCombine = gate.kind == ConditionKind.COMBINE
+            templates.forEach { t ->
+                specs.add(
+                    TemplateSpec(
+                        templateB64 = t.imageData,
+                        // 合取子模板各自用自己的 region / 阈值 / 滤镜（m 个独立特征框）；
+                        // 单门控沿用原逻辑（有 sceneRule 时取 rule.searchRoi/similarity）。
+                        region = if (isCombine) t.region
+                                 else if (a.sceneRule != null) rule.searchRoi else RoiExpr.resolveRegion(t.region),
+                        minSimilar = if (isCombine) t.imageSimilarity
+                                     else if (a.sceneRule != null) rule.similarity else t.imageSimilarity,
+                        filters = t.filters,
+                        refDpi = rd, curDensity = cd,
+                        maskRects = rule.maskRects,
+                        templateSrcW = rule.templateSrcW,
+                        templateSrcH = rule.templateSrcH,
+                        pickXPct = pick.first,
+                        pickYPct = pick.second,
+                        colorArgb = evColor,
+                        colorTolerance = evTol,
+                        convergedRoi = evRoi,
+                        evidenceStreak = ev.streak,
+                        pickRotation = rule.pickRotation,
+                    ),
+                )
+            }
+            ruleSpecCount.add(templates.size)
+            ruleCombines.add(if (isCombine) gate.combine else null)
+            ruleMinCounts.add(if (isCombine) gate.runCountLimit else 1)
+        }
+        val gated = specs.count { it.templateB64.isNotBlank() }
+
+        // A4 fail-closed：一条带画面门控的规则都没有 → 明确中止，不回退至无画面校验的顺序触发。
+        if (gated == 0) {
+            onLog("⚠ 场景驱动脚本没有任何可用画面模板（截图能力不可用 / 未拾取稳定锚点）：" +
+                "已 fail-closed —— 不触发任何动作、不回退至无画面校验的顺序触发。请重新拾取坐标或检查无障碍截图")
+            onAbnormal?.invoke("场景驱动缺画面模板，已停止（未回退至无画面校验的顺序触发）")
+            onWaitStatus?.invoke(
+                WaitStatus("场景画面模板缺失（fail-closed）", 0L, 0L),
+            )
+            return false
+        }
+        // S3：一条规则可挂 m 条 spec（合取），所以规则数用 rules.size、模板数用 gated。
+        val conjunctionRules = ruleCombines.count { it != null }
+        val canvasFollowers = actions.size - rules.size   // N−1 点位等 ungated：不进规则、由载体展开
+        // v2.9.28：监视节拍绑定帧同步档位，不再复用 WaitGate 的慢场景常量。
+        val frameIntervalMs = SceneFramePolicy.frameIntervalMs(
+            recognitionTuning.pollMode, recognitionTuning.intervalMs,
+        )
+        onLog("开始监视 ${rules.size} 条场景触发规则（$gated 条模板、$conjunctionRules 条合取门控" +
+            (if (canvasFollowers > 0) "，$canvasFollowers 条点位由载体按序展开、不独立触发" else "") + "）：" +
+            "逐帧判定（${frameIntervalMs}ms 帧同步，每帧全判 ${rules.size} 条规则）· " +
+            "一轮一帧共享 · 带状态触发（迟滞/冷却/重试/仲裁）· 同轮最多 ${script.sceneMaxFiringPerRound} 条 · " +
+            "按场景出现触发对应高精度动作，不按步骤顺序；" +
+            LoopPolicy.sceneDrivenNotice())
+        RunLog.i("Runner", "场景驱动：rules=${rules.size} specs=$gated 合取=$conjunctionRules 跟随点位=$canvasFollowers " +
+            "K=${script.sceneMaxFiringPerRound} 帧同步=${frameIntervalMs}ms 一轮一帧")
+        runListeners(script.listeners.beforeScript)
+
+        var state = SceneFiringState()
+        lastSceneSummary = ""
+        sceneFrameCount = 0L
+        lastSceneLogAt = 0L
+        lastSceneLogFrame = 0L
+        lastWaitStatusAt = 0L
+        var firedRounds = 0
+        // S3：m 条合取子模板各自独立判据，故逐 spec 状态数组按 specs.size 索引；
+        // 规则→spec 映射用 ruleSpecStart[slot]（合取取第 0 条子模板作锚，承载落点几何）。
+        // v2.9.26：每条规则每次运行的 miss 现场帧只存第一张，避免常驻监视刷盘。
+        val sceneMissDumped = BooleanArray(specs.size)
+        // v2.9.20 重新发版：连续落点偏差按规则独立计数，为单次运行局部状态，不跨脚本实例保留。
+        val mismatchTracker = MismatchGuard.Tracker()
+        // v2.9.31 同源判据运行期状态（单次运行局部，不落盘）：
+        // 连续疑似帧数 / 上次有效落点 / 是否已升级告警。
+        val suspectStreak = IntArray(specs.size)
+        val lastValid = arrayOfNulls<SceneObservation>(specs.size)
+        val suspectedAlerted = BooleanArray(specs.size)
+        // v2.9.44：本轮由无障碍节点 fallback 命中的规则槽位（落点走节点中心、免 NCC 相对校验）。
+        val nodeFiredThisRound = BooleanArray(rules.size)
+
+        /**
+         * v2.9.44 节点 fallback：截图失败 / NCC 未命中且规则装配了语义节点时，
+         * 零截图查无障碍节点树，命中即构造等价的「场景在场」观测与 NODE 判定。
+         * 不改 NCC 成功路径；节点树读取异常一律 fail-closed（返回 null）。
+         */
+        fun tryNodeFallback(i: Int): Pair<SceneObservation, SceneEvidence.Verdict>? {
+            val rule = rules[i]
+            if (!NodeFallback.applicable(rule)) return null
+            val hit = runCatching {
+                nodeFinder.find(rule.nodeViewId, rule.nodeClass, rule.nodeText, 0, 0)
+            }.getOrNull() ?: return null
+            val fw = frame?.width ?: 0
+            val fh = frame?.height ?: 0
+            if (fw <= 0 || fh <= 0) return null
+            val signal = NodeFallback.NodeSignal(
+                hit.text, hit.viewId, hit.className, hit.centerX, hit.centerY,
+            )
+            if (!NodeFallback.matches(signal, rule)) return null
+            val obs = NodeFallback.toObservation(signal, fw, fh)
+            if (!obs.present) return null
+            nodeFiredThisRound[i] = true
+            val verdict = SceneEvidence.Verdict(
+                true, obs.cxPx, obs.cyPx, SceneEvidence.Tier.NODE,
+                "无障碍节点命中（截图通道不可用或 NCC 未命中）", false, false, false, false,
+            )
+            return obs to verdict
+        }
+
+        // 约 1.5s 的连续疑似帧数；按实际帧同步档位折算，最低 3 帧。
+        val suspectAlertFrames = (1500L / frameIntervalMs.coerceAtLeast(1L)).toInt().coerceAtLeast(3)
+        // v2.9.32 方向无关：监听方向变化并重标定，绝不因旋转中止。
+        // 首帧方向未定时用 -1，第一帧只记录不重置；之后每次方向改变清掉跨帧瞬态证据，
+        // 避免上一方向遗留的疑似连续帧 / 上次有效落点污染新方向的判定。
+        var lastRotation = -1
+        try {
+            while (true) {
+                kotlin.coroutines.coroutineContext.ensureActive()
+                awaitIfPaused()
+                // v2.9.32：刷新帧信息，使旋转检测与 resolveXY 的百分比→像素换算
+                // 始终基于当前显示几何（frame 在启动时取一次，旋转后会过期）。
+                AutoClickService.live()?.frame()?.let { frame = it }
+                val nowRotation = frame?.rotation?.let {
+                    dev.nymph.auto.core.runner.OrientationTransform.norm(it)
+                } ?: -1
+                if (lastRotation >= 0 && nowRotation >= 0 && nowRotation != lastRotation) {
+                    suspectStreak.fill(0)
+                    suspectedAlerted.fill(false)
+                    for (i in lastValid.indices) lastValid[i] = null
+                    val label = if (nowRotation == 1 || nowRotation == 3) "横屏" else "竖屏"
+                    onLog("屏幕方向已切换至$label：按新方向重标定坐标，脚本继续执行")
+                    RunLog.i("Runner", "方向变化 $lastRotation -> $nowRotation：已重置跨帧瞬态证据并继续")
+                }
+                if (nowRotation >= 0) lastRotation = nowRotation
+                script.abortCondition?.let { evaluateCondition(it, "") }
+
+                val nowMs = android.os.SystemClock.elapsedRealtime()
+                val roundStartMs = nowMs
+                nodeFiredThisRound.fill(false)
+                sceneFrameCount++
+                // A6 一轮一帧 + v2.9.28 逐帧：每轮强制抓新帧，N 条规则共享同一帧全判，
+                // 不复用帧缓存里的旧画面，也不因固定休眠把短暂出现的场景整段跳过。
+                val matches = vision.findTemplates(
+                    specs, freshFrame = true, currentRotation = nowRotation.coerceAtLeast(0),
+                    wholeFrameBaselineB64 = wholeFrameBaselineB64,
+                    wholeFrameMethod = script.globalMethod,
+                    wholeFrameSimilarity = script.globalVerifySimilarity,
+                )
+                val observations = ArrayList<SceneObservation>(rules.size)
+                val verdicts = ArrayList<SceneEvidence.Verdict>(rules.size)
+                // 单条子模板 → 一条原始观测（纯函数式，逐 spec 索引状态）。合取与单门控共用。
+                fun assessSpec(specIdx: Int): Pair<SceneObservation, SceneEvidence.Verdict> {
+                    val m = matches.getOrNull(specIdx)
+                    val thr = specs[specIdx].minSimilar / 100.0
+                    if (m == null) {
+                        // 抓帧失败 / 模板解码失败：本子条件 fail-closed（A4），标 invalid 冻结状态机。
+                        suspectStreak[specIdx] = 0
+                        return SceneObservation(present = false, valid = false) to SceneEvidence.Verdict(
+                            false, -1, -1, SceneEvidence.Tier.NONE,
+                            "本轮无匹配结果", false, false, false, false,
+                        )
+                    }
+                    val suspect = SceneEvidence.isSuspect(m.present, m.score, thr) && m.bestCxPx >= 0
+                    suspectStreak[specIdx] = if (suspect) suspectStreak[specIdx] + 1 else 0
+                    val v = SceneEvidence.assess(
+                        evidence[specIdx],
+                        SceneEvidence.Frame(
+                            hit = m.present, score = m.score, cxPx = m.cxPx, cyPx = m.cyPx,
+                            bestCxPx = m.bestCxPx, bestCyPx = m.bestCyPx,
+                            frameW = m.frameW, frameH = m.frameH,
+                            observedArgb = m.observedArgb,
+                            suspectStreak = suspectStreak[specIdx], geometryOk = m.geometryOk,
+                        ),
+                        thr,
+                    )
+                    val obs = SceneObservation(
+                        v.present, m.score, v.cxPx, v.cyPx, m.frameW, m.frameH,
+                        valid = m.score >= 0.0,
+                    )
+                    return obs to v
+                }
+
+                for (r in rules.indices) {
+                    val start = ruleSpecStart[r]
+                    val count = ruleSpecCount[r]
+                    val combine = ruleCombines[r]
+                    val label = actions[ruleActions[r]].desc.ifBlank { "规则 ${r + 1}" }
+                    if (combine != null && count > 1) {
+                        // S3 合取：m 条子模板各自同帧求值（matches 已一次 findTemplates 产出），
+                        // 再聚合为 1 条载体观测。frame() 全程恰好 1 次（确认 2）。
+                        val children = ArrayList<SceneObservation>(count)
+                        for (k in 0 until count) {
+                            val (childObs, childVerdict) = assessSpec(start + k)
+                            children.add(childObs)
+                            verdicts.add(childVerdict)
+                            // 逐子模板的疑似升级告警（条款 6）。
+                            val si = start + k
+                            if (suspectStreak[si] >= suspectAlertFrames && !suspectedAlerted[si]) {
+                                suspectedAlerted[si] = true
+                                val msg = "特征${k + 1}疑似失效：连续 ${suspectStreak[si]} 帧疑似在场但未达阈值"
+                                onLog("⚠ $msg")
+                                RunLog.w("Runner", msg)
+                                onSuspectedPresent?.invoke(msg)
+                            }
+                        }
+                        val agg = SceneTrigger.aggregateObservations(children, combine, ruleMinCounts[r])
+                        // v2.9.44：合取整体未命中且锚规则装配了语义节点 → 节点 fallback。
+                        val fb = if (!agg.present) tryNodeFallback(r) else null
+                        if (fb != null) {
+                            verdicts[verdicts.size - count] = fb.second
+                            observations.add(fb.first)
+                            RunLog.i("Runner", "场景「$label」合取未全中，改由无障碍节点判定：在场")
+                        } else {
+                            observations.add(agg)
+                            if (agg.present && agg.cxPx >= 0) {
+                                lastValid[start] = agg
+                                suspectedAlerted[start] = false
+                            }
+                        }
+                    } else {
+                        // 单门控（含 N=1 的画布、老脚本）：沿用原逐规则逻辑，逐字同旧版。
+                        val (obs, v) = assessSpec(start)
+                        val fb = if (!obs.present) tryNodeFallback(r) else null
+                        if (fb != null) {
+                            verdicts.add(fb.second)
+                            observations.add(fb.first)
+                            RunLog.i("Runner", "场景 ${r + 1} NCC 未命中，改由无障碍节点判定：在场")
+                        } else {
+                            verdicts.add(v)
+                            observations.add(obs)
+                            if (obs.present && obs.cxPx >= 0) {
+                                lastValid[start] = obs
+                                suspectedAlerted[start] = false
+                            }
+                        }
+                        if (suspectStreak[start] >= suspectAlertFrames && !suspectedAlerted[start]) {
+                            suspectedAlerted[start] = true
+                            val msg = "模板可能已失效：连续 ${suspectStreak[start]} 帧目标疑似在场但未达阈值，建议重新拾取锚点"
+                            onLog("⚠ $msg")
+                            RunLog.w("Runner", msg)
+                            onSuspectedPresent?.invoke(msg)
+                        }
+                    }
+                }
+                // A3 带状态调度：迟滞 / cooldown / retryTimeout / 仲裁 / K 上限 / 三种 mode
+                val decision = SceneTrigger.planSceneFiringStateful(
+                    observations, rules, state, nowMs, script.sceneMaxFiringPerRound,
+                )
+                state = decision.next
+
+                // A5 可观测性：每轮每规则日志（规则名/present/score/loc/决策）+ 调试覆盖层框。
+                emitSceneObservability(actions, specs, ruleActions, ruleSpecStart, ruleCombines,
+                    observations, decision, matches, verdicts, nowMs)
+
+                // v2.9.26 场景 miss 存证：每条规则每次运行只存一张现场帧（顺序找图路径
+                // 早有 dumpMissFrame，场景驱动此前没接 —— 现场调试包里出现「明明出现过
+                // 却判未出现」时，拿不到当轮画面就无法区分是移出搜索窗、外观变化、
+                // 掩码覆盖还是尺度问题）。帧来自本轮缓存，不额外截屏。
+                for (r in rules.indices) {
+                    val anchorSpec = ruleSpecStart[r]
+                    val m = matches.getOrNull(anchorSpec)
+                    if (m != null && !m.present && specs[anchorSpec].templateB64.isNotBlank() && !sceneMissDumped[anchorSpec]) {
+                        sceneMissDumped[anchorSpec] = true
+                        dumpMissFrame("场景${ruleActions[r] + 1}")
+                    }
+                }
+
+                if (decision.fire.isEmpty()) {
+                    // v2.9.20 重新发版：本轮无触发意图不打断连续偏差计数。
+                    // 锚点失配的成因不因场景离场而消除，显式登记保持态。
+                    mismatchTracker.onIdle()
+                    // v2.9.28：判定逐帧执行，界面文本按状态刷新间隔节流，不随帧率更新。
+                    if (SceneFramePolicy.due(nowMs, lastWaitStatusAt, SceneFramePolicy.STATUS_MS)) {
+                        lastWaitStatusAt = nowMs
+                        onWaitStatus?.invoke(
+                            WaitStatus("等待场景出现", nowMs - scriptStartAt, 0L),
+                        )
+                    }
+                    pulse("等待场景出现")
+                    paceFrame(roundStartMs, frameIntervalMs)
+                    continue
+                }
+                // 从「等待场景出现」切换到触发：清除浮层一次，不逐帧重复下发 null。
+                if (lastWaitStatusAt != 0L) {
+                    onWaitStatus?.invoke(null)
+                    lastWaitStatusAt = 0L
+                }
+                for (slot in decision.fire) {
+                    val idx = ruleActions[slot]          // 规则槽位 -> Action 下标
+                    val anchorSpec = ruleSpecStart[slot]
+                    currentStep = idx + 1
+                    stats.executed++
+                    val carrier = actions[idx]
+                    pulse(carrier.desc.ifBlank { carrier.type.name })
+                    val label = if (carrier.desc.isBlank()) "规则 ${idx + 1}" else carrier.desc
+                    val obs = observations[slot]
+                    val turns = matches.getOrNull(anchorSpec)?.orientationTurns ?: 0
+
+                    // S3 确认 3（画布合取载体）：以 desc 前缀圈定同一批编译产物，按下标升序
+                    // 展开为 N 点位按序派发；全部点位共享载体这一轮聚合出的同帧 observation，
+                    // 各点位只叠加自身 sceneRule 的 Relative clickOffset。N−1 点位不进 rules，
+                    // 在此由载体统一驱动，绝不各自独立触发、绝不退回 RUN_ACTIONS 绝对子链。
+                    val canvasPoints = if (ruleCombines[slot] != null) {
+                        SceneTrigger.canvasPointIndices(actions, CANVAS_ACTION_TAG_LOCAL)
+                    } else emptyList()
+
+                    if (canvasPoints.isNotEmpty()) {
+                        for (pIdx in canvasPoints) {
+                            val p = actions[pIdx]
+                            val prule = p.sceneRule ?: SceneRule()
+                            // 节点 fallback 命中：载体同帧观测给节点中心，各点位只叠 clickOffset 已无意义
+                            // ——画布合取产物不带语义节点（isSceneTrigger 由图片 COMBINE 而来），走正常相对分支。
+                            when (val click = SceneTrigger.resolveSceneClick(
+                                obs, prule, p.x, p.y,
+                                lastValid = lastValid[anchorSpec],
+                                strictNoFallback = prule.triggerMode != TriggerMode.ON_DISAPPEAR,
+                            )) {
+                                is SceneClickResolution.NoValidLocation -> {
+                                    failLoudSkip("no-loc-$pIdx", "场景「${p.desc}」${click.detail}，本次点位不点击")
+                                    RunLog.w("Runner", "canvas point ${pIdx + 1}: ${click.detail}")
+                                    stats.skip++
+                                }
+                                is SceneClickResolution.SuspiciousMismatch -> {
+                                    val msg = "场景「${p.desc}」点位错位 ${String.format(Locale.US, "%.1f", click.deviationPct)}%" +
+                                        "（阈值 ${String.format(Locale.US, "%.1f", click.maxPct)}%），本点位不点击"
+                                    failLoudSkip("mismatch-$pIdx", msg)
+                                    RunLog.w("Runner", msg)
+                                    stats.skip++
+                                }
+                                is SceneClickResolution.Hit -> {
+                                    val (cx, cy) = dev.nymph.auto.core.runner.OrientationTransform.pointToCurrent(
+                                        click.xPct, click.yPct, turns,
+                                    )
+                                    val corrected = p.copy(x = cx, y = cy, unit = CoordUnit.PCT)
+                                    onLog("场景命中 → 点位「${p.desc}」${p.type} @ ${String.format(Locale.US, "%.1f", cx)}% , " +
+                                        "${String.format(Locale.US, "%.1f", cy)}%（合取同帧 · 相对偏移${if (turns != 0) " · 已旋回" else ""}）")
+                                    runAction(corrected, script, sceneGatePreChecked = true, ruleIndex = pIdx)
+                                }
+                                is SceneClickResolution.Absolute -> {
+                                    // 显式 useAbsolute 点位：绝对 PCT 存于拾取几何，旋回当前屏幕。
+                                    val (ax, ay) = dev.nymph.auto.core.runner.OrientationTransform.pointToCurrent(
+                                        p.x, p.y, turns,
+                                    )
+                                    val corrected = p.copy(x = ax, y = ay, unit = CoordUnit.PCT)
+                                    onLog("场景命中 → 点位「${p.desc}」${p.type} @ ${String.format(Locale.US, "%.1f", ax)}% , " +
+                                        "${String.format(Locale.US, "%.1f", ay)}%（显式绝对兜底）")
+                                    runAction(corrected, script, sceneGatePreChecked = true, ruleIndex = pIdx)
+                                }
+                            }
+                        }
+                        mismatchTracker.onFired(slot)
+                        continue
+                    }
+
+                    // 普通规则（单门控 / v2.9.14 过渡格式）：沿用原逐规则派发，逐字同旧版。
+                    if (nodeFiredThisRound[slot]) {
+                        val o = obs
+                        if (o.frameW <= 0 || o.frameH <= 0) {
+                            failLoudSkip("node-size-$slot", "场景「$label」节点命中但落点尺寸无效，本次不点击")
+                            stats.skip++
+                            continue
+                        }
+                        val nx = (100.0 * o.cxPx / o.frameW).coerceIn(0.0, 100.0)
+                        val ny = (100.0 * o.cyPx / o.frameH).coerceIn(0.0, 100.0)
+                        mismatchTracker.onFired(slot)
+                        onLog("场景命中 → 触发「$label」${carrier.type} @ ${String.format(Locale.US, "%.1f", nx)}% , " +
+                            "${String.format(Locale.US, "%.1f", ny)}%（无障碍节点，零截图）")
+                        runAction(
+                            carrier.copy(x = nx, y = ny, unit = CoordUnit.PCT),
+                            script, sceneGatePreChecked = true, ruleIndex = idx,
+                        )
+                        continue
+                    }
+                    when (val click = SceneTrigger.resolveSceneClick(
+                        obs, rules[slot], carrier.x, carrier.y,
+                        lastValid = lastValid[anchorSpec],
+                        strictNoFallback = rules[slot].triggerMode != TriggerMode.ON_DISAPPEAR,
+                    )) {
+                        is SceneClickResolution.NoValidLocation -> {
+                            failLoudSkip("no-loc-$slot", "场景「$label」${click.detail}，本次不点击")
+                            RunLog.w("Runner", "场景「$label」${click.detail}")
+                            stats.skip++
+                            continue
+                        }
+                        is SceneClickResolution.SuspiciousMismatch -> {
+                            val msg = "场景「$label」疑似错位：匹配位置偏离 ${String.format(Locale.US, "%.1f", click.deviationPct)}%" +
+                                "（阈值 ${String.format(Locale.US, "%.1f", click.maxPct)}%），本次不点击"
+                            failLoudSkip("mismatch-$slot", msg)
+                            RunLog.w("Runner", msg)
+                            stats.skip++
+                            val guard = mismatchTracker.onMismatch(slot)
+                            when (guard.action) {
+                                MismatchGuard.Action.WARN -> {
+                                    onLog("⚠ ${guard.reason}")
+                                    onAbnormal?.invoke(
+                                        "连续 ${guard.consecutive} 次落点偏差超出预算：" +
+                                            "请复核锚点与当前分辨率、显示方向",
+                                    )
+                                }
+                                MismatchGuard.Action.BACKOFF -> {
+                                    if (guard.announce) onLog("⚠ ${guard.reason}")
+                                    pulse()
+                                    delay(guard.backoffMs)
+                                }
+                                MismatchGuard.Action.ABORT -> {
+                                    onLog("⚠ ${guard.reason}")
+                                    onAbnormal?.invoke(
+                                        "连续 ${guard.consecutive} 次落点偏差超出预算，" +
+                                            "判定为门控参数失配，已中止；请重新拾取锚点",
+                                    )
+                                    throw AbortHit("场景落点偏差达确定性失效上界，已中止")
+                                }
+                                MismatchGuard.Action.CONTINUE -> Unit
+                            }
+                            continue
+                        }
+                        is SceneClickResolution.Hit -> {
+                            mismatchTracker.onFired(slot)
+                            val (cx, cy) = dev.nymph.auto.core.runner.OrientationTransform.pointToCurrent(
+                                click.xPct, click.yPct, turns,
+                            )
+                            val corrected = carrier.copy(x = cx, y = cy, unit = CoordUnit.PCT)
+                            onLog("场景命中 → 触发「$label」${carrier.type} @ ${String.format(Locale.US, "%.1f", cx)}% , " +
+                                "${String.format(Locale.US, "%.1f", cy)}%（相对匹配坐标校正${if (turns != 0) " · 已旋回当前方向" else ""}）")
+                            runAction(corrected, script, sceneGatePreChecked = true, ruleIndex = idx)
+                        }
+                        is SceneClickResolution.Absolute -> {
+                            mismatchTracker.onFired(slot)
+                            val (ax, ay) = dev.nymph.auto.core.runner.OrientationTransform.pointToCurrent(
+                                carrier.x, carrier.y, turns,
+                            )
+                            val corrected = carrier.copy(x = ax, y = ay, unit = CoordUnit.PCT)
+                            onLog("场景命中 → 触发「$label」${carrier.type} @ ${String.format(Locale.US, "%.1f", ax)}% , " +
+                                "${String.format(Locale.US, "%.1f", ay)}%")
+                            runAction(corrected, script, sceneGatePreChecked = true, ruleIndex = idx)
+                        }
+                    }
+                }
+                firedRounds++
+                paceFrame(roundStartMs, frameIntervalMs)
+            }
+        } catch (e: AbortHit) {
+            onLog(e.message ?: "中止条件命中，脚本中止")
+            // 场景链的「停在哪」用规则号表达，比步号更准确。
+            emitHalt(HaltReport.Kind.GATE_MISMATCH, e.message ?: "场景门控中止", currentStep - 1)
+            return false
+        } catch (e: ScriptAbort) {
+            emitHalt(HaltReport.Kind.SCRIPT_ERROR, e.message ?: e.javaClass.simpleName)
+            return false
+        } finally {
+            onWaitStatus?.invoke(null)
+            onSceneDebug?.invoke(emptyList())  // 清除调试覆盖层
+            runListeners(script.listeners.afterScript)
+            // v2.9.20：场景范式收尾不引用脚本级 repeatCount，避免把仅作用于
+            // 顺序范式的轮次数值呈现为本次监视的轮次总量。
+            onLog(sceneSummary(firedRounds))
+        }
+    }
+
+    /**
+     * v2.9.28 帧同步节拍：命中轮与未命中轮共用，按固定步长补足本轮剩余间隔。
+     *
+     * 抓帧与匹配本身已耗满目标间隔时不追加休眠，避免「实际耗时 + 固定间隔」
+     * 让判定反而更慢；快于目标时补足差值，限制最高采样率以保护功耗。
+     */
+    private suspend fun paceFrame(roundStartMs: Long, targetMs: Long) {
+        val spentMs = android.os.SystemClock.elapsedRealtime() - roundStartMs
+        val remainMs = SceneFramePolicy.delayFor(spentMs, targetMs)
+        if (remainMs > 0) delay(remainMs)
+    }
+
+    /** 场景范式专用执行总结：以实际触发轮次为口径，不呈现脚本级循环次数。 */
+    private fun sceneSummary(firedRounds: Int): String {
+        val secs = (android.os.SystemClock.elapsedRealtime() - scriptStartAt) / 1000.0
+        return "场景监视总结：已触发 $firedRounds 轮，逐帧判定 $sceneFrameCount 帧（每帧全判），" +
+            "${stats.resultText()}，耗时 ${String.format(Locale.US, "%.1f", secs)}s；${LoopPolicy.sceneDrivenNotice()}"
+    }
+
+    /**
+     * 可观测性：每帧构造「规则名 / 观测 / score / loc / 触发决策 / 落点」，按状态变化
+     * 与周期心跳写入完整明细。
+     *
+     * v2.9.16：[SceneDebugBox] 是纯数据，构造恒做（每规则一个对象，成本与日志格式化
+     * 同量级），回调亦恒调用；是否绘制由 `VisualizerLayer` 依据独立诊断开关判定。
+     * 这样诊断能力不依赖「动作可视化」总开关，且构造侧不因开关状态产生分支。
+     *
+     * v2.9.28：判定提升到帧同步档位后，若仍每帧每规则写一行完整明细，
+     * `RunLog` 的 500 条环形缓冲会在数秒内被场景日志占满、挤掉其它模块记录。
+     * 因此完整明细改为「状态变化 + 周期心跳」写出，心跳行由
+     * [SceneFramePolicy.heartbeatLine] 带上本周期实际判定帧数：判定仍逐帧执行，
+     * 逐帧证据不依赖日志条数。调试覆盖层仍按帧回调，与日志节流互不耦合。
+     */
+    private fun emitSceneObservability(
+        actions: List<Action>,
+        specs: List<TemplateSpec>,
+        ruleActions: List<Int>,
+        ruleSpecStart: List<Int>,
+        ruleCombines: List<Combine?>,
+        observations: List<SceneObservation>,
+        decision: dev.nymph.auto.core.model.SceneFiringDecision,
+        matches: List<dev.nymph.auto.engine.TemplateMatch?>,
+        verdicts: List<SceneEvidence.Verdict>,
+        nowMs: Long,
+    ) {
+        val ruleCount = observations.size
+        val boxes = ArrayList<SceneDebugBox>(ruleCount)
+        val presentCount = observations.count { it.present }
+        val summary = "$presentCount/${ruleCount}在场·触发${decision.fire.joinToString(",", "[", "]") { (it + 1).toString() }}"
+        val changed = summary != lastSceneSummary
+        lastSceneSummary = summary
+        val heartbeat = SceneFramePolicy.due(nowMs, lastSceneLogAt, SceneFramePolicy.HEARTBEAT_MS)
+        val verbose = changed || heartbeat
+        for (r in 0 until ruleCount) {
+            val ai = ruleActions[r]
+            val anchorSpec = ruleSpecStart[r]
+            val o = observations[r]
+            val act = actions[ai]
+            val label = act.desc.ifBlank { "规则 ${ai + 1}" }
+            val scoreTxt = if (o.score >= 0.0) String.format(Locale.US, "%.2f", o.score) else "n/a"
+            val locTxt = if (o.cxPx >= 0) "${o.cxPx},${o.cyPx}" else "-"
+            val reason = decision.reasons[r] ?: "无观测"
+            val hasTemplate = specs.getOrNull(anchorSpec)?.templateB64?.isNotBlank() == true
+            val spec = specs[anchorSpec]
+            // v2.9.26 未命中归因：把「差多少分 / 最佳窗口在哪 / 是否被掩码盖住」写进每轮日志。
+            // 合取规则以锚子模板（第 0 条）为可观测代表，其余子模板仍有独立 verdict。
+            val evidence = if (!o.present && hasTemplate) {
+                val m = matches.getOrNull(anchorSpec)
+                val thrVal = spec.minSimilar / 100.0
+                val thr = String.format(Locale.US, "%.2f", thrVal)
+                when {
+                    m == null -> " · 本轮无匹配结果（截帧或模板解码失败）"
+                    m.bestCxPx < 0 -> " · 阈值$thr · ROI 内无可评窗口（区域过小或全被抑制）"
+                    else -> {
+                        val covered = spec.maskRects.count { rc ->
+                            val px = 100.0 * m.bestCxPx / m.frameW
+                            val py = 100.0 * m.bestCyPx / m.frameH
+                            px >= rc.leftPct && px <= rc.rightPct && py >= rc.topPct && py <= rc.bottomPct
+                        }
+                        val band = if (o.score >= 0.45) "元素疑似在场但外观/尺度/掩码与拾取快照不一致"
+                        else "搜索窗内无相似内容"
+                        " · 阈值$thr · 差距${String.format(Locale.US, "%.2f", thrVal - o.score)} · " +
+                            "best@${m.bestCxPx},${m.bestCyPx} · 掩码盖住=$covered/${spec.maskRects.size} · $band"
+                    }
+                }
+            } else ""
+            val evLine = verdicts.getOrNull(anchorSpec)?.let { v ->
+                if (v.suspect || v.tier != SceneEvidence.Tier.NONE || v.reason.contains("方向错配")) {
+                    " · ${v.reason}"
+                } else ""
+            }.orEmpty()
+            val gateTag = if (ruleCombines[r] != null) " [合取]" else ""
+            val line = "场景 ${r + 1}/$ruleCount「$label」$gateTag" +
+                (if (!hasTemplate) " [无模板·不触发] " else " 观测=${o.present} score=$scoreTxt loc=$locTxt") +
+                evidence + evLine +
+                " → $reason"
+            if (verbose) RunLog.i("Scene", line)
+            val m = matches.getOrNull(anchorSpec)
+            boxes.add(
+                SceneDebugBox(
+                    index = ai,
+                    label = label,
+                    roi = spec.region,
+                    hit = o.present,
+                    score = o.score,
+                    clickXPct = if (m != null && m.frameW > 0) 100.0 * m.cxPx / m.frameW else act.x,
+                    clickYPct = if (m != null && m.frameH > 0) 100.0 * m.cyPx / m.frameH else act.y,
+                    decision = reason,
+                ),
+            )
+        }
+        if (verbose) {
+            if (heartbeat && !changed) {
+                RunLog.i(
+                    "Scene",
+                    SceneFramePolicy.heartbeatLine(
+                        sceneFrameCount - lastSceneLogFrame,
+                        ruleCount,
+                        (nowMs - lastSceneLogAt).coerceAtLeast(1L),
+                    ),
+                )
+            }
+            lastSceneLogAt = nowMs
+            lastSceneLogFrame = sceneFrameCount
+        }
+        onSceneDebug?.invoke(boxes)
+        if (changed) {
+            onLog("场景观测：$summary${if (decision.fire.isNotEmpty()) " · ${decision.reasons.filterKeys { it in decision.fire }}" else "（等待场景出现）"}")
         }
     }
 
@@ -295,14 +1112,14 @@ class ScriptRunner(
         val curPortrait = f.height > f.width
         val desc = "当前屏幕 ${f.width}x${f.height}（${if (curPortrait) "竖屏" else "横屏"}）"
         if (refPortrait != curPortrait) {
-            onLog("⚠ 警告：$desc 与脚本参考 ${script.refWidth}x${script.refHeight}（${if (refPortrait) "竖屏" else "横屏"}）方向相反，图片模板匹配大概率失败")
-            RunLog.w("Script", "屏幕方向与脚本参考相反：$desc vs ${script.refWidth}x${script.refHeight}")
+            onLog("$desc 与脚本参考 ${script.refWidth}x${script.refHeight}（${if (refPortrait) "竖屏" else "横屏"}）方向不同：已启用方向自适应，帧旋回拾取几何匹配、落点旋回当前屏幕")
+            RunLog.i("Script", "方向差异已自适应：$desc vs ${script.refWidth}x${script.refHeight}")
             return
         }
         val refRatio = script.refWidth.toDouble() / script.refHeight
         val curRatio = f.width.toDouble() / f.height
         if (abs(refRatio - curRatio) / refRatio > 0.25) {
-            onLog("⚠ 警告：$desc 与脚本参考 ${script.refWidth}x${script.refHeight} 宽高比差异较大（${"%.2f".format(refRatio)} vs ${"%.2f".format(curRatio)}），图片模板匹配可能失败")
+            onLog("$desc 与脚本参考 ${script.refWidth}x${script.refHeight} 宽高比不同（${String.format(Locale.US, "%.2f", refRatio)} vs ${String.format(Locale.US, "%.2f", curRatio)}）：按百分比坐标与自适应尺度继续运行")
         }
     }
 
@@ -322,7 +1139,105 @@ class ScriptRunner(
      *  成功: onActionOk / 失败: onActionFail；条件不满足: onConditionFail；
      *  最后 afterAction。
      */
-    private suspend fun runAction(action: Action, script: Script, inListener: Boolean = false): Boolean {
+    // ------------------------------------------------------------ v2.9.30 预告
+
+    /** 动作键：优先用描述，保证同一动作跨轮次可被识别为「已确认」。 */
+    private fun actionKey(action: Action): String =
+        if (action.desc.isNotEmpty()) "${action.type}#${action.desc}" else action.type.name
+
+    /** 动作的可读描述；没有描述时不编造，退到类型对应的最小词。 */
+    private fun actionLabel(action: Action): String {
+        if (action.desc.isNotEmpty()) return action.desc
+        return when (action.type) {
+            ActionType.TAP, ActionType.MULTI_TAP -> "点击"
+            ActionType.LONG_PRESS -> "长按"
+            ActionType.SWIPE, ActionType.CURVE -> "滑动"
+            ActionType.INPUT -> "输入文字"
+            ActionType.KEY -> "按键"
+            ActionType.CLICK_IMAGE, ActionType.CLICK_TEXT, ActionType.CLICK_COLOR,
+            ActionType.CLICK_NODE, ActionType.CLICK_AI,
+            -> "点击识别到的目标"
+            else -> action.type.name
+        }
+    }
+
+    /**
+     * 分级预告。返回 false 表示用户在本步撤销窗口内点了撤销。
+     *
+     * 只有 FULL 级阻塞，且阻塞时长有上界（≤2s，见 [AnnouncePolicy]）。已确认的
+     * 重复循环走 FOLDED，零延迟——这是「不拿延迟换安心」的落点。
+     */
+    private suspend fun announce(action: Action, ruleIndex: Int): Boolean {
+        val sink = onAnnounce ?: return true // 未接线：零开销
+        val key = actionKey(action)
+        val sceneFirst = ruleIndex >= 0 && seenScenes.add(ruleIndex)
+        val since = if (lastFullEndAt == 0L) Long.MAX_VALUE
+        else android.os.SystemClock.elapsedRealtime() - lastFullEndAt
+        val d = AnnouncePolicy.decide(
+            AnnouncePolicy.Fact(
+                undoable = AnnouncePolicy.isUndoable(action.type),
+                highRisk = key in riskyActions,
+                firstRun = firstRun,
+                sceneFirstSeen = sceneFirst,
+                confirmed = key in confirmedActions,
+                sinceLastFullMs = since,
+            ),
+            actionLabel(action),
+        )
+        when (d.level) {
+            AnnouncePolicy.Level.NONE -> {
+                onNext?.invoke("")
+                return true
+            }
+            AnnouncePolicy.Level.FOLDED -> {
+                onNext?.invoke(d.nextLabel)
+                confirmedActions.add(key)
+                return true
+            }
+            AnnouncePolicy.Level.FULL -> {
+                undoRequested = false
+                onNext?.invoke(d.nextLabel)
+                sink(d, d.announce)
+                // 刷新看门狗心跳：预告等待是预期内停顿，不是卡死。
+                pulse("预告等待")
+                val deadline = android.os.SystemClock.elapsedRealtime() + d.undoWindowMs
+                while (android.os.SystemClock.elapsedRealtime() < deadline && !undoRequested) {
+                    delay(60L)
+                }
+                lastFullEndAt = android.os.SystemClock.elapsedRealtime()
+                if (undoRequested) {
+                    undoRequested = false
+                    return false
+                }
+                confirmedActions.add(key)
+                return true
+            }
+        }
+    }
+
+    /**
+     * 产出终止报告。调用方在 catch 分支里调用，保证「为什么停 / 停在哪 / 能做什么」
+     * 三件事一起送达，而不是只留一行日志。
+     */
+    private fun emitHalt(kind: HaltReport.Kind, detail: String, ruleIndex: Int = -1) {
+        val sink = onHalt ?: return
+        val rep = HaltReport.of(
+            kind = kind,
+            detail = detail,
+            resumeStep = if (ruleIndex < 0) currentStep else 0,
+            resumeRule = if (ruleIndex >= 0) ruleIndex + 1 else 0,
+            resumeLabel = currentStepDesc,
+        )
+        runCatching { sink(rep) }
+    }
+
+    private suspend fun runAction(
+        action: Action,
+        script: Script,
+        inListener: Boolean = false,
+        sceneGatePreChecked: Boolean = false,
+        ruleIndex: Int = -1,
+    ): Boolean {
         val desc = action.desc.takeIf { it.isNotEmpty() }?.let { "（$it）" } ?: ""
         val prefix = if (inListener) "[监听] " else ""
         if (action.disabled) {
@@ -337,7 +1252,10 @@ class ScriptRunner(
         // 由 WaitGate 生成「等到目标画面出现」门控。游戏「扫荡 → 随机时长动画 →
         // 结算确认 → 再扫荡」这类循环因此变成事件驱动，不再靠固定延时猜时长。
         // 老脚本无 waitAppear 字段（默认 false），此分支完全不生效。
+        // v2.9.14：场景驱动下外层 runSceneDriven 已判定该规则的场景命中，这里跳过
+        // 二次门控（否则刚命中的画面要再截图匹配一次，且时序抖动会误判为跳过）。
         val gateCond: Condition? = when {
+            sceneGatePreChecked -> null
             action.condition != null -> action.condition
             action.waitAppear && action.imageData.isNotEmpty() && WaitGate.supports(action.type) ->
                 WaitGate.image(action.imageData, action.imageSimilarity, action.region, action.filters)
@@ -353,12 +1271,21 @@ class ScriptRunner(
 
         var ok = false
         if (condOk) {
+            // v2.9.30：分级预告。FULL 级在此阻塞并等待撤销窗口；FOLDED 只刷新常驻
+            // 「下一步」。返回 false 表示用户撤销了本步——不派发，但不算失败。
+            if (!announce(action, ruleIndex)) {
+                stats.skip++
+                onLog("↩ ${AnnouncePolicy.revokedNotice(actionLabel(action))}")
+                runListeners(action.listeners.afterAction)
+                return false
+            }
             ok = repeatActionBody(action, script)
             runCounts[action.desc] = (runCounts[action.desc] ?: 0) + 1
             // 次数同步变量（对标自动精灵）：把"本动作累计运行次数"写进
             // vars.__runCount，JS 条件 / RUN_JS 代码可读：
             //   if (vars.__runCount >= 3) { ... }
             vars.set(RUN_COUNT_VAR, runCounts[action.desc])
+            var failHandled = false
             if (ok) {
                 // 后置断言（裁定阶段 3.3）：坐标命中 ≠ 点击产生了正确结果。
                 // 断言失败与坐标未命中是两类问题：前者是目标 App 界面逻辑变了，
@@ -372,13 +1299,17 @@ class ScriptRunner(
                     onFail?.invoke(FailReason.ASSERT_FAIL, msg, currentStep)
                     onAbnormal?.invoke(msg)
                     handleActionFail(action, msg)
+                    failHandled = true
                 }
             }
             if (ok) {
                 runListeners(action.listeners.onActionOk)
                 // 一次性变量（执行后删变量）：动作成功结束后即删除值，声明保留
                 if (action.deleteVarAfter) vars.clearValue(action.varName)
-            } else if (action.postCondition == null) {
+            } else if (!failHandled) {
+                // v2.9.35：此前条件是 `else if (postCondition == null)`，导致"动作本体
+                // 失败 + 配了后置断言"时两处都不调 handleActionFail —— pauseOnFail 失效、
+                // onActionFail 监听不触发。有断言的脚本反而比无断言的失败处理更弱。
                 handleActionFail(action, null)
             }
         } else {
@@ -420,8 +1351,10 @@ class ScriptRunner(
      */
     private suspend fun repeatActionBody(action: Action, script: Script): Boolean {
         val times = if (action.timesExp.isNotEmpty()) {
+            // v2.9.35：表达式结果截断后为 0 会被 while(times==0) 当"无限重复"→
+            // 死循环刷屏。表达式次数一律保底 1；"无限"只允许静态 times==0 字面值。
             runCatching { js.eval(action.timesExp, vars.live()) }.getOrNull()
-                ?.toString()?.trim()?.toDoubleOrNull()?.toInt() ?: action.times
+                ?.toString()?.trim()?.toDoubleOrNull()?.toInt()?.coerceAtLeast(1) ?: action.times
         } else action.times
         if (action.waitMs > 0 || action.randomWaitMs > 0) {
             // v2.9.4：randomWaitMs = Long.MAX_VALUE 时 +1 溢出成负数，
@@ -441,9 +1374,11 @@ class ScriptRunner(
                 ActionType.RUN_ACTIONS -> runChildren(action, script)
                 ActionType.RUN_SCRIPT -> { runSubScript(action); true }
                 ActionType.RUN_JS -> {
+                    // v2.9.35：JS 抛异常时只发 onAbnormal 仍 return true，会让统计、
+                    // onActionOk、后置断言都当成功，"运行报告全绿"掩盖副作用全未生效。
                     val r = runCatching { js.run(action.jsCode, vars.live()) }
                     r.exceptionOrNull()?.let { onAbnormal?.invoke("JS 执行失败：${it.message}") }
-                    true
+                    r.isSuccess
                 }
                 else -> executeSingle(action)
             }
@@ -503,7 +1438,11 @@ class ScriptRunner(
 
     // ------------------------------------------------------------ 条件判断
 
-    private suspend fun evaluateCondition(cond: Condition, runCountKey: String = ""): Boolean {
+    private suspend fun evaluateCondition(
+        cond: Condition,
+        runCountKey: String = "",
+        isolatedJs: Boolean = false,
+    ): Boolean {
         // 中止条件（对标自动精灵 break）：载荷命中即中止整个脚本。
         // 必须在组合/原生分支之前拦截——ConditionEvaluator 对未知 kind 兜底 false，
         // 漏到这里会让中止条件永远"不命中"而静默失效。
@@ -522,7 +1461,7 @@ class ScriptRunner(
         //  导致含图片/文字/颜色子条件的 COMBINE 永远不可能满足——
         //  "第一步就全部跳过"的重大嫌疑根因。）
         if (cond.kind == dev.nymph.auto.core.model.ConditionKind.COMBINE) {
-            val results = cond.children.map { evaluateCondition(it, runCountKey) }
+            val results = cond.children.map { evaluateCondition(it, runCountKey, isolatedJs) }
             val ok = when (cond.combine) {
                 dev.nymph.auto.core.model.Combine.ALL -> results.all { it }
                 dev.nymph.auto.core.model.Combine.ANY -> results.any { it }
@@ -540,8 +1479,10 @@ class ScriptRunner(
             dev.nymph.auto.core.model.ConditionKind.APPEAR_NODE ->
                 vision.findNode(cond.nodeId, cond.nodeClass, cond.nodeText, cond.nodeDepthMin, cond.nodeDepthMax) != null
             // 文字/颜色找图找色：走视觉管线（对标自动精灵的文字与颜色条件）
+            // v2.9.34 安全根基：文字存在性判定改走无坐标断言接口，
+            // 条件求值在类型层面无法取得点击位置；点击定位仍走 findTextNode，能力不退化。
             dev.nymph.auto.core.model.ConditionKind.APPEAR_TEXT ->
-                vision.findTextNode(cond.text, cond.textRegex) != null
+                vision.assertText(cond.text, cond.textRegex) != null
             // AI 找目标：文字描述映射到检测类别后出现即满足（离线 TFLite）
             dev.nymph.auto.core.model.ConditionKind.APPEAR_AI ->
                 vision.findAiObject(cond.aiLabel, cond.aiThreshold, RoiExpr.resolveRegion(cond.region)) != null
@@ -553,7 +1494,10 @@ class ScriptRunner(
             else -> null
         }
         if (native != null) return native != cond.invert
-        return evaluator.eval(cond, vars.live(), { key -> runCounts[key] ?: 0 }, runCountKey) != cond.invert
+        // v2.9.35：check 回调路径（isolatedJs）用隔离的内存求值器，杜绝从 Default
+        // 线程重入主 QuickJS runtime；其余路径保持原 evaluator 零回归。
+        val activeEvaluator = if (isolatedJs) checkEvaluator else evaluator
+        return activeEvaluator.eval(cond, vars.live(), { key -> runCounts[key] ?: 0 }, runCountKey) != cond.invert
     }
 
     /**
@@ -567,7 +1511,7 @@ class ScriptRunner(
     private suspend fun abortPayloadHit(cond: Condition): Boolean =
         cond.children.isNotEmpty() && cond.children.all { evaluateCondition(it, "") }
 
-    /** 中止条件的人话描述（命中日志用：告诉用户是哪个屏幕元素触发的中止）。 */
+    /** 中止条件的可读描述（命中日志用：告诉用户是哪个屏幕元素触发的中止）。 */
     private fun abortDesc(cond: Condition): String =
         cond.children.firstOrNull()?.let { condDesc(it) } ?: "（无载荷）"
 
@@ -586,7 +1530,9 @@ class ScriptRunner(
             RunLog.w("Script", "check('$name')：未找到同名条件（按动作描述 desc 匹配运行条件）")
             return false
         }
-        return evaluateCondition(cond, name)
+        // isolatedJs=true：本方法由 JS 原生上调（runBlockingSync/Default 线程）进入，
+        // JS_EXPR 子条件必须走隔离求值器，避免跨线程重入主 runtime。
+        return evaluateCondition(cond, name, isolatedJs = true)
     }
 
     private fun findCondition(actions: List<Action>, name: String): Condition? {
@@ -600,7 +1546,7 @@ class ScriptRunner(
         return null
     }
 
-    /** 条件类型的人话描述（失败日志用，直接告诉用户是哪类条件挂的）。 */
+    /** 条件类型的可读描述（失败日志用，直接告诉用户是哪类条件挂的）。 */
     private fun condDesc(cond: Condition): String = when (cond.kind) {
         dev.nymph.auto.core.model.ConditionKind.APPEAR_IMAGE -> "图片未出现"
         dev.nymph.auto.core.model.ConditionKind.APPEAR_TEXT -> "文字未出现"
@@ -779,7 +1725,7 @@ class ScriptRunner(
                             return false
                         }
                         if (d > 0.5) {
-                            onLog("锚点「$key」漂移修正 ${"%.1f".format(d)}px（累计 ${"%.1f".format(drift.cumulative)}px）")
+                            onLog("锚点「$key」漂移修正 ${String.format(Locale.US, "%.1f", d)}px（累计 ${String.format(Locale.US, "%.1f", drift.cumulative)}px）")
                         }
                     }
                     anchorLast[key] = hit.cx to hit.cy
@@ -811,12 +1757,12 @@ class ScriptRunner(
             }
             ActionType.CLICK_COLOR -> {
                 val hit = withRetry(
-                    target = "目标颜色 #%06X".format(action.color and 0xFFFFFF),
+                    target = String.format(Locale.US, "目标颜色 #%06X", action.color and 0xFFFFFF),
                     isImage = true,
                     find = { vision.findColor(action.color, action.colorSimilarity, RoiExpr.resolveRegion(action.region), action.coordX, action.coordY) },
                 )
                 if (hit == null) {
-                    onFail?.invoke(FailReason.COORD_MISS, "未找到目标颜色 #%06X".format(action.color and 0xFFFFFF), currentStep)
+                    onFail?.invoke(FailReason.COORD_MISS, String.format(Locale.US, "未找到目标颜色 #%06X", action.color and 0xFFFFFF), currentStep)
                     onAbnormal?.invoke("未找到目标颜色（已重试至超时）")
                     return false
                 }
@@ -857,7 +1803,7 @@ class ScriptRunner(
                     onAbnormal?.invoke("AI 未识别到目标（已重试至超时）：${action.aiLabel}")
                     return false
                 }
-                onLog("AI 命中 ${hit.label}（${"%.2f".format(hit.score)}）@ ${hit.cx},${hit.cy}")
+                onLog("AI 命中 ${hit.label}（${String.format(Locale.US, "%.2f", hit.score)}）@ ${hit.cx},${hit.cy}")
                 val ax = (hit.cx + action.offsetX).toFloat(); val ay = (hit.cy + action.offsetY).toFloat()
                 return dispatch(
                     gesture.planTap(hit.cx + action.offsetX, hit.cy + action.offsetY, action.holdMs),
@@ -870,7 +1816,7 @@ class ScriptRunner(
                 if (!ok) onAbnormal?.invoke("未找到输入框")
                 return ok
             }
-            ActionType.OPEN_APP, ActionType.CLOSE_APP -> {
+            ActionType.OPEN_APP -> {
                 if (!TargetPackages.isLaunchableTarget(action.packageName)) {
                     // 旧版录制脚本可能残留系统组件窗口动作：无启动入口、无需打开，
                     // 跳过而非失败，避免回放第一步就中断。
@@ -878,6 +1824,15 @@ class ScriptRunner(
                     return true
                 }
                 return AppLauncher.run(action.packageName, action.restart)
+            }
+            ActionType.CLOSE_APP -> {
+                // v2.9.35：与 OPEN_APP 拆开。此前共用启动分支导致"关闭应用"实际
+                // 重新拉起目标应用，前序退出动作之后的所有坐标动作打错界面。
+                if (!TargetPackages.isLaunchableTarget(action.packageName)) {
+                    RunLog.i("Runner", "跳过系统组件窗口动作：${action.packageName}")
+                    return true
+                }
+                return AppLauncher.close(action.packageName)
             }
             ActionType.OPEN_LINK -> return AppLauncher.openLink(action.linkUrl)
             ActionType.SET_VAR -> { vars.set(action.varName, resolveVarValue(action)); return true }
@@ -896,6 +1851,14 @@ class ScriptRunner(
             }
             ActionType.TOAST -> { onLog("[提示] ${action.text}"); return true }
             ActionType.STOP -> { onAbnormal?.invoke("脚本已停止"); throw StopScript() }
+            ActionType.VAR_DIALOG -> {
+                // v2.9.35：变量弹窗动作此前无实现，落 else 被当成功——弹窗从不出现、
+                // 变量从不写入，却上报成功，依赖人工输入的分支全部走错。执行器内无法
+                // 同步弹窗，显式报"不支持"并失败，不静默伪装成功。
+                val msg = "变量弹窗动作需在界面端输入，回放暂不支持：${action.varName}"
+                onAbnormal?.invoke(msg)
+                return false
+            }
             else -> return true
         }
     }
@@ -1006,7 +1969,7 @@ class ScriptRunner(
                         val best = diagnose?.invoke() ?: -1.0
                         if (best >= 0) {
                             val th = threshold.coerceIn(1, 100) / 100.0
-                            sb.append("；最佳 NCC ${"%.2f".format(best)} / 阈值 ${"%.2f".format(th)}")
+                            sb.append("；最佳 NCC ${String.format(Locale.US, "%.2f", best)} / 阈值 ${String.format(Locale.US, "%.2f", th)}")
                             sb.append(
                                 when {
                                     best < 0.45 -> "（界面大概率没有该元素，或屏幕方向/分辨率与脚本错配）"
@@ -1021,7 +1984,7 @@ class ScriptRunner(
                     // 2s 就重跑一轮、每次都压缩一张失败截图，90 秒刷几十张 PNG，
                     // 空转烧电且写满调试目录。这里按「连续未命中」次数线性退避
                     // 并封顶：只降频、绝不终止脚本（等待目标出现的正常场景不受影响），
-                    // 一旦命中立即清零恢复。退避前刷新心跳，避免被 120s 看门狗误杀。
+                    // 一旦命中立即清零恢复。退避前刷新心跳，避免被 120s 看门狗误判终止。
                     consecutiveMiss++
                     if (consecutiveMiss >= MISS_BACKOFF_AFTER) {
                         val backoffMs = ((consecutiveMiss - MISS_BACKOFF_AFTER + 1)
@@ -1088,7 +2051,7 @@ class ScriptRunner(
         if (!cfg.enabled || !cfg.accepts(kind)) return
         if (cfg.previewEnabled && cfg.previewMs > 0 && kind != VisualKind.PREVIEW) {
             emitCue(sink, VisualKind.PREVIEW, points, cfg.previewMs, cfg)
-            pulse("动作落点预告") // 刷新看门狗心跳，避免预告等待被误杀
+            pulse("动作落点预告") // 刷新看门狗心跳，避免预告等待被误判终止
             delay(cfg.previewMs)
         }
         emitCue(sink, kind, points, durationMs, cfg)
@@ -1152,9 +2115,10 @@ class ScriptRunner(
             }
             return true
         }
-        val current = runCatching {
+        fun currentFrontPackage(): String? = runCatching {
             AutoClickService.live()?.rootInActiveWindow()?.packageName?.toString()
         }.getOrNull()
+        val current = currentFrontPackage()
         val verdict = SceneGuard.decide(
             recordedPackage = script.startPackage,
             currentPackage = current,
@@ -1183,8 +2147,26 @@ class ScriptRunner(
                     )
                     true
                 } else {
-                    onAbnormal?.invoke("无法自动返回录制时的应用（${script.startPackage}），已中止；请手动打开后重试")
-                    false
+                    // v2.9.33：拉起失败不再无条件中止。厂商聚合应用（如
+                    // com.hihonor.gameassistant）无标准启动入口、或受包可见性限制时，
+                    // getLaunchIntentForPackage 返回 null，旧实现在此把「拉不起来」等同
+                    // 「中止脚本」，用户手动进入后仍需反复重跑。重新读取前台包名，
+                    // 已进入目标应用即放行；确未进入才中止，并一次性点名要打开的应用。
+                    val restore = RestorePolicy.decide(
+                        recordedPackage = script.startPackage,
+                        currentPackage = currentFrontPackage(),
+                        hasPositionalActions = positional,
+                    )
+                    when (restore.outcome) {
+                        RestorePolicy.Outcome.PROCEED -> {
+                            emitSceneNotice(restore.message)
+                            true
+                        }
+                        RestorePolicy.Outcome.ABORT -> {
+                            onAbnormal?.invoke(restore.message)
+                            false
+                        }
+                    }
                 }
             }
             SceneGuard.Decision.REQUIRE_MANUAL -> {
@@ -1205,7 +2187,11 @@ class ScriptRunner(
     }
 
     private suspend fun runListeners(list: List<Action>) {
-        list.forEach { l -> if (l.type != ActionType.GOTO) runAction(l, Script(), inListener = true) }
+        // v2.9.35：此前用空 Script() 作上下文，导致监听动作里的中止条件
+        // （abortCondition）恒为空检查、嵌套监听器被忽略。改用当前运行脚本作
+        // 上下文，监听动作同样受中止条件保护；GOTO 仍在监听器内禁用防止控制流逃逸。
+        val ctx = currentScript ?: Script()
+        list.forEach { l -> if (l.type != ActionType.GOTO) runAction(l, ctx, inListener = true) }
     }
 
     private suspend fun awaitIfPaused() {
@@ -1245,7 +2231,7 @@ class ScriptRunner(
      *
      * 旧版所有 findImage / diagnoseImage / imageExists 都把 refDpi 传 0.0，
      * [ImageFinder] 的 scalesOf 里 `ratio = if (refDpi > 0.01) curDensity/refDpi
-     * else 1.0` 恒等于 1.0 —— 也就是说脚本里记录的 refWidth/refHeight
+     * else 1.0` 恒等于 1.0 —— 即脚本里记录的 refWidth/refHeight
      * （导入器会写入，坐标映射也用）**从未参与模板缩放**，只在方向告警里
      * 露过面。跨分辨率导入的脚本，模板尺寸与当前屏幕不匹配时必然全灭，
      * 真机日志反复出现「分辨率与脚本错配 / NCC 0.00」正是这个症状。
@@ -1297,7 +2283,13 @@ object KeyMapper {
             "主页键" -> android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_HOME
             "任务键" -> android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_RECENTS
             "通知栏" -> android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS
-            "电源键" -> android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN
+            "电源键" -> {
+                // v2.9.24：GLOBAL_ACTION_LOCK_SCREEN 自 API 28 起才有定义。
+                // 低版本上该常量会被内联成 8 并下发一个未定义动作，
+                // performGlobalAction 静默返回 false —— 明确不支持而不是下发无效动作。
+                if (android.os.Build.VERSION.SDK_INT < 28) return false
+                android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN
+            }
             else -> return false // 其余按键需 IME
         }
         return svc.global(g)
@@ -1306,19 +2298,98 @@ object KeyMapper {
 
 /** 应用打开/关闭（显式 Intent + 包可见性已声明）。 */
 object AppLauncher {
+    /** 结束目标进程所需权限；本应用按「权限零新增」约束不声明，恒为未授予。 */
+    private const val PERMISSION_KILL_BACKGROUND =
+        android.Manifest.permission.KILL_BACKGROUND_PROCESSES
+
     fun run(pkg: String, restart: Boolean): Boolean {
         val ctx = AutoClickService.live() ?: return false
         return runCatching {
             val pm = ctx.packageManager
-            val intent = pm.getLaunchIntentForPackage(pkg) ?: return false
+            // v2.9.33：部分厂商聚合应用（如 com.hihonor.gameassistant）没有可被
+            // getLaunchIntentForPackage 解析的标准 CATEGORY_LAUNCHER 入口。先取标准入口，
+            // 取不到再退而求解显式 setPackage 的 MAIN intent——在包可见性允许解析到目标
+            // Activity 的设备上可补齐这一缺口。<queries> 仅声明 MAIN intent，解析可能因
+            // Android 11+ 包可见性失败；这是尽力而为，失败交由 RestorePolicy 裁决，不再
+            // 直接等同中止。不引入 shell / monkey（权限与进程契约不变）。
+            val intent = pm.getLaunchIntentForPackage(pkg)
+                ?: explicitMainIntent(ctx, pkg)
+                ?: return false
             intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-            if (restart) {
-                val am = ctx.getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-                am.killBackgroundProcesses(pkg)
-            }
+            // v2.9.24：结束进程与启动解耦。旧实现把 killBackgroundProcesses 与
+            // startActivity 放在同一个 runCatching 里，而未声明
+            // KILL_BACKGROUND_PROCESSES 权限 → 必然抛 SecurityException → 直接
+            // 跳过 startActivity，于是「关闭并重启应用」100% 不启动且只返回 false。
+            if (restart) killIfPermitted(ctx, pkg)
             ctx.startActivity(intent)
             true
         }.getOrDefault(false)
+    }
+
+    /**
+     * v2.9.35：关闭应用（对标自动精灵"关闭应用"）。此前 CLOSE_APP 与 OPEN_APP
+     * 共用 [run] 分支，导致"关闭"实际执行"启动"，语义完全反转。
+     *
+     * 本应用按权限零新增约束不声明 KILL_BACKGROUND_PROCESSES，因此无法强杀
+     * 第三方进程；可行且语义正确的降级是"退到桌面"——让目标应用不再处于前台，
+     * 后续坐标动作打在桌面上，符合用户"先退出某 App"的意图。有权限的特殊设备
+     * 上再叠加 killBackgroundProcesses 真正结束进程。
+     */
+    fun close(pkg: String): Boolean {
+        val ctx = AutoClickService.live() ?: return false
+        // 有权限时尽力结束进程（本应用恒无，属罕见授权设备路径）
+        killIfPermitted(ctx, pkg)
+        return runCatching {
+            val home = android.content.Intent(android.content.Intent.ACTION_MAIN)
+                .addCategory(android.content.Intent.CATEGORY_HOME)
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(home)
+            RunLog.i("Runner", "已退到桌面（关闭应用 ${pkg} 的前台显示）")
+            true
+        }.getOrDefault(false)
+    }
+
+    /**
+     * 显式包名的 MAIN 入口兜底：解析不到返回 null。
+     *
+     * 与 [TargetPackages.isLaunchableTarget] 的纯字符串判定不同，这里真实查询
+     * PackageManager，用于补齐「有可启动 Activity、但无 CATEGORY_LAUNCHER 入口」的厂商应用。
+     * 受包可见性限制时 resolve 可能返回 null，属预期边界，不做异常外抛。
+     */
+    private fun explicitMainIntent(ctx: android.content.Context, pkg: String): android.content.Intent? {
+        val probe = android.content.Intent(android.content.Intent.ACTION_MAIN).setPackage(pkg)
+        val resolved = runCatching {
+            ctx.packageManager.resolveActivity(probe, 0)
+        }.getOrNull() ?: return null
+        return probe.setComponent(resolved.activityInfo.let {
+            android.content.ComponentName(it.packageName, it.name)
+        })
+    }
+
+    /**
+     * 尽力结束目标进程：无权限时只记日志，不阻断启动。
+     *
+     * 权限在本应用里恒为未授予（不新增权限），因此该分支实际上总是跳过结束进程，
+     * 启动语义与「打开应用」一致；保留权限判定是为了在用户通过系统设置手工授予
+     * 的特殊设备上仍能真正重启。
+     */
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun killIfPermitted(ctx: android.content.Context, pkg: String) {
+        val granted = runCatching {
+            ctx.checkSelfPermission(PERMISSION_KILL_BACKGROUND) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        }.getOrDefault(false)
+        if (!granted) {
+            RunLog.i("Runner", "未授予结束进程权限，跳过结束进程，直接启动目标应用")
+            return
+        }
+        runCatching {
+            val am = ctx.getSystemService(android.content.Context.ACTIVITY_SERVICE)
+                as android.app.ActivityManager
+            am.killBackgroundProcesses(pkg)
+        }.onFailure {
+            RunLog.w("Runner", "结束进程失败（${it.javaClass.simpleName}），继续启动目标应用")
+        }
     }
 
     /**

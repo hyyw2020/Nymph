@@ -42,7 +42,7 @@ import kotlinx.coroutines.withContext
  * 运行日志页：内存环形缓冲 + 本地滚动文件的最新 [CAP] 行。
  *
  * 不做自动滚动到底：排查时用户往往在一次失败后打开，停在底部反而
- * 看不到失败前的上下文；页面从最近的记录开始（倒序不重要，保持时间正序
+ * 无法获取失败前的上下文；页面从最近的记录开始（倒序不重要，保持时间正序
  * 但从顶部开始），让用户自己滚动。
  */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -113,7 +113,7 @@ fun LogScreen(
                 contentAlignment = Alignment.Center,
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("暂无日志", style = MaterialTheme.typography.titleMedium)
+                    Text("暂无日志", style = Ds.ItemTitle)
                     Text(
                         "导入、运行、录制的过程会实时记录在这里",
                         style = MaterialTheme.typography.bodySmall,

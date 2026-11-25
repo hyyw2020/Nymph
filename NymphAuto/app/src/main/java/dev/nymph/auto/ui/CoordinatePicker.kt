@@ -11,7 +11,10 @@ import android.view.Choreographer
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
+import dev.nymph.auto.core.editor.FeatureBox
 import dev.nymph.auto.core.vision.PickerGeometry
+import dev.nymph.auto.core.vision.EdgeSafety
+import dev.nymph.auto.core.vision.PointerTouchTarget
 import dev.nymph.auto.engine.AutoClickService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -28,6 +31,18 @@ data class PickerResult(
     val yPx: Int,
     val widthPx: Int,
     val heightPx: Int,
+    /**
+     * v2.9.29：落点原本在系统手势热区内，已内移到安全边界。
+     *
+     * 携带这个标记而不是让上层重新算一遍，是为了让「交付的坐标」与「提示文案」
+     * 出自同一次判定——两处各算一次就会在 insets 变化时给出互相矛盾的结论。
+     */
+    val edgeAdjusted: Boolean = false,
+    /** 内移原因（如「左边缘手势区」）；未内移时为空串。 */
+    val edgeNote: String = "",
+    /** 内移前的原始像素坐标，供诊断摘要还原用户实际点的位置。 */
+    val rawXPx: Int = xPx,
+    val rawYPx: Int = yPx,
 ) {
     /** 百分比坐标（0..100，全精度 Double，编辑器按需格式化）。 */
     val xPct: Double get() = if (widthPx > 0) 100.0 * xPx / widthPx else 0.0
@@ -47,6 +62,11 @@ data class PickerRegion(
     val heightPx: Int,
     /** ROI 表达式（百分比四元组，Locale 安全）；运行时由 RoiExpr 优先解析。 */
     val expr: String = "",
+    /**
+     * v2.9.49：该框独立的匹配相似度下限（0–100，默认 85）。多框会话逐框携带，
+     * 应用时写入目标动作/条件的 imageSimilarity。单框路径忽略此值，零回归。
+     */
+    val similarity: Int = 85,
 ) {
     val leftPct: Double get() = pct(leftPx, widthPx)
     val topPct: Double get() = pct(topPx, heightPx)
@@ -60,12 +80,17 @@ data class PickerRegion(
     ).joinToString(",")
 
     private fun pct(v: Int, total: Int): Double = if (total > 0) 100.0 * v / total else 0.0
+
+    /** v2.9.49：几何完全相同（忽略 expr / similarity），用于多框去重。 */
+    internal fun sameRect(o: PickerRegion): Boolean =
+        leftPx == o.leftPx && topPx == o.topPx && rightPx == o.rightPx &&
+            bottomPx == o.bottomPx && widthPx == o.widthPx && heightPx == o.heightPx
 }
 
 /**
  * 超高精度坐标拾取浮层（v2.7.0 **非模态穿透**重构；v2.7.1 修准星/会话 bug）。
  *
- * ## 与 v2.6.0 的本质区别（回应用户第一诉求）
+ * ## 与 v2.6.0 的架构差异（对应首要需求）
  *
  * v2.6.0 是一个 `MATCH_PARENT` 且**可触摸**的全屏模态层：盖上之后底层 APP
  * 完全收不到触摸，用户没法「一边拾取坐标，一边操作指针外的任意区域」，
@@ -118,6 +143,11 @@ object CoordinatePicker {
     var lastRegion: PickerRegion? = null
         private set
 
+    /** v2.9.49：多框会话最近一次提交的全部特征框（只读快照）。 */
+    @Volatile
+    var lastRegions: List<PickerRegion> = emptyList()
+        private set
+
     /** 每次确认自增，供编辑器判断「这次结果还没消费」。 */
     @Volatile
     var resultSeq: Int = 0
@@ -130,6 +160,10 @@ object CoordinatePicker {
     @Volatile
     private var deliver: ((PickerResult?, PickerRegion?) -> Unit)? = null
 
+    /** v2.9.49：多框会话提交回调，与单结果 deliver 并存、互不干扰。 */
+    @Volatile
+    private var deliverRegions: ((List<PickerRegion>) -> Unit)? = null
+
     @Volatile
     private var session: PickerSession? = null
 
@@ -137,7 +171,7 @@ object CoordinatePicker {
      * v2.9.5：活跃会话登记表（防残留窗口）。
      *
      * 旧版只持有 [session] 一个引用：一旦某条路径在 `start()` 中途抛异常
-     * （权限被撤销、窗口数量超限），已经 `addView` 成功的窗口就成了「无主窗口」——
+     * （权限被撤销、窗口数量超限），已经 `addView` 成功的窗口就成了「未登记窗口」——
      * 没有任何引用能把它移除，旧浮层便永久留在屏幕上，与新会话叠加，
      * 表现为多串坐标读数 / 多个准星互相打架。
      *
@@ -163,13 +197,17 @@ object CoordinatePicker {
         snap: SnapProvider? = null,
         onRegionPicked: ((PickerRegion) -> Unit)? = null,
         onPicked: ((PickerResult) -> Unit)? = null,
+        /** v2.9.49：多特征框会话（REGION 模式下连续落定 N 框，确认一次提交全部）。 */
+        multiBox: Boolean = false,
+        onRegionsPicked: ((List<PickerRegion>) -> Unit)? = null,
     ): Boolean {
         if (!Settings.canDrawOverlays(context)) return false
         // v2.9.5：不管登记表里还剩几个会话，先全部拆掉再建新的。
         // 原来只拆 session 指向的那一个，其余残留窗口会永远留在屏幕上。
         dismissAll()
         this.deliver = buildDeliver(onPicked, onRegionPicked)
-        val s = PickerSession(context.applicationContext, mode, snap)
+        this.deliverRegions = onRegionsPicked
+        val s = PickerSession(context.applicationContext, mode, snap, multiBox)
         return try {
             s.start(initialPct)
             session = s
@@ -183,9 +221,22 @@ object CoordinatePicker {
         }
     }
 
+    /** v2.9.49：由多框会话在确认时调用：一次性提交全部框，取消时绝不调用。 */
+    internal fun deliverRegions(regions: List<PickerRegion>) {
+        if (regions.isEmpty()) return
+        lastRegions = regions
+        resultSeq++
+        val cb = this.deliverRegions
+        this.deliverRegions = null
+        this.deliver = null
+        dismissAll()
+        cb?.invoke(regions)
+    }
+
     /** 关闭浮层（幂等；结果保留，回调清空避免持有已销毁的 Composable）。 */
     fun dismiss() {
         this.deliver = null
+        this.deliverRegions = null
         dismissAll()
     }
 
@@ -253,7 +304,10 @@ object CoordinatePicker {
         private val ctx: Context,
         private val mode: PickerMode,
         private val snap: SnapProvider?,
+        private val multiBox: Boolean = false,
     ) {
+        /** v2.9.49：多框会话已落定的框（不含当前正在拖的框）。 */
+        private val confirmed = mutableListOf<PickerRegion>()
         private val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
         private val d = ctx.resources.displayMetrics.density
         private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -276,6 +330,18 @@ object CoordinatePicker {
         private var addedOverlay = false
         private var addedHandle = false
         private var addedSecond = false
+
+        /**
+         * v2.9.29：全屏滑动捕获层与它的窗口参数。
+         *
+         * 放在绘制层之上、抓手之下：绘制层 `FLAG_NOT_TOUCHABLE` 不接触摸，
+         * 抓手必须比捕获层更靠上，否则面板上的按钮会被捕获层吃掉。
+         */
+        private val capture = PointerCaptureView(ctx)
+        private val captureLp: WindowManager.LayoutParams
+        private var addedCapture = false
+        private var captureEnabled = true
+        private var releaseRunnable: Runnable? = null
         private var lastShotAt = 0L
 
         // ---- v2.9.5：抓取偏移（手指屏幕绝对坐标 − 目标真值），拖动全程不变 ----
@@ -296,15 +362,10 @@ object CoordinatePicker {
         }
 
         init {
-            val bounds = if (Build.VERSION.SDK_INT >= 30) {
-                wm.currentWindowMetrics.bounds
-            } else {
-                @Suppress("DEPRECATION")
-                android.util.DisplayMetrics().also { wm.defaultDisplay.getRealMetrics(it) }
-                    .let { android.graphics.Rect(0, 0, it.widthPixels, it.heightPixels) }
-            }
-            screenW = max(1, bounds.width())
-            screenH = max(1, bounds.height())
+            // v2.9.19：边界尺寸统一取自全屏绝对坐标真源，与其余悬浮窗口共用同一基准。
+            val size = OverlayWindowMetrics.screenSize(wm)
+            screenW = size.width
+            screenH = size.height
 
             overlay.mode = mode
             overlay.screenW = screenW
@@ -326,7 +387,13 @@ object CoordinatePicker {
                 height = cs
                 gravity = Gravity.TOP or Gravity.START
             }
+            // 捕获层：全屏、透明、可触摸。不含 FLAG_NOT_TOUCHABLE，否则收不到触摸。
+            captureLp = baseParams().apply {
+                width = WindowManager.LayoutParams.MATCH_PARENT
+                height = WindowManager.LayoutParams.MATCH_PARENT
+            }
             handle.mode = mode
+            handle.multiBox = multiBox && mode == PickerMode.REGION
             if (mode == PickerMode.REGION) ensureSecond(addNow = false)
             positionParams()
         }
@@ -354,7 +421,28 @@ object CoordinatePicker {
             }
             handle.onDragTo = { rawX, rawY -> moveCrossTo(rawX, rawY) }
             handle.onDragEnd = { flushPending() }
+            // v2.9.29：长按抓手 = 临时放行 3 秒，让用户能翻页 / 点击背后应用。
+            // 没有这个出口，全屏捕获会把「先让目标界面出现」这一步堵死。
+            handle.onLongPress = { releaseCaptureBriefly(3_000L) }
             handle.onAction = ::onAction
+
+            // 捕获层接线：任意位置按下即拖准星，不再要求命中 30dp 的小圆。
+            capture.onDown = { rawX, rawY ->
+                grabOffX = PickerGeometry.grabOffset(rawX, crossX)
+                grabOffY = PickerGeometry.grabOffset(rawY, crossY)
+            }
+            capture.onMove = { rawX, rawY -> moveCrossTo(rawX, rawY) }
+            capture.onUp = { flushPending() }
+            capture.onCancel = { flushPending() }
+            // 轻点 = 绝对定位：准星直接放到按下的那个点，不做增量换算。
+            capture.onTap = { rawX, rawY ->
+                pendingX = PickerGeometry.clamp(rawX, screenW)
+                pendingY = PickerGeometry.clamp(rawY, screenH)
+                pendingIsRegion = false
+                pendingValid = true
+                commitPending()
+                applyGestureExclusion()
+            }
             handle.onExpandedChanged = { expanded ->
                 if (expanded) {
                     handleLp.width = PickerHandleView.expandedW(d)
@@ -376,8 +464,11 @@ object CoordinatePicker {
             positionParams()
 
             wm.addView(overlay, overlayLp); addedOverlay = true
+            // 捕获层必须在绘制层之后、抓手之前：z 序靠后 add 的在上层。
+            wm.addView(capture, captureLp); addedCapture = true
             wm.addView(handle, handleLp); addedHandle = true
             second?.let { s -> secondLp?.let { lp -> wm.addView(s, lp); addedSecond = true } }
+            applyGestureExclusion()
             applyCross()
         }
 
@@ -387,6 +478,10 @@ object CoordinatePicker {
                 .coerceIn(0, max(0, screenW - handleLp.width))
             handleLp.y = (crossY.roundToInt() - handleLp.height / 2)
                 .coerceIn(0, max(0, screenH - handleLp.height))
+            // v2.9.29：把准星真值换算成抓手窗口内的绘制坐标。窗口贴边被夹住时，
+            // 圆仍画在真值处，不再出现「读数 0%、圆却在 24dp」的错位。
+            handle.crossInWindowX = crossX - handleLp.x
+            handle.crossInWindowY = crossY - handleLp.y
             secondLp?.let { lp ->
                 lp.x = (bX.roundToInt() - lp.width / 2)
                     .coerceIn(0, max(0, screenW - lp.width))
@@ -402,12 +497,65 @@ object CoordinatePicker {
             if (addedSecond) second?.let { v -> secondLp?.let { lp -> runCatching { wm.updateViewLayout(v, lp) } } }
         }
 
+        /**
+         * v2.9.29：声明「准星附近这块不参与系统返回手势」。
+         *
+         * 手势导航下左右边缘与底部属于系统热区，落在其中的 `MOVE` 会被系统截走，
+         * 应用收不到事件——表现就是准星拖到边上后再也拉不回来。排除区跟随准星，
+         * 而不是常驻三条屏边：系统对排除区总量有上限，常驻会被裁剪，跟随只占一块。
+         *
+         * API 29 起才有该能力；低版本没有手势导航，桌面/三键导航的边缘不会抢
+         * 触摸，因此直接跳过，不做无效调用。
+         */
+        private fun applyGestureExclusion(x: Float = crossX, y: Float = crossY) {
+            if (Build.VERSION.SDK_INT < 29) return
+            val size = (PointerTouchTarget.EXCLUSION_DP * d).toInt()
+            val r = PointerTouchTarget.exclusionFor(x, y, screenW, screenH, size) ?: return
+            runCatching {
+                capture.systemGestureExclusionRects = listOf(
+                    android.graphics.Rect(r.l, r.t, r.r, r.b),
+                )
+            }
+        }
+
+        /** 捕获 / 放行切换。放行期间捕获层变 `FLAG_NOT_TOUCHABLE`，触摸落回背后应用。 */
+        private fun setCapture(enabled: Boolean) {
+            captureEnabled = enabled
+            val base = baseParams().flags
+            captureLp.flags = if (enabled) base else {
+                base or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            }
+            if (addedCapture) runCatching { wm.updateViewLayout(capture, captureLp) }
+            handle.released = !enabled
+            handle.invalidate()
+        }
+
+        /**
+         * 临时放行：给「先让目标界面出现」留出口。
+         *
+         * 全屏捕获在拾取期间会挡住背后应用，翻页 / 滚动这类操作需要短暂让路。
+         * 到点自动恢复捕获，用户不需要记得再切回来；重复触发以最后一次为准。
+         */
+        private fun releaseCaptureBriefly(ms: Long) {
+            setCapture(false)
+            releaseRunnable?.let { runCatching { handle.removeCallbacks(it) } }
+            val r = Runnable {
+                releaseRunnable = null
+                setCapture(true)
+            }
+            releaseRunnable = r
+            handle.postDelayed(r, ms)
+        }
+
         /** 真值驱动绘制层；读数用 Locale.US 格式化。 */
         private fun applyCross() {
             overlay.crossX = crossX
             overlay.crossY = crossY
             overlay.regionA = floatArrayOf(crossX, crossY)
             overlay.regionB = floatArrayOf(bX, bY)
+            overlay.confirmedRects = confirmed.map {
+                floatArrayOf(it.leftPx.toFloat(), it.topPx.toFloat(), it.rightPx.toFloat(), it.bottomPx.toFloat())
+            }
             handle.readout = "X ${crossX.roundToInt()}  Y ${crossY.roundToInt()} · " +
                 "${PickerGeometry.fmt4(PickerGeometry.pct(crossX.roundToInt(), screenW))}% / " +
                 "${PickerGeometry.fmt4(PickerGeometry.pct(crossY.roundToInt(), screenH))}%"
@@ -444,7 +592,36 @@ object CoordinatePicker {
                 HandleAction.DOWN -> nudge(0, 1)
                 HandleAction.LEFT -> nudge(-1, 0)
                 HandleAction.RIGHT -> nudge(1, 0)
+                HandleAction.ADD_BOX -> addBox()
+                HandleAction.DEL_BOX -> delBox()
             }
+        }
+
+        /** v2.9.49：落定当前框，复位到一个与上一框不重叠的新位置，继续框下一个。 */
+        private fun addBox() {
+            if (!multiBox || overlay.mode != PickerMode.REGION) return
+            val rect = PickerGeometry.normalizeRegion(crossX, crossY, bX, bY, screenW, screenH)
+            val region = PickerRegion(
+                rect.l, rect.t, rect.r, rect.b, screenW, screenH,
+                PickerGeometry.regionExpr(rect, screenW, screenH),
+                FeatureBox.DEFAULT_SIMILARITY,
+            )
+            if (!confirmed.any { it.sameRect(region) }) confirmed += region
+            // 复位当前框到屏幕中央的独立区域，避免与刚落定的框重叠导致下一框误判
+            val side = (min(screenW, screenH) * 0.18f).coerceAtLeast(40f * d)
+            crossX = screenW / 2f; crossY = screenH / 2f
+            bX = PickerGeometry.clamp(crossX + side, screenW)
+            bY = PickerGeometry.clamp(crossY + side, screenH)
+            handle.boxCount = confirmed.size
+            placeHandles(); applyCross()
+        }
+
+        /** v2.9.49：撤销最近落定的一个框（无框时无副作用）。 */
+        private fun delBox() {
+            if (!multiBox || confirmed.isEmpty()) return
+            confirmed.removeAt(confirmed.lastIndex)
+            handle.boxCount = confirmed.size
+            handle.invalidate()
         }
 
         private fun nudge(dx: Int, dy: Int) {
@@ -494,22 +671,49 @@ object CoordinatePicker {
             if (overlay.snapOn) snap?.snap(px, py)?.let { px = it.first; py = it.second }
             px = px.coerceIn(0, screenW - 1)
             py = py.coerceIn(0, screenH - 1)
+            // v2.9.29：危险边缘。落点在系统返回 / Home 热区内时，运行时这次点击
+            // 会被系统静默消费——脚本看着执行了，界面毫无反应，且没有错误码。
+            // 因此拾取阶段就按执行侧同一套规则收敛，保证「看到的坐标＝将来点到的坐标」。
+            val rawPx = px
+            val rawPy = py
+            val edge = runCatching {
+                val insets = AutoClickService.live()?.gestureInsets()
+                    ?: EdgeSafety.fallback(ctx.resources.displayMetrics.density)
+                EdgeSafety.adjust(px, py, screenW, screenH, insets)
+            }.getOrNull()
+            if (edge != null) { px = edge.x; py = edge.y }
             if (overlay.mode == PickerMode.REGION) {
                 val rect = PickerGeometry.normalizeRegion(
                     px.toFloat(), py.toFloat(), bX, bY, screenW, screenH,
                 )
-                CoordinatePicker.deliverRegion(
-                    PickerRegion(
-                        rect.l, rect.t, rect.r, rect.b, screenW, screenH,
-                        PickerGeometry.regionExpr(rect, screenW, screenH),
+                val region = PickerRegion(
+                    rect.l, rect.t, rect.r, rect.b, screenW, screenH,
+                    PickerGeometry.regionExpr(rect, screenW, screenH),
+                )
+                if (multiBox) {
+                    // 多框：把当前框并入选中的框集（去重完全相同的框），一次性提交；
+                    // 没有任何有效框（例如全在边缘被夹成同一点）才静默取消，绝不产生空规则。
+                    val all = if (confirmed.any { it.sameRect(region) }) confirmed.toList()
+                    else confirmed + region
+                    if (all.isEmpty()) CoordinatePicker.dismiss()
+                    else CoordinatePicker.deliverRegions(all)
+                } else {
+                    CoordinatePicker.deliverRegion(region)
+                }
+            } else {
+                CoordinatePicker.deliverPoint(
+                    PickerResult(
+                        px, py, screenW, screenH,
+                        edgeAdjusted = edge?.moved == true,
+                        edgeNote = edge?.reason.orEmpty(),
+                        rawXPx = rawPx,
+                        rawYPx = rawPy,
                     ),
                 )
-            } else {
-                CoordinatePicker.deliverPoint(PickerResult(px, py, screenW, screenH))
             }
         }
 
-        /** 放大镜节流：150ms 最多一次截图，避免拖动时把无障碍截图通道打爆。 */
+        /** 放大镜节流：150ms 最多一次截图，避免拖动时把无障碍截图通道耗尽。 */
         private fun scheduleShot(force: Boolean = false) {
             if (!overlay.magnifierEnabled) return
             val now = SystemClock.elapsedRealtime()
@@ -531,6 +735,7 @@ object CoordinatePicker {
             if (!PickerGeometry.shouldCommit(nx - crossX, ny - crossY)) return
             pendingX = nx; pendingY = ny; pendingIsRegion = false; pendingValid = true
             scheduleFrame()
+            applyGestureExclusion(nx, ny)
         }
 
         /** v2.9.5：框选第二角同款（绝对定位，不受窗口移动影响）。 */
@@ -573,10 +778,13 @@ object CoordinatePicker {
             }
             pendingValid = false
             liveSessions.remove(this)
+            releaseRunnable?.let { runCatching { handle.removeCallbacks(it) } }
+            releaseRunnable = null
             if (addedSecond) second?.let { runCatching { wm.removeViewImmediate(it) } }
             if (addedHandle) runCatching { wm.removeViewImmediate(handle) }
+            if (addedCapture) runCatching { wm.removeViewImmediate(capture) }
             if (addedOverlay) runCatching { wm.removeViewImmediate(overlay) }
-            addedSecond = false; addedHandle = false; addedOverlay = false
+            addedSecond = false; addedHandle = false; addedCapture = false; addedOverlay = false
         }
     }
 }

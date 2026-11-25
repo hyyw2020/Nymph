@@ -14,7 +14,7 @@ import kotlin.math.roundToInt
  *
  * v2.6～v2.7.1 的「编辑动作」是 Compose `AlertDialog`，画在 `MainActivity`
  * 的视图树里——它是 **Activity 生命周期绑定的前台界面**，切到其他 APP 就随
- * `onStop` 一起不可见，也没法在其他 APP 之上呼出（用户差评点）。本版把编辑器
+ * `onStop` 一起不可见，也没法在其他 APP 之上呼出（评估结论指向）。本版把编辑器
  * 搬到 `TYPE_APPLICATION_OVERLAY` 系统悬浮窗 + 前台服务（见 app 层
  * `FloatingEditorService`），而窗口尺寸、折叠态、贴边 clamp、拖动、表单解析
  * 这些**确定性逻辑**必须与 Android 解耦，才能在没有真机的环境里用 JVM 单测
@@ -40,7 +40,7 @@ object FloatingEditorLayout {
      * 展开态面板宽度（dp）。
      *
      * v2.9.7 只做 240 → 220 的微调（约 -8%），真机仍是一块近半屏宽的大卡片；
-     * 用户第二次反馈「悬浮窗还是这么大」。v2.9.8 改为**结构性瘦身**：
+     * 第二轮回归结论「展开态面板尺寸未收敛」。v2.9.8 改为**结构性瘦身**：
      * 220 → 168（1080px 屏上 660px → 504px，占屏宽 61% → 47%），同时把
      * 高级字段默认折叠（见 `FloatingEditorPanel` 的「高级」区），控件与功能
      * 一个不删，只是不再一打开就铺满半个屏幕。
@@ -55,8 +55,8 @@ object FloatingEditorLayout {
      *
      * v2.9.7 把点击与拖动统一到 `ViewConfiguration.scaledTouchSlop`（常见
      * 8dp ≈ 24px @3x），副作用是：40dp 小球上手指轻移 10~20px 完全不启动
-     * 拖动，抬手却被判成点击 → 球直接展开成大面板。真机体感就是「悬浮球
-     * 拖不动、一碰就变大」。现在拖动用 4dp（约 12px @3x）启动，点击仍用
+     * 拖动，抬手却被判成点击 → 球直接展开成大面板。装机表现为「悬浮球
+     * 位移能力未生效、误触发展开」。现在拖动用 4dp（约 12px @3x）启动，点击仍用
      * 系统 slop 兜底；一旦进入拖动，[isTap] 因 `dragging=true` 恒为 false。
      */
     const val DRAG_START_DP = 4
@@ -124,6 +124,13 @@ object FloatingEditorLayout {
         val desc: String = "",
         /** 框选出的 ROI；非空时保存阶段交给 `RoiApplier` 应用到脚本内目标。 */
         val region: Region? = null,
+        /**
+         * v2.9.32：拾取后可配置的场景判据参数。空串字段表示「沿用装配值」，
+         * 缺省全空 → 应用到任何 [dev.nymph.auto.core.model.SceneRule] 都是恒等变换，
+         * 老脚本与未展开高级区的路径零回归。由 app 层 `save()` 消费，
+         * 不参与 [toPatch]（后者只负责动作层字段）。
+         */
+        val tuning: SceneTuning.Config = SceneTuning.Config(),
     )
 
     /** 百分比格式化（强制 Locale.US，4 位小数）。 */
@@ -151,6 +158,9 @@ object FloatingEditorLayout {
             waitMs = p.waitMs.toString(),
             desc = p.desc,
             region = if (RoiApplier.hasExplicitRegion(a.region)) a.region else null,
+            // v2.9.32：载入既有场景时把落盘判据参数回显到高级区，
+            // 使用户看到并能在拾取之后继续调整，而非每次回到默认值。
+            tuning = a.sceneRule?.let { SceneTuning.from(it) } ?: SceneTuning.Config(),
         )
     }
 
@@ -234,7 +244,7 @@ object FloatingEditorLayout {
      * 本次 MOVE 是否应认定为拖动。
      *
      * v2.9.6 的 MOVE 用 `4f * density` 启动拖动、UP 却用 `8f * density` 判定
-     * 「点击」，中间 4~8dp 既不进入拖动又被判成点击 → 小球一点就展开。
+     * 「点击」，中间 4~8dp 既不进入拖动又被判成点击 → 小球误触发展开。
      * v2.9.7 把两者统一到系统 slop 消掉了这段误判窗口，但阈值偏大（约 24px
      * @3x），40dp 小球上轻拖仍完全不启动拖动。v2.9.8 把 [thresholdPx] 交给
      * 调用方：MOVE 用更小的 `dragStartPx`，UP 用系统 slop 做点击上界。
@@ -260,9 +270,9 @@ object FloatingEditorLayout {
      * （后台省电 / overlay 窗口静止时部分 ROM 会停 VSYNC 派发），或回调内
      * `shouldCommit` / `isPositionOnlyUpdate` 判定丢弃后再没有新的 MOVE 续投，
      * `frameScheduled` 就永久为 true，此后每一次 MOVE 都在函数入口直接
-     * `return`，窗口再也不更新 —— 真机表现正是「收起后的悬浮球完全拖不动」。
+     * `return`，窗口再也不更新 —— 装机表现对应折叠态悬浮球位移能力完全未生效。
      * 反证：主悬浮球 `RunnerService.attachBallTouch` 一直是同步
-     * `wm.updateViewLayout`，从未被投诉拖不动。
+     * `wm.updateViewLayout`，未出现位移能力失效报告。
      *
      * 本函数把「算位置 + 1px 节流」收敛成纯函数，**没有任何可变状态**，
      * 因此不存在「卡住」这种失效模式；Service 只需同步提交返回值即可。

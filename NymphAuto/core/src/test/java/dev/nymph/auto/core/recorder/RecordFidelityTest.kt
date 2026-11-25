@@ -133,7 +133,7 @@ class RecordFidelityTest {
         assertTrue("翻页等待不得超过 500ms，实际 ${list.last().waitMs}", list.last().waitMs <= 500L)
     }
 
-    // ---- 5) 起始界面与诚实告警 ----
+    // ---- 5) 起始界面与按实际状态告警 ----
 
     @Test
     fun `录制起始包名写入脚本供回放前校验`() {
@@ -142,7 +142,7 @@ class RecordFidelityTest {
     }
 
     @Test
-    fun `方向不可知时如实给出告警`() {
+    fun `方向不可知时按实际情况给出告警`() {
         val r = compiler.compile("翻页", listOf(scroll(0)))
         assertTrue(r.report.warnings.any { it.contains("未上报方向") })
         assertTrue(r.script.description.contains("未上报方向"))

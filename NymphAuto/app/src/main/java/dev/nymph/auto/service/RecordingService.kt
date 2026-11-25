@@ -30,6 +30,7 @@ import dev.nymph.auto.recorder.RecordPanel
 import dev.nymph.auto.recorder.RecorderBus
 import dev.nymph.auto.recorder.RecordingSession
 import dev.nymph.auto.ui.CoordinatePicker
+import dev.nymph.auto.ui.OverlayWindowMetrics
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -92,7 +93,7 @@ class RecordingService : Service() {
             ACTION_START -> begin(intent.getStringExtra(EXTRA_NAME))
             ACTION_UNDO -> {
                 val ok = session?.undo() ?: false
-                toast(if (ok) "已撤销上一步" else "没有可撤销的步骤")
+                toast(if (ok) "已撤销上一条" else "没有可撤销的事件")
                 refreshPanel()
                 refreshForeground()
             }
@@ -108,6 +109,11 @@ class RecordingService : Service() {
         CoordinatePicker.dismiss()
         val svc = AutoClickService.live()
         if (svc == null) {
+            // v2.9.35：本服务由 startForegroundService 启动，但此失败分支此前在
+            // 任何 startForeground 之前就 stopSelf —— Android 8+/12+ 抛
+            // ForegroundServiceDidNotStartInTimeException 崩溃（无障碍未开极常见）。
+            // 先建立前台通知满足契约，再提示并停止。
+            runCatching { refreshForeground() }
             RunLog.e("Record", "无障碍服务未连接，无法录制")
             toast("请先开启无障碍服务")
             stopSelf()
@@ -118,7 +124,13 @@ class RecordingService : Service() {
         val frame = runCatching { svc.frame() }.getOrNull()
         // v2.7.0：传入本应用包名 → 启用「过滤自扰事件 + 待命到切出本应用」。
         // 用户点"开始录制"后不用急着切后台，点击器内的一切操作都不会被记进脚本。
-        RecorderBus.start(frame, packageName)
+        // v2.9.27：注入实时屏幕坐标系，录制期间旋转屏幕后事件分母随之更新；
+        // 取不到时回退到启动快照，行为与旧版一致。
+        RecorderBus.start(
+            frame,
+            packageName,
+            { AutoClickService.live()?.frame() ?: frame },
+        )
         RecorderBus.onArmedChanged = { on ->
             liveArmed = on
             RunLog.i("Record", if (on) "已进入目标 APP，开始记录" else "录制待命中")
@@ -130,7 +142,7 @@ class RecordingService : Service() {
             scope = scope,
             enhancer = buildEnhancer(),
             // v1.2.1：无悬浮窗权限时 panel 为 null，旧版这里只刷新浮窗，
-            // 通知栏步数永远是 0，用户完全看不到录制是否在采事件。
+            // 通知栏步数永远是 0，界面未呈现录制采集状态。
             onEventCount = { n ->
                 liveCount = n
                 lastEventAt = SystemClock.elapsedRealtimeCompat()
@@ -227,7 +239,7 @@ class RecordingService : Service() {
         RecorderBus.stop()
         // finish() 会先等后台增强排空（增强期间仍在用 ocrEngine），故必须在其后释放。
         // 编译可能因超大脚本 OOM 抛异常：无论成败都必须复位前台状态，
-        // 否则界面会一直显示「录制中」而服务其实已经不可用。
+        // 否则界面会一直显示「录制中」而服务已不可用。
         val compiled = runCatching { s.finish(pendingName, RecordCompiler()) }
         closeOcr()
         session = null
@@ -244,7 +256,7 @@ class RecordingService : Service() {
 
         if (script.actions.isEmpty()) {
             // v2.9.2：不再只给一句「未录到有效动作，已取消」——用户由此完全
-            // 不知道为什么、更不知道该改用什么方式，正是本次真机差评的根源。
+            // 不知道为什么、更不知道该改用什么方式，正是本轮装机负向评估的成因。
             // 完整指引（根因 + 替代路径 + 诊断）写进日志页，toast 用短版。
             RunLog.w("Record", RecordabilityGuard.finishGuidance(verdict, diagnostics))
             toast(RecordabilityGuard.finishToast(verdict))
@@ -456,18 +468,10 @@ class RecordingService : Service() {
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
-    /** 屏幕像素尺寸（拖动 clamp 用）。 */
-    @Suppress("DEPRECATION")
+    /** 屏幕像素尺寸（拖动 clamp 用）。v2.9.19：统一取全屏绝对坐标真源。 */
     private fun screenSize(): Pair<Int, Int> {
-        return if (Build.VERSION.SDK_INT >= 30) {
-            val b = wm.currentWindowMetrics.bounds
-            b.width() to b.height()
-        } else {
-            val m = android.util.DisplayMetrics()
-            @Suppress("DEPRECATION")
-            wm.defaultDisplay.getRealMetrics(m)
-            m.widthPixels to m.heightPixels
-        }
+        val size = OverlayWindowMetrics.screenSize(wm)
+        return size.width to size.height
     }
 
     private fun toast(text: String) {

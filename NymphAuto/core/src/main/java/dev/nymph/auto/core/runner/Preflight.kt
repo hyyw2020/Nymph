@@ -1,5 +1,6 @@
 package dev.nymph.auto.core.runner
 
+import java.util.Locale
 import dev.nymph.auto.core.model.Action
 import dev.nymph.auto.core.model.ActionType
 import dev.nymph.auto.core.model.Condition
@@ -93,6 +94,15 @@ data class EnvironmentSnapshot(
     val screenRotation: Int = 0,
     /** 已安装包名集合（预检只查集合包含，不查版本号——版本号查询成本高且易误报）。 */
     val installedPackages: Set<String> = emptySet(),
+    /**
+     * v2.9.27：Android 11+ 包可见性受限标记。
+     *
+     * 本应用 <queries> 只声明 ACTION_MAIN，无法可靠枚举已安装包。此时
+     * 「getLaunchIntentForPackage 返回 null」不能推出「应用未安装」——现场日志里
+     * com.hihonor.gameassistant 在录制阶段刚被进入并采集 55 个事件，预检却判它
+     * 未安装、把整个脚本拦下 12 次。受限时存在性未知只告警、不拦截。
+     */
+    val packageVisibilityRestricted: Boolean = false,
     /** AAPM 状态（由 CapabilityMatrix 先行判定后传入，避免重复探测）。 */
     val aapmEnabled: Boolean = false,
     /** AI 通道可用性（目标检测模型 + TFLite 运行时就绪）。 */
@@ -103,9 +113,13 @@ data class EnvironmentSnapshot(
 data class PreflightReport(
     val ok: Boolean,
     val problems: List<String> = emptyList(),
+    /** v2.9.27：非阻断提示（存在性无法确认 / 纯坐标脚本方向差异）。写日志但不拦下脚本。 */
+    val warnings: List<String> = emptyList(),
 ) {
     /** 拦截时的一句话说明（含全部差异）。 */
     fun explain(): String = if (ok) "预检通过" else "预检未通过：" + problems.joinToString("；")
+    /** 非阻断提示的一句话说明；无提示为空串。 */
+    fun warningsText(): String = warnings.joinToString("；")
 }
 
 /**
@@ -124,29 +138,46 @@ object Preflight {
         if (deps.needsScreenshot && !env.screenshotSupported) {
             problems += "脚本有 $deps.imageStepCount 步依赖截图，但当前系统不支持（需 Android 11+）"
         }
+        // v2.9.32：方向 / 宽高比不再阻断任何脚本。运行期已实现方向无关的帧归一化
+        // （当前帧旋回拾取几何做匹配）+ 落点旋回当前屏幕（OrientationTransform），
+        // 方向差异是可自适应的运行条件而非致命错误。v2.9.27 起纯坐标脚本已降级为
+        // 警告，本版把「依赖图片模板」脚本同样降级——彻底移除「竖屏拾取 / 横屏运行」
+        // 被拦下的根因（现场日志连续数十次「屏幕方向与脚本相反」预检拦截）。
+        val warnings = mutableListOf<String>()
         if (deps.refWidth > 0 && deps.refHeight > 0 && env.screenWidth > 0 && env.screenHeight > 0) {
             val refPortrait = deps.refHeight > deps.refWidth
             val curPortrait = env.screenHeight > env.screenWidth
-            if (refPortrait != curPortrait) {
-                problems += "屏幕方向与脚本相反（脚本 ${deps.refWidth}×${deps.refHeight}，" +
+            val orientationIssue: String? = if (refPortrait != curPortrait) {
+                "屏幕方向与脚本相反（脚本 ${deps.refWidth}×${deps.refHeight}，" +
                     "当前 ${env.screenWidth}×${env.screenHeight}）"
             } else {
                 val refRatio = deps.refWidth.toDouble() / deps.refHeight
                 val curRatio = env.screenWidth.toDouble() / env.screenHeight
                 if (kotlin.math.abs(refRatio - curRatio) / refRatio > 0.25) {
-                    problems += "屏幕宽高比差异较大（脚本 ${deps.refWidth}×${deps.refHeight}，" +
-                        "当前 ${env.screenWidth}×${env.screenHeight}），图片匹配大概率失败"
-                }
+                    "屏幕宽高比差异较大（脚本 ${deps.refWidth}×${deps.refHeight}，" +
+                        "当前 ${env.screenWidth}×${env.screenHeight}），运行期按当前方向重标定模板尺度"
+                } else null
+            }
+            if (orientationIssue != null) {
+                warnings += "$orientationIssue（运行期按当前方向重标定：帧旋回拾取几何匹配、落点旋回当前屏幕，方向差异不阻断）"
             }
         }
+        // v2.9.27：包可见性受限时「查不到」不等于「未安装」。
         val missing = deps.packages.filter { it !in env.installedPackages }
-        if (missing.isNotEmpty()) problems += "目标应用未安装：${missing.joinToString("、")}"
+        if (missing.isNotEmpty()) {
+            if (env.packageVisibilityRestricted) {
+                warnings += "目标应用存在性无法确认（Android 11+ 包可见性限制）：" +
+                    "${missing.joinToString("、")}；运行时按包守卫校验前台应用"
+            } else {
+                problems += "目标应用未安装：${missing.joinToString("、")}"
+            }
+        }
         // AI 找目标步骤需要本地检测模型：不可用就明说，别让脚本跑到那步才失败
         if (deps.needsAi && !env.aiSupported) {
             problems += "脚本有 $deps.aiStepCount 步 AI 找目标，但本地检测模型不可用" +
                 "（可改用图片/文字/节点类步骤）"
         }
-        return PreflightReport(problems.isEmpty(), problems)
+        return PreflightReport(problems.isEmpty(), problems, warnings)
     }
 }
 
@@ -192,8 +223,8 @@ class DriftTracker(
         val d = kotlin.math.sqrt(dx * dx + dy * dy)
         cumulative += d
         return when {
-            d > maxSinglePx -> "单次修正 ${"%.1f".format(d)}px 超过预算 ${maxSinglePx}px，判定布局已变"
-            cumulative > maxCumulativePx -> "累计漂移 ${"%.1f".format(cumulative)}px 超过预算 ${maxCumulativePx}px，判定布局已变"
+            d > maxSinglePx -> "单次修正 ${String.format(Locale.US, "%.1f", d)}px 超过预算 ${maxSinglePx}px，判定布局已变"
+            cumulative > maxCumulativePx -> "累计漂移 ${String.format(Locale.US, "%.1f", cumulative)}px 超过预算 ${maxCumulativePx}px，判定布局已变"
             else -> null
         }
     }

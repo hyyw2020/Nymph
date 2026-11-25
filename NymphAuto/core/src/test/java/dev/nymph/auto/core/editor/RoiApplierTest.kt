@@ -49,7 +49,7 @@ class RoiApplierTest {
     }
 
     @Test
-    fun `无目标时返回原对象且命中0 不假装成功`() {
+    fun `无目标时返回原对象且命中0 不误报命中`() {
         val s = Script(actions = listOf(Action(type = ActionType.TAP), Action(type = ActionType.WAIT)))
         val (next, hits) = RoiApplier.apply(s, roi)
         assertEquals(0, hits)

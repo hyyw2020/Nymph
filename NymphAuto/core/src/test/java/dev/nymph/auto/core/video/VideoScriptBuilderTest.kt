@@ -35,7 +35,7 @@ class VideoScriptBuilderTest {
     }
 
     @Test
-    fun `模板缺失如实降级为坐标点击 不假装找图`() {
+    fun `模板缺失显式降级为坐标点击 不误报图像匹配`() {
         val s = VideoScriptBuilder.build(
             "V", listOf(VideoScriptBuilder.Tap(100, 12.5, 77.0, "")), 720, 1280,
         )
@@ -66,7 +66,7 @@ class VideoScriptBuilderTest {
         assertEquals("空", s.name)
     }
 
-    // ---- v2.9.2：视频导入产物支持循环（真机差评「重复操作跑不了」）----
+    // ---- v2.9.2：视频导入产物支持循环（装机负向评估「重复操作不可达」）----
 
     @Test
     fun `不传循环参数时默认执行一次 老调用零回归`() {
@@ -145,7 +145,7 @@ class VideoScriptBuilderTest {
         }
     }
 
-    // ---- v2.9.6：门控模式（真机差评「不支持复杂操作」）----
+    // ---- v2.9.6：门控模式（装机负向评估「复杂操作链路能力未达标」）----
 
     @Test
     fun `默认开启门控 找图动作等到画面出现且不再依赖固定延时`() {
@@ -183,7 +183,7 @@ class VideoScriptBuilderTest {
     }
 
     @Test
-    fun `模板缺失动作在门控模式下如实降级为坐标加固定延时`() {
+    fun `模板缺失动作在门控模式下显式降级为坐标加固定延时`() {
         val s = VideoScriptBuilder.build(
             "V",
             listOf(

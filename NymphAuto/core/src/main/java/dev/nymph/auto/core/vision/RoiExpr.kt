@@ -82,9 +82,17 @@ object RoiExpr {
         var b = v[3].coerceIn(0.0, 100.0)
         if (ri < l) { val tmp = l; l = ri; ri = tmp }
         if (b < t) { val tmp = t; t = b; b = tmp }
-        // 零面积 ROI 无意义，给一个最小 1% 窗口避免 NCC 直接返回 null
-        if (ri - l < 1.0) ri = min(100.0, l + 1.0)
-        if (b - t < 1.0) b = min(100.0, t + 1.0)
+        // 零面积 ROI 无意义，给一个最小 1% 窗口避免 NCC 直接返回 null。
+        // v2.9.35：此前 ri=min(100, l+1) 在 l=100 时仍得 100（零面积）、l=99.5 时
+        // 宽仅 0.5%；右边界不足时改为向左退让，保证始终有 ≥1% 跨度。
+        if (ri - l < 1.0) {
+            ri = min(100.0, l + 1.0)
+            if (ri - l < 1.0) l = (ri - 1.0).coerceAtLeast(0.0)
+        }
+        if (b - t < 1.0) {
+            b = min(100.0, t + 1.0)
+            if (b - t < 1.0) t = (b - 1.0).coerceAtLeast(0.0)
+        }
         return ImageFinder.RegionPct(l, t, ri, b)
     }
 

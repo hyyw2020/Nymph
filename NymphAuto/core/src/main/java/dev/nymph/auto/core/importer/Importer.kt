@@ -57,16 +57,20 @@ object Importer {
                     return null to Fail.VersionTooOld(minVer, ZdjlImporter.COMPAT_VERSION_CODE)
                 }
             }
-            ZdjlImporter.import(trimmed, ZdjlImporter.COMPAT_VERSION_CODE)?.let { return it to null }
+            // v2.9.35：各方言导入器内部深层字段形态千差万别，任何一个残留的
+            // 强转异常都不应穿透到调用方崩溃；这里统一兜底为"格式无法识别"。
+            runCatching { ZdjlImporter.import(trimmed, ZdjlImporter.COMPAT_VERSION_CODE) }
+                .getOrNull()?.let { return it to null }
         }
 
         // ③ scriptBean
         if (trimmed.contains("\"scriptBean\"")) {
-            ScriptBeanImporter.import(trimmed, curVerCode)?.let { return it to null }
+            runCatching { ScriptBeanImporter.import(trimmed, curVerCode) }
+                .getOrNull()?.let { return it to null }
         }
 
         // ④ 行分隔方言
-        val line = LineImporter.import(trimmed, curVerCode)
+        val line = runCatching { LineImporter.import(trimmed, curVerCode) }.getOrNull()
         if (line != null) return line to null
 
         return null to Fail.UnknownFormat("不是有效的 JSON 脚本，也不是行分隔脚本")

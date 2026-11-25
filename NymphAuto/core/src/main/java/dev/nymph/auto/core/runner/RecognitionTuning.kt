@@ -15,7 +15,7 @@ import kotlinx.serialization.Serializable
  * 再叠加运动外推（见 core.vision.MotionPredictor），才能在物理上限内
  * 尽量跟上移动目标。
  *
- * ## 诚实边界（写进 ADR，不粉饰）
+ * ## 能力边界（未验证项）（写进 ADR，不掩饰）
  *
  * 「1ms 内通过特征自动找坐标」在 Android 无障碍通道上**不可能**：一次全屏
  * 截图 + 灰度化 + NCC 匹配的端到端延迟下限由帧率决定（典型 16~60ms），

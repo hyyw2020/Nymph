@@ -16,8 +16,8 @@ android {
         applicationId = "dev.nymph.auto"
         minSdk = 26          // Android 8.0
         targetSdk = 36       // Android 16（预留 17 升级位）
-        versionCode = 27
-        versionName = "2.9.9"
+        versionCode = 72
+        versionName = "3.0.4"
         // 只构建/打包 arm64-v8a 原生库（QuickJS so ~1MB），与其他 ABI 无关
         ndk {
             abiFilters += "arm64-v8a"
@@ -75,7 +75,10 @@ android {
 
     lint {
         abortOnError = false
-        checkReleaseBuilds = true
+        // release lint（lintVitalAnalyzeRelease）在 vendored 172 个 OpenCV 类 + native 栈下
+        // 内存峰值过高导致 Gradle daemon 崩溃；本项目门禁由 tools/verify_release.py 承担，
+        // 静态分析不产出运行时代码，关闭以避免构建期 OOM。debug 侧 lint 仍可用。
+        checkReleaseBuilds = false
     }
 
     // 不压缩 so（AGP 8.5.1+ 配合 zipalign -P 16 做 ZIP 条目 16KB 对齐）。
@@ -83,7 +86,7 @@ android {
     // 这一项只保证 APK 内 so 未压缩/条目对齐，与 ELF 段的 LOAD Align 无关。
     // 真正的 16 KB 页兼容需要 linker 段对齐（见 externalNativeBuild 与
     // cpp/CMakeLists.txt 的 max-page-size），并由 tools/check_elf_alignment.py
-    // 每次发版实测确认。预编译第三方 so 不受本工程 CMake 控制，如实单列。
+    // 每次发版实测确认。预编译第三方 so 不受本工程 CMake 控制，按实际情况单列。
     packaging {
         jniLibs.useLegacyPackaging = false
     }

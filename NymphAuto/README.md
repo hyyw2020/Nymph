@@ -2,48 +2,158 @@
 
 对标 **自动精灵 v26.5.0** 的离线自动化脚本工具：无障碍被动事件录制 + `.zjs` 脚本回放 + QuickJS 脚本引擎 + 端侧 AI/OCR。
 
-当前版本 **v2.9.8（versionCode 26）**，minSdk 26 / targetSdk 36 / compileSdk 36，纯 `arm64-v8a`。
+当前版本 **v2.9.49（versionCode 67）**，minSdk 26 / targetSdk 36 / compileSdk 36，纯 `arm64-v8a`。
 
-**v2.9.8 是「折叠球真能拖 + 悬浮窗结构性瘦身」版**：输入是两张真机截图与**第二次**反馈「悬浮窗还是这么大，收起后悬浮球仍然不能拖动」。上一版只调了 8%~13% 的常量、拖动修复也没落到真机行为上，本版把整条链路重查一遍。
+> **本版是「系统性稳定性修复（审计第一轮 P0）」的正式 release**：修复四类根因。① **无效帧冻结**：截图失败 / 几何错配此前构造 `present=false` 观测推进 missStreak，`ON_DISAPPEAR` 把「没拍到」当成「场景消失」误派发下降沿；`SceneObservation` 新增 `valid` 三态，`SceneTrigger` 对无效帧冻结状态机（不推进计数、不产生边沿），`ON_DISAPPEAR` 只接受有效帧确认离场。② **RunSession 唯一所有权**：`toggle` 的 `finally/postUi/invokeOnCompletion` 此前全写共享字段，停止后立即重启会被旧收尾破坏（关掉新浮层、取消新看门狗、改写新状态）；新增 core `RunToken` 单调会话号，所有延迟提交以 `isCurrent(myRunId)` 守卫，停止/交接先 `invalidate`，运行中拒绝重复 `ACTION_START`，浮层/看门狗/引擎用局部引用释放。③ **识别热路径降本**：模板此前每帧每规则重复 `decodeBase64` + 整帧 `copyOf`（1080p×10 规则≈每帧 100MB 分配）；改为实例级模板解码缓存 + 仅掩码规则复制整帧。④ **QuickJS 同步桥**：`NativeHandle` 加读写锁（`useIfAlive` 读锁 / `disposeOnce` 写锁）消除在途 UAF；按 API 拆分超时，`sleep(60000)` 不再被 30s 截断且停止后 50ms 内可打断，桥接协程退出即取消。零新增权限、零新依赖、零 `MediaProjection`、签名与 ABI 不变；新增 14 项纯 JVM 回归，单测 931 项全通过。详见 `ENGINEERING.md` ADR-064。
+>
+> **v2.9.45 是「稳定性修复」的正式 release**：修复两处确证的并发缺陷。① QuickJS 原生 runtime 指针此前用裸 `Long` 做 check-then-act，脚本线程收尾与主线程停止链路可同时读到同一个非 0 指针 → native double-free / use-after-free；且 `stopAll/handover` 在主线程直接销毁正在脚本线程 `eval` 的 runtime，构成 UAF。本版新增纯 JVM 一次性句柄守卫 `NativeHandle`（`AtomicLong.getAndSet` 保证 destroy 恰好一次），`QuickJsAndroidBinding` 改用它；主线程停止链路只做中断 + 取消协程，真正销毁收敛到脚本协程收尾并由 `invokeOnCompletion` 兜底（局部引用捕获，避免误伤下一轮）。② `LogStore.append` 被日志总线监听器在任意线程并发回调，此前无锁的「长度检查 + 轮转 + 追加」会交错导致写丢失或写进已改名文件；现对 `append/tail/clear` 加实例锁串行化。零新增权限、零新依赖、零 `MediaProjection`、签名与 ABI 不变；新增 7 项纯 JVM 并发回归，单测 917 项全通过。详见 `ENGINEERING.md` ADR-063。
+>
+> **v2.9.44 是「场景驱动无障碍节点 fallback」的正式 release**：真机录屏 + debug 日志确认，系统录屏占用无障碍截图通道后，场景驱动每帧 `findTemplates` 失败、长时间「等待场景出现」却一次不点（该次运行 767 帧命中 0）。按 ADR-061 硬约束项目绝不抢录屏权限，故改在识别侧降级：给场景驱动加一条「截图失败或 NCC 未命中时，按落盘语义节点查无障碍节点树判定场景出现」的零截图触发源。`SceneRule` 新增四个带默认值字段（schemaVersion 保持 1、老脚本零迁移）；装配期拾取瞬间 `findSmallestNodeAt` 捕获锚点 text/viewId/class（有判别度才启用）；运行期 `nodeFinder.find` 命中即构造观测喂入同一套状态机与落点护栏，落点用当前节点中心屏幕百分比（方向无关）。**只对有语义节点的界面生效**；纯图像/游戏/短视频/桌面色块无节点，录屏占用截图时仍空转（技术边界）。零新增权限、零 `MediaProjection`、零 shell、fail-closed 不放宽、几何主链不动；新增 12 项回归，单测 871 项全通过。详见 `ENGINEERING.md` ADR-062。
+>
+> **v2.9.43 是「不和录屏抢权限永久门禁加固」的正式 release**：审查稿逐条确认 2.9.42 的三处修复与两组补测均正确、无新引入真 bug，核心逻辑不动。本版落实硬约束「不管何时都不能和录屏抢权限」：此前 README 声称 8 类录屏符号引用为 0，但门禁只在 dex 层锁 7 项、缺 `createScreenCaptureIntent` 等授权入口，且无源码级拦截——断言写在文档、门禁没钉死。本版把 dex 层 `BANNED` 从 7 项补到 13 项（`MediaProjectionManager`/`createScreenCaptureIntent`/`getMediaProjection`/`ACTION_MEDIA_PROJECTION`/`android/media/projection`/`createScreenCapture`），并新增源码级门禁 `v2943_no_screen_capture_api` 扫描全量 main 源码非注释代码行，精确 API 标识符零引用，同时正向锁定无障碍截图通道（`canTakeScreenshot=true`/不启用触摸浏览）。裸词 `MediaProjection`/`VirtualDisplay` 因中文说明文案合法出现、由 dex 层字节锁定，两层互补。无运行期行为改动、零新增权限、零 `MediaProjection`、零 shell；单测维持 859 项全通过。详见 `ENGINEERING.md` ADR-061。
+>
+> **v2.9.42 是「2.9.41 审查回执确证问题修复」的正式 release**：对回执逐条源码核查（属实≠该修）后修 3 处并补齐 2 组测试——① `AtomicTextFile` 临时文件正则此前只锚定 `.json.tmp`，而历史快照走 `.naz`（`ScriptRepository.SUFFIX`），崩溃残留 `.naz.tmp-*` 结构上永远匹配不到、且 `.history` 目录从未接 `cleanupStale`，本版正则扩为 `(json|naz)` 两类并在 `ScriptRepository.init` 接清理；② `LineImporter` 起点 `x<=0&&y<=0` 双零整条丢弃与「终点合法零保留」口径矛盾，去掉起点双零丢弃、起终统一为解析成功即保留；③ 补测上版声称与实际不符的部分——`V2942FixRegressionTest`（core，6 例：naz 正则/接口清理/起终零坐标/orphan 隔离）+ `CrashReportActivityTest`（app，4 例：`isCrashProcessName` 全分支），补上 ④ 迁移隔离与 ⑤a 防循环判定的零覆盖。回执④「orphan 无回收路径」属保数据优先的设计取舍、本版未列必修，记为已知边界。全部为 core/app 纯 JVM、零新增权限、零 `MediaProjection`、零 shell、零新增第三方依赖；新增 10 项回归、单测 859 项全通过。详见 `ENGINEERING.md` ADR-060。
+>
+> **v2.9.41 是「2.9.40 审查回执确证真 bug 修复」的正式 release**：对回执 5 条逐条源码核查（属实≠该修），修 4 处——① `LineImporter` 滑动终点解析失败/缺失改为丢弃整条，不再生成「滑到 (0,0)」的动作；③ `AtomicTextFile` 临时文件正则两分支锚定 `.json.tmp`，不再误删用户自有 `备份.tmp`；④ 重名迁移删除旧文件失败改为告警 + `.orphan` 改名隔离，封死下次再生 `(3)` 的幂等死角；⑤a 崩溃页 `isCrashProcess` 增加 `/proc/self/cmdline` 回退，防部分 ROM API 失效导致防循环失效。②「文档版本脱节」经核查为旧快照误报（当前 README/ENGINEERING/build.gradle 一致），但吸收其流程教训——本版先落定文档再打源码包；⑤b 冷启动后台启动限制需真机、记 ADR-059 不改。①③④为 core 纯 JVM、新增 6 例回归、零新增权限、零 `MediaProjection`、零 shell、零新增第三方依赖。决策记录见 `ENGINEERING.md` ADR-059。
+>
+> **v2.9.40 是「数据完整性修复」的正式 release**：对三份审查文档逐条源码甄别（属实≠该修），只修 3 条确证真 bug——① `ActionEditGuard` 编辑 PX/DP 动作不再被强改成百分比、坐标不再截断到 100；② `LineImporter` 无法解析的坐标改为丢弃并在摘要可见；③ `AtomicTextFile` 不再误删用户自有 `.tmp` 中间名文件。详见 `ENGINEERING.md` ADR-058。
+>
+> **v2.9.39 是「重名崩溃修复」的正式 release**：依据 v2.9.38 取证得到的真机堆栈，定位脚本列表以脚本名作懒列表 key、老版本遗留 `script.json` 与新版同名文件解码出重复 name 导致主线程崩溃。修复为两道防线——存储层 `ScriptStore.migrateDuplicateNames()` 启动时幂等迁移，让 name 恢复唯一主键、消除按名删除/编辑串台隐患；列表项携带文件名 `id`，懒列表 key 改用 `id`，迁移遗漏也绝不崩。详见 `ENGINEERING.md` ADR-057。
+>
+> **v2.9.33 是「厂商应用中止循环修复 + 能力边界可见告警」的正式 release**：修复厂商聚合应用（如 `com.hihonor.gameassistant`）无法自动回切导致脚本被反复中止的缺陷；并把列表视图复用、离线 OCR 未就绪两处能力边界从静默降级改为可见告警。详见 `../NymphAuto-v2.9.33-发布说明.md` 与 `ENGINEERING.md` ADR-051。
+>
+> **一、核心修复（真机实证 bug）**
+>
+> 2.9.32 真机日志出现同因中止二十余次：场景守卫用纯字符串谓词 `TargetPackages.isLaunchableTarget` 判「可启动」，实际拉起用 `getLaunchIntentForPackage`——厂商应用无标准启动入口 / 受包可见性限制时，谓词说可启动、实际拉不起来，旧实现把拉起失败直接等同中止。
+>
+> - 新增 core 单一真源 `RestorePolicy`：拉起失败后重读前台包名，已在目标应用则放行（坐标手势追加界面一致性提示），否则一次性点名中止，移除「请手动打开后重试」循环话术。
+> - `AppLauncher.run` 新增显式 `ACTION_MAIN + setPackage` 兜底，补齐「有可启动 Activity、无标准入口」的缺口；**不引入 shell / monkey**，权限契约不变。
+> - 专业取舍：未把 core 谓词直接换成 PM 探测（那会在包可见性受限设备大面积假阴性，即 v2.9.27 已修的坑），而是在失败路径安全降级。
+>
+> **二、能力边界可见告警（不做虚假修复）**
+>
+> - 列表视图复用（ADR-002 边界）：`RecordCompiler` 滚动告警补充「同节点文字随位置变化、文字锚点可能匹配相邻项，请以图像或坐标复核」。
+> - 离线 OCR 未就绪：新增 `Script.dependsOnText()`，仅当脚本确用文字锚点且两路 OCR 均不可用时，运行前一次性 toast + 日志告警并给出模型补齐路径；不内置大模型（体积 / 零依赖约束），不静默降级。
+>
+> **三、零回归**：`schemaVersion=1`、无新增落盘字段；`RestorePolicy` 只在拉起失败路径生效；OCR 告警只增可见性。静态门禁 61 项全 True（新增回切降级 / OCR 边界告警两组）、措辞门禁 0 命中、单测 807 项 0 失败、lint error 0、同钥 v2/v3、16KB 对齐。
+>
+> **四、不冒充实测**：本环境无真机；厂商应用兜底成功率、包可见性受限设备的 resolve 表现、文字锚点通道切换、列表复用告警可操作性需真机矩阵验证。
+>
+> **v2.9.32 是「方向无关执行 + 判据参数精调」的正式 release**：修正竖屏拾取、横屏运行（或运行期旋转）时脚本被方向硬闸中止、落点错位的缺陷；并把拾取后可配置、却无写回入口的六项场景判据参数接入悬浮面板。详见 `../NymphAuto-v2.9.32-发布说明.md` 与 `ENGINEERING.md` ADR-050。
+>
+> **v2.9.31 是「装配-运行同源」的正式 release**：取色 / 收敛 ROI / 跨帧下界 / 帧几何基准进入运行期判定链，分层判据、时域掩码、重试落点不退化、疑似在场可见告警。详见 `../NymphAuto-v2.9.31-发布说明.md` 与 `ENGINEERING.md` ADR-049。
+>
+> **v2.9.30 是「控制权收回」的正式 release**：连接所有权五相位状态机、通知三键全局入口、分级预告、终止可恢复；并对外部技术栈清单做了版本事实核对与不整体替换裁决。详见 `../NymphAuto-v2.9.30-发布说明.md` 与 `ENGINEERING.md` ADR-047 / ADR-048。
+>
+> **v2.9.29 是「场景编辑操作逻辑 + 拾取落点精度」的正式 release**：步进器替代弹键盘、复用落点、选填语义；整屏可拖、轻点绝对定位、手势排除与边缘收敛。详见 `../NymphAuto-v2.9.29-发布说明.md` 与 `ENGINEERING.md` ADR-045 / ADR-046。
+>
+> **v2.9.28 是场景驱动逐帧判定的正式 release**：场景监视改为帧同步节拍、每轮强制新帧、提频后日志有界。详见 `../NymphAuto-v2.9.28-发布说明.md` 与 `ENGINEERING.md` ADR-044。
+>
+> **v2.9.27 是录制脚本预检误拦回归收口的正式 release**：目标应用未安装误判、纯坐标脚本方向误拦、录制转屏坐标错乱、日志标签自相矛盾，另修复下载页 APK 主按钮标签残缺。详见 `../NymphAuto-v2.9.27-发布说明.md` 与 `ENGINEERING.md` ADR-043。
+>
+> **v2.9.26 是场景判定不可取证收口的正式 release**：未命中现场存证 + 最佳窗口归因 + 掩码覆盖可见。详见 `../NymphAuto-v2.9.26-发布说明.md` 与 `ENGINEERING.md` ADR-042。
+>
+> **v2.9.25 是界面结论与运行时事实对齐的正式 release**：门控假 PASS、失败结论被引导覆盖、运行前无检查、重连窗口误判、界面减法。详见 `../NymphAuto-v2.9.25-发布说明.md` 与 `ENGINEERING.md` ADR-041。
+>
+> **v2.9.24 是未被报告缺陷清理的正式 release**：重启应用恒失效、截图错误码跨调用残留、服务掉线归因、门控自证命中、API 门限、Locale 格式化。详见 `../NymphAuto-v2.9.24-发布说明.md` 与 `ENGINEERING.md` ADR-040。
+>
+> **v2.9.23 是装配失败归因收口的正式 release**：六阶段失败归因（截图空 / 安全窗口 / 超时 / 装配 / 像素 / 采样）、截图错误码进入判定、瞬时失败补采、诊断摘要三行。详见 `../NymphAuto-v2.9.23-发布说明.md` 与 `ENGINEERING.md` ADR-039。
+>
+> **v2.9.20 是场景驱动运行时策略二次复核的正式 release（重新发版）**：修正连续落点偏差护栏的计数语义、精确降格时钟归因、补齐执行范式结束条件的可操作指引。详见 `../NymphAuto-v2.9.20-发布说明.md` 与 `ENGINEERING.md` ADR-036 补记。
+>
+> **v2.9.19 是悬浮窗坐标空间同源缺陷收口的正式 release**：承接 v2.9.18 的窗口标志修复，补齐同一根因下的边界尺寸基准与配置变化重定位。落盘格式继续零改动（`schemaVersion` 仍为 1、`SceneRule` 字段与语义逐字不变），不改动已核对的拖动提交逻辑，不实现 B1 / C。
+>
+> - **三层同源排查**：L1 窗口标志缺失（v2.9.18 已修）→ L2 补齐标志后窗口坐标空间变为全屏绝对坐标，而运行球初始位置、边界收敛与编辑面板尺寸缓存仍取应用窗口可用区尺寸 → L3 `RunnerService` 无配置变化处理，屏幕方向变化后不重算窗口坐标。L2 / L3 为本版修复对象。
+> - **core 契约 `OverlayBounds`**：`Size` 描述全屏绝对坐标边界，`clamp()` 按边界减窗口尺寸收敛，`reposition()` 按旧边界占比映射至新边界后收敛；新增 8 例纯 JVM 单测，覆盖全屏与应用可用区口径差异、方向切换相对锚点、贴边坐标回收。
+> - **app 单一真源 `OverlayWindowMetrics`**：API 30+ 取 `currentWindowMetrics.bounds`、低版本回退 `getRealMetrics`；运行球、编辑面板、录制面板、坐标拾取器、编辑界面预览五处统一接入，删除三份重复实现。拖动热路径不重读尺寸的既有约束不变。
+> - **配置变化重定位**：`RunnerService` 新增 `onConfigurationChanged` 与边界缓存，横竖屏切换、折叠屏展开后按相对锚点重定位运行球并重排控制面板；`FloatingEditorService` 同步补齐相对锚点映射，边界未变化时不触发 relayout。
+> - **窗口标志与拖动逻辑零改动**：`OverlayWindowSpec` 两种受控态、`RunnerService` 运行球与展开面板的 `FLAG_LAYOUT_IN_SCREEN|FLAG_LAYOUT_NO_LIMITS`、`attachBallTouch` 的同步提交路径、`isAllowed` 约束全部沿用 v2.9.18 结论。
+>
+> 全量 **527 项单测 0 失败**（core 492 + app 35，57 suite）、**58/58** 符号进包、1045 本工程可读类、表述门禁 PASS（68 条 0 命中）、拖动门禁 PASS（新增「边界尺寸单一真源已接线」「应用窗口可用区尺寸未用于边界收敛」「配置变化重定位已接线」三项断言）、禁用 API 全 0、权限 8 项零新增、16KB 对齐、同钥 v2/v3。**B1 / C 严格后置**。详见 `../NymphAuto-v2.9.19-发布说明.md` 与 `ENGINEERING.md` ADR-035。
+>
+> **v2.9.18 已完成本地构建与核验但未对外发布**，其窗口标志修复已并入本版；下方该版条目保留为排查过程记录，其中的单测与符号数字为当时实测口径。
+>
+> **上一版（v2.9.18）是悬浮窗「可见但位移交互未生效」根因修复的正式 release**：落盘格式继续零改动（`schemaVersion` 仍为 1、`SceneRule` 字段与语义逐字不变），不改动已核对的拖动提交逻辑，不实现 B1 / C。本版以**用户真机录屏逐帧分析**定位到真实根因——运行球与编辑面板窗口缺 `FLAG_LAYOUT_IN_SCREEN|FLAG_LAYOUT_NO_LIMITS`（坐标拾取器、录制面板因自带这两项而可拖），补齐后与已知可用窗口配置一致。
+>
+> - **窗口坐标空间修复**：`OverlayWindowSpec`（编辑面板 flags 单一真源）并入 `FLAG_LAYOUT_IN_SCREEN|FLAG_LAYOUT_NO_LIMITS` 两种受控态；`RunnerService` 运行球与展开面板内联补齐同款标志。在 OEM ROM / 游戏空间等第三方悬浮层叠加场景下，消除「视觉位置」与「触摸命中区域」的错位，恢复运行球与编辑面板的拖动能力。
+> - **拖动逻辑零改动**：`attachBallTouch` 的 `setOnTouchListener + updateViewLayout` 提交路径与 `isAllowed` 受控态集合保持不变；`setInputFocusable` 焦点切换在两种受控态间进行，坐标空间标志恒定保留。
+> - **D1/D2/D3 能力（v2.9.16/v2.9.17）保持**：意图后果展开 `ScenePreset.explain()`、执行范式同构 `ExecutionParadigm`、位移事件链路自诊断 `DragProbe`/`DragDiagnostics` 继续有效；本版修复后预期 `MOVE_INTERCEPTED` 不再因坐标空间错位而触发。
+> - **表述门禁分类化（v2.9.17）保持**：`check_wording.py` 四类规则 + 显式豁免表（默认空），68 条 0 命中。
+>
+> 全量 **519 项单测 0 失败**（core 484 + app 35）、**54/54** 符号进包、1042 本工程可读类、表述门禁 PASS、拖动门禁 PASS（含"布局坐标空间标志已接线"新断言）、禁用 API 全 0、权限 8 项零新增、16KB 对齐、同钥 v2/v3。**B1 / C 严格后置**。详见 `../NymphAuto-v2.9.18-发布说明.md` 与 `ENGINEERING.md` ADR-034。
+>
+> **上一版（v2.9.17）是可自解释呈现与位移事件链路可取证的正式 release**：落盘格式继续零改动（`schemaVersion` 仍为 1、`SceneRule` 字段与语义逐字不变），不改动已核对的位移提交逻辑，不实现 B1 / C。本版把「界面自己说清后果」与「状态自己可被验证」落成四项能力。
+>
+> - **意图后果展开 `ScenePreset.explain()`**：四维意图逐项展开实际参数、运行时效果与权衡；`optionCatalog()` 由同一组函数生成档位目录，设置页按维度分组查阅。主层只呈现档位名，高级区与查阅区呈现完整后果，界面信息自足。
+> - **执行范式同构呈现 `ExecutionParadigm`**：场景驱动与顺序执行统一投影为四字段卡片（触发依据 / 执行次序 / 画面条件 / 失败处理），并提供随时可查的对照表与切换退路；顺序侧不再只有静态说明，两套心智模型在呈现层收敛。
+> - **位移事件链路自诊断 `DragProbe` + `DragDiagnostics`**：旁路聚合一次手势的按下 / 移动 / 提交 / 位置变化四阶段，按失败代价排序输出四态结论（`NO_DOWN` / `MOVE_INTERCEPTED` / `COMMIT_BLOCKED` / `PASS`）与原始观测量；两路悬浮窗口各自独立取证，设置页呈现结论并写入运行日志。提交逻辑逐字不动，零回归。
+> - **表述门禁分类化**：`check_wording.py` 重构为四类规则 + 显式豁免表（默认空）+ 不可豁免类别，移除两条中性词误伤条目（70→68）。严格性不变；可理解性由信息架构承担，不由放宽措辞承担。
+>
+> 全量 **519 项单测 0 失败**（新增 `ScenePresetExplanationTest` 8 + `ExecutionParadigmTest` 7 + `DragProbeTest` 10）、**51/51** 符号进包、1042 本工程可读类、表述门禁 PASS、拖动门禁 PASS、禁用 API 全 0、权限 8 项零新增、16KB 对齐、同钥 v2/v3。**B1 / C 严格后置**；**位移可用性结论仍未闭环**，本版交付的是一次手势即可取证的诊断能力，四态结论需在真机读取后才能推进到系统派发层定位。详见 `../NymphAuto-v2.9.17-发布说明.md` 与 `ENGINEERING.md` ADR-033。
+>
+> **上一版（v2.9.16）是可理解性基线与表述规范化的正式 release 收口版**：`schemaVersion` 仍为 1、`SceneRule` 落盘格式逐字不变，只处理五类交互基线问题——参数呈现分层、观测量→结论映射、可观测性通道解耦、表述纪律、决策点引导。
+>
+> - **意图层 `ScenePreset`**（core 纯 JVM）：把带状态触发参数投影为「触发时机 / 防抖强度 / 重复与重试 / 同轮上限」四维意图，`toRule()` / `fromRule()` 双向可逆，非预设组合降级为「自定义」；`Intent.normalized()` 收敛 `WHILE_PRESENT` 与 `CONTINUOUS` 的维度耦合，27 种组合往返一致。不新增落盘字段。
+> - **判定层 `SceneVerdict`**（core 纯 JVM）：三项原始观测量 → 四态结论（`NO_FRAME` / `LOW_DISTINCTNESS` / `LOCATION_DEVIATION` / `PASS`），主界面只呈现结论与建议动作，原始分数进日志；`usable` 仅驱动界面提示，门控挂载不变，运行时零回归。
+> - **呈现分层与单一真源**：`FloatingEditorPanel.setSceneIntent()` 把摘要收进「高级」区（默认视图高度不变）；`buildSceneRule()` 默认触发参数改由 `ScenePreset.DEFAULT` 展开，消除装配点与界面各维护一套字面量。
+> - **可观测性解耦**：`VisualConfig.sceneDebugEnabled` 独立开关 + 独立持久化 + `VisualizerLayer` / `ScriptRunner` / `RunnerService` 恒定回调 + Compose 独立入口；`visualize()` 首行 `!cfg.enabled` 保证只开诊断框不叠加手势特效，零新增权限。
+> - **决策点引导**：首次装配时说明「场景触发」与「顺序执行」差异并给出关闭场景驱动的退路，一次性标记存既有 SharedPreferences。
+> - **表述纪律 + 静态门禁**：全仓清除用户反馈原话、口语化俚语、拟人与情绪化措辞，统一以专业术语陈述；新增 `tools/check_wording.py`（70 条精确模式）纳入 `verify_release.py` 硬门槛，命中即 FAIL。远端已发布历史 release 附件字节不变，本地副本仅做表述规范化，差异在 ADR-032 载明。
+>
+> 全量 **494 项单测 0 失败**（新增 `ScenePresetTest` 9 + `SceneVerdictTest` 10）、**40/40** 符号进包、表述门禁 PASS、拖动门禁 PASS、禁用 API 全 0、权限 8 项零新增、16KB 对齐、同钥 v2/v3。**B1（统一 `select-ready` 循环）与 C（视觉 DSL / OCR 主链路、运行时自适应阈值、全量推倒引擎）严格后置**；**悬浮编辑器位移能力仍未闭环**，剩余取证需要三项埋点与真机，本版不在逻辑层盲改。详见 `../NymphAuto-v2.9.16-发布说明.md` 与 `ENGINEERING.md` ADR-032。
+>
+> **v2.9.15 是「场景驱动」三处落盘语义的正式 release 收口版**：方案分界线只有一条 **是否落盘锁定**——可观测性与三处持久化语义（模板结构 / 坐标语义 / 触发语义）在发版前定死，其余能力后置；交付形态限定为完整正式 release。**v2.9.14 已发布**（Gitee `1300720` / GitHub `442575696`），不能误报没发、不能删同名 tag 重传导致同名不同 SHA，故本方案承载为下一个正式 release，走完整构建 / 同钥签名 / 核验 / 三附件 / 双平台发布流程。
+>
+> - **A1 模板结构**：v2.9.14 把「整块 ROI」当模板，点击就发生在 ROI 内 → 内容改变判消失 → 稍恢复判再现 → 边沿再点火，这是**自激振荡反馈回路**，布尔边沿防不了「自己制造消失」。本版起 `Condition.imageData` = ROI 内 **24–48px 稳定局部锚点小图**（`StableAnchor.pickAnchor()` 按梯度能量选纹理丰富块、贴近拾取点），ROI 退回「搜索范围」；ROI 内除锚点外的高方差 cell 记为 `maskRects`，运行时由 `ImageMask.suppress` 只在匹配副本里剔除。锚点选取失败（近乎纯色 / secure 黑帧）返回实际值 `stable=false` 并降级，不误报找到。
+> - **A2 坐标语义**：`clickOffsetX/Ypct`（相对锚点匹配中心）+ `anchorRectPct` + `templateSrcW/H` 一次落盘定死。运行时 `resolveSceneClick()` 用匹配中心 + 偏移算真实落点，匹配中心偏离记录锚点超阈值判「**场景疑似错位**」不点（相较无校验触发更安全）；缺省 `null` 走老绝对坐标，零回归。
+> - **A3 触发语义**：`planSceneFiringStateful()` 带状态纯函数形状定死（输入 `{observed, rules, prev, nowMs, K}` / 输出 `{fire, nextState, reasons}`）；`triggerMode = ON_APPEAR | WHILE_PRESENT | ON_DISAPPEAR`（默认 ON_APPEAR）、迟滞 `presentStreak/absentStreak`、`cooldownMs`、`retryTimeoutMs`（修复「触发后场景持续在场导致无新上升沿」P0 缺陷）、`priority + mutexGroup` 冲突仲裁、同轮最多 K 条（`Script.sceneMaxFiringPerRound` 默认 1）。旧 `planSceneFiring()` 改为委托，默认参数下逐字等价，v2.9.14 布尔边沿零回归。
+> - **A4 fail-closed**：截图不可用 / 无模板时该规则不触发 + 显式日志与状态提示；整脚本无一条门控即明确中止，**绝不回退 `pc++` 按步骤顺序无画面校验的顺序触发**（v2.9.14 的 `gated==0` 回退顺序链已移除）。
+> - **A5 可观测性**：每轮日志「规则名 / present / score / loc / 触发决策 / 落点」写进运行日志；打开「动作可视化」即复用**同一 overlay 窗口**画每规则 ROI 框（命中青绿 / 未命中洋红 + 落点圆点 + 序号），零新增窗口 / 权限 / 前台服务；**拾取即自测**（ROI 内最高命中分 / ROI 外次高干扰分 / 命中位置偏差）显示给用户并落盘，阈值按 `max(82, 干扰分 + 0.08)` 自校准，把 secure 黑帧 / dismiss 时序 race / 裁歪三种静默失败一眼暴露。
+> - **A6 一轮一帧**：`VisionPipeline.findTemplates()` 一次 `frame()` + 一份基础像素副本，N 个模板各 `copyOf()` 做掩码 / 滤镜 / NCC，绝不 N 次 `screenshotBitmap()`；未命中也保留 `score` 供每轮归因。
+>
+> `Script.sceneDriven` / `sceneMaxFiringPerRound` / `Action.sceneRule` 全带默认值、`schemaVersion` 仍为 1：老脚本 / 录制 / 导入 / 历史回放、以及 **v2.9.14 过渡格式**（整块 ROI 模板 + 绝对坐标 + 布尔边沿）继续按旧语义执行，零回归。**B1（统一 `select-ready` 循环、把 `pc` 收进门通过）与 C（视觉 DSL / OCR 主链路、运行时自适应阈值、无障碍事件预触发、全量推倒引擎）严格后置**，本版不做；触发真·推倒的唯一条件是诊断数据显示局部模板匹配在目标 UI 上系统性失效。全量 **475 项单测 0 失败**（新增 34 例：`SceneRuleTest` 24 + `StableAnchorTest` 10）。详见 `../NymphAuto-v2.9.15-发布说明.md` 与 `ENGINEERING.md` ADR-031。**与下方「位移能力未生效」的遗留诊断是两个独立问题**。
 
-- **P0 收起球仍拖不动（真因）**：`FloatingEditorService.onDragAbsolute` 把窗口位移**唯一地**交给 `Choreographer.postFrameCallback`，并用 `frameScheduled` 自锁；该标志只在 VSYNC 回调开头复位，一旦回调未触发（后台省电 / overlay 窗口静止）或回调内被判丢后再无 MOVE 续投，就永久为 `true`，此后每个 MOVE 都在入口 `return`，窗口再也不动。反证：主悬浮球 `RunnerService.attachBallTouch` 一直是同步 `updateViewLayout`，从未被投诉拖不动。修法：core 新增**无状态纯函数** `FloatingEditorLayout.commitDrag`（绝对坐标 + 1px 节流），Service 同步直提交，删除 `Choreographer` / `frameScheduled` / `pendingX/Y`；v2.8.1 抗抽搐成果（绝对坐标、不累加、不漂移）不回退——抽搐真因是「局部增量累加」，不是 update 频率。另把拖动启动阈值从系统 `scaledTouchSlop`（约 24px）降到 **4dp**（约 12px），点击仍用 slop 兜底，轻拖不再被误判成点击展开；折叠球按住放大给出可拖反馈。
-- **P1 悬浮窗还是这么大**：v2.9.7 的 220dp / 0.54 / 85% 不透明仍是近半屏大黑块。本版 `EXPANDED_W_DP` 220→**168**（1080px 屏上占屏宽 61%→47%）、`MAX_H_FRACTION` 0.54→**0.40**、`GLASS_BG` alpha `0xD9`→**`0xB0`**（69%，明显透出底层）；4 个动作 chips 由 2×2 改**单行**、导航文案与内边距收紧（真机截图里按钮已被挤成竖排多行）、ROI / 滑动终点 / 高级数值字段收进默认隐藏的**「高级」区**（控件与功能一个不删，选「滑动」自动展开）、状态行两行→一行、间距 token 同步收紧。**展开态最大面积相对 v2.9.7 缩小约 43%**。
-- **不回退的防线**：`verify_release.py` 新增静态门禁，禁止 `Choreographer` / `postFrameCallback` / `frameScheduled` / `pendingX` / `pendingY` 重新出现在 Service 的**代码行**（KDoc 里如实描述旧缺陷不受影响）；`commitDrag` / `dragStartPx` 纳入 release dex 硬门槛。
+> **关于「悬浮编辑器位移能力未生效」的五次反复（按实际状态记录）**：v2.9.7（阈值不一致）→ v2.9.8（异步自锁）→ v2.9.9（根视图 `onInterceptTouchEvent`/`onTouchEvent` 接管）→ v2.9.10（改用 `setOnTouchListener` 直吃手势）四版「修复」在源码分析层面都讲得通，但**装机实测位移能力始终未生效**（第五轮装机回归：展开态面板与折叠态悬浮球均无位移响应）。真正的结构性根因直到 v2.9.11 才钉死：**拖动手柄（`dragHandle`/顶部条）一直是 `MaxHeightScrollView` 的「后代」**——无论用 `onInterceptTouchEvent` 还是 `setOnTouchListener`，`ScrollView` 一旦判定是竖直/斜向手势，就在 `onInterceptTouchEvent` 把后续 MOVE 抢走，手柄收不到 MOVE → 窗口原地不动。反证：本工程唯一真机可拖的 `RunnerService` 运行球，是**孤零零的 `FloatBall` 视图、下面没有 ScrollView**。v2.9.11 把顶部条**整体移出 ScrollView**（与折叠小球平级），并对祖先调用 `requestDisallowInterceptTouchEvent(true)` 双保险，从结构上对齐运行球，彻底根除「滚动容器吞手势」。
 
-新增 3 例 core 单测，全量 **426/426**（48 suite）。**仍无真机复测**：折叠球拖动手感、69% alpha 的文字可读性、168dp 下按钮单行是否仍够宽、收紧高度后是否需滚动，待装机回归；不冒充已跑通。详见 `../NymphAuto-v2.9.8-发布说明.md` 与 `ENGINEERING.md` ADR-024。
+- **P0 真因（v2.9.11）**：前四版都卡在同一个点——拖动监听所在的手柄是 `MaxHeightScrollView` 的后代（v2.9.9 是根视图重写、v2.9.10 是手柄挂 `setOnTouchListener`，但手柄仍嵌在 `body`/`scroll` 内）。`ScrollView` 的 `onInterceptTouchEvent` 在内容可滚时截走竖直 MOVE，手柄拿不到 MOVE，窗口无位移响应。修法：**顶部条（含拖动手柄 + 收起/关闭按钮）从 `body`/`scroll` 移到 `expanded`，与 ScrollView 平级**；折叠小球本来就在 `expanded` 平级，无需动。`dragListener` 保留 `setOnTouchListener` 直吃手势 + `requestDisallowInterceptTouchEvent(true)` 保险。绝对坐标、1px 节流、`commitDrag` 同步直提交、4dp 阈值全部保留，v2.8.1 抗抽搐成果不回退。
+- **不回退的防线（门禁随真机证据持续改写）**：`verify_release.py` 拖动门禁当前要求「`setOnTouchListener`+`dragListener` 机制、**顶部条移出 ScrollView**（`expanded.addView(bar` 存在且 `body.addView(bar` 消失）、按下禁止祖先拦截、旧 `attachDrag` 消失、`commitDrag` 同步直提交、4dp 阈值、异步自锁残留全 False」——任一为 False 即 FAIL。
+
+发版核对 **475 项单测 0 失败**（core 440 / app 35，51 suite；本版新增 34 例，数字上升还含「重新跑 app 单测」口径因素，不虚报增量），1013 本工程类，33 个 gate 符号（含本版新增 16 个）全部编入 release dex，拖动门禁 PASS，同钥证书 `361722d6…6271` v2/v3，权限仍 8 项零新增，16KB 对齐，三附件回源 SHA 见发布说明。**能力边界（未验证项）（决定性）**：反编译确认 **v2.9.11 发布包里已编进全部修复**（requestDisallowInterceptTouchEvent / dragListener / setOnTouchListener / commitDrag 全在，attachDrag=0）——代码逻辑层本就正确。v2.9.12 仅把拖动热路径**逐字对齐运行球**（去掉 commitDrag 的 null 返回与 isPositionOnlyUpdate 门禁、直接 updateViewLayout）+ **全量 clean 构建**排除缓存。若 v2.9.12 位移能力仍未生效，真因只可能是「手机上跑的是旧包」或「真机层面对该窗口的触摸派发问题」，需用「主悬浮球能否拖动」这一事实来区分。详见 `../NymphAuto-v2.9.12-发布说明.md` 与 `ENGINEERING.md` ADR-028。尺寸瘦身（168dp / 0.40 / 69% alpha）见 `../NymphAuto-v2.9.8-发布说明.md` 与 ADR-024。
 
 ### 历史版本
 
-**v2.9.7 是「收起球可拖动 + 悬浮面板瘦身」版（历史）**：输入是三张真机对照截图（自动精灵小面板 vs NymphAuto 悬浮编辑面板）与反馈「交互界面傻大粗、收起后的悬浮球无法拖动」。
+**v2.9.14 是「拾取坐标自动框选 ROI + 场景驱动」版（上一版，已发布）**：把「按步骤触发点击」改为「场景出现 → 触发高精度动作」。新增 core 纯 JVM 单一真源 `SceneTrigger`——`autoRoi()` 以拾取点为中心按**屏幕短边**算物理半边长再分轴换算回百分比，横屏 / 竖屏 / 折叠屏 / 异形屏下 ROI 都近似物理正方形；`attachScene()` 用 `copy` 保真把裸动作装配成带 `APPEAR_IMAGE` 门控的场景规则；`planSceneFiring()` 布尔边沿触发，谁的场景从无到有出现就触发谁，常驻不重复高频重复触发。拾取瞬间复用既有无障碍 `takeScreenshot` 按自动 ROI 裁出场景模板（最长边 160px 的 base64 PNG），不新建 `MediaProjection` / `VirtualDisplay` / `MediaCodec`；截图不可用时显式降级「只框 ROI、不挂画面门控」。`Script.sceneDriven: Boolean = false` 带默认值、`schemaVersion` 仍为 1，老脚本 / 录制 / 导入 / 历史回放走 `pc++` 顺序链零回归；编辑器与执行日志把「第 N 步」话术换成「场景 N / M」。**该版存在真实缺陷并在 v2.9.15 收口**：整块 ROI 当模板 + 点击改变 ROI = 自激振荡；ROI 只判「有没有」、点击仍用裸绝对坐标；布尔边沿缺迟滞 / cooldown / retry / 仲裁 / K 上限；`gated==0` 截图不可用时回退 `pc++` 顺序链是 fail-open。详见 `../NymphAuto-v2.9.14-发布说明.md` 与 ADR-030 → ADR-031。上一版 v2.9.13 的横屏预检误拦修复（`adoptRefFromPicker()`）见 `../NymphAuto-v2.9.13-发布说明.md` 与 ADR-029。
 
-- **P0 收起球拖不动**：`FloatingEditorPanel.attachDrag` 的 MOVE 用 `4dp` 启动拖动、UP 却用 `8dp` 判定点击，中间 4~8dp 的位移既不进入 `dragging`、又满足「点击」条件 —— 抬手直接把 40dp 小球**展开成大面板**，体感就是「拖不动、一点就变大」。同时 `downRawX/Y/dragging` 是折叠球与顶部条**共享**的面板级字段，展开态拖动后收起会带着残留状态；点击分支 `return false` 还让 UP 未被消费。修法：判定收敛到 core 纯函数 `FloatingEditorLayout.isDragMove / isTap`（共用系统 `scaledTouchSlop`，严格互补、无中间窗口），折叠切换时 `resetDragState()`，折叠球消费整个手势。
-- **P1 傻大粗**：真机像素量化，悬浮面板约占 **76.5% 屏宽 × 58.4% 屏高 ≈ 44.7% 屏幕面积**、背景 93% 不透明；竞品同场景约 49% × 22% 且半透明透出桌面。修法：`EXPANDED_W_DP` 240→220、`MAX_H_FRACTION` 0.62→0.54、`GLASS_BG` alpha `0xED`→`0xD9`；控件与功能一个不删。另修 `EditorScreen` 顶栏 5 个 TextButton 把标题挤成「编 / 辑 / 动 / 作」竖排四行（收紧内边距 + 标题强制单行）。
+**v2.9.7 是「收起球可拖动 + 悬浮面板瘦身」版（历史）**：输入是三张真机对照截图（自动精灵小面板 vs NymphAuto 悬浮编辑面板）与评估结论「交互界面尺寸与视觉密度超标，折叠态悬浮球位移能力未生效」。
+
+- **P0 收起球位移能力未生效**：`FloatingEditorPanel.attachDrag` 的 MOVE 用 `4dp` 启动拖动、UP 却用 `8dp` 判定点击，中间 4~8dp 的位移既不进入 `dragging`、又满足「点击」条件 —— 抬手直接把 40dp 小球**展开成大面板**，表现为位移能力未生效且误触发展开。同时 `downRawX/Y/dragging` 是折叠球与顶部条**共享**的面板级字段，展开态拖动后收起会带着残留状态；点击分支 `return false` 还让 UP 未被消费。修法：判定收敛到 core 纯函数 `FloatingEditorLayout.isDragMove / isTap`（共用系统 `scaledTouchSlop`，严格互补、无中间窗口），折叠切换时 `resetDragState()`，折叠球消费整个手势。
+- **P1 尺寸与视觉密度超标**：真机像素量化，悬浮面板约占 **76.5% 屏宽 × 58.4% 屏高 ≈ 44.7% 屏幕面积**、背景 93% 不透明；竞品同场景约 49% × 22% 且半透明透出桌面。修法：`EXPANDED_W_DP` 240→220、`MAX_H_FRACTION` 0.62→0.54、`GLASS_BG` alpha `0xED`→`0xD9`；控件与功能一个不删。另修 `EditorScreen` 顶栏 5 个 TextButton 把标题挤成「编 / 辑 / 动 / 作」竖排四行（收紧内边距 + 标题强制单行）。
 
 新增 3 例 core 单测，全量 **423/423**（48 suite）。**仍无真机复测**：收起球拖动手感、半透明观感、收紧后是否需滚动，待装机回归。详见 `../NymphAuto-v2.9.7-发布说明.md` 与 `ENGINEERING.md` ADR-023。
 
-**v2.9.6 是「复杂操作可达」版**：输入是 48.87 秒横屏手游录屏（720×328 / 60fps）与差评「不支持类似复杂操作」。逐帧取证：视频是一个「战斗 → 约 12 秒全屏开箱动画 → 深色『获得奖励』结算 +『确认』→ 回主界面再战」的循环，**全程没有 NymphAuto 界面**——用户演示的是想被自动化的目标操作，不是回放失败实录。
+**v2.9.6 是「复杂操作可达」版**：输入是 48.87 秒横屏手游录屏（720×328 / 60fps）与能力评估结论「复杂操作链路未达标」。逐帧取证：视频是一个「战斗 → 约 12 秒全屏开箱动画 → 深色『获得奖励』结算 +『确认』→ 回主界面再战」的循环，**全程没有 NymphAuto 界面**——输入演示的是待自动化的目标操作，不是回放失败实录。
 
 但源码审计确认：**按产品内提示的推荐做法，这类操作必然失败**。
 
 1. **承诺与实现不符（P0）**：编辑器循环弹窗写着「配合找图动作（会等待按钮出现）」，视频导入提示写着「会轮询等待按钮出现，不依赖固定延时」。实际 `CLICK_IMAGE` 的 `withRetry` 默认只等 **2000ms**（`retryWindowMs`，上限 60s 但设置页无入口），超时即判失败推进；视频导入更只生成 `waitMs = gap`（≤3 秒）的固定延时动作。面对 10 秒级转场动画，脚本必然在动画期间超时空转。
 2. **能力存在但不可达（P0）**：引擎早已有 `Condition(APPEAR_IMAGE)` + `repeatCheckUntilOk` 轮询，且轮询里带中止条件检查点、等待浮层与看门狗心跳；缺的只是「把这条条件写进脚本」——`VideoScriptBuilder` 不生成，编辑器也没有配置入口。
-3. **修复**：core 新增 `WaitGate`（等待画面出现的单一真源，纯 JVM 可测）；`VideoScriptBuilder` 默认开启**门控模式**，每个有模板的动作自带「等到该画面出现 → 再点」的条件，固定延时归零，脚本从定时回放变成**事件驱动状态机**，`waitForAppearance = false` 可完全回到 v2.9.5 行为；`Action.waitAppear` 让手动建的找图动作也能由引擎注入同一门控；编辑器与视频导入的提示改为如实描述。
+3. **修复**：core 新增 `WaitGate`（等待画面出现的单一真源，纯 JVM 可测）；`VideoScriptBuilder` 默认开启**门控模式**，每个有模板的动作自带「等到该画面出现 → 再点」的条件，固定延时归零，脚本从定时回放变成**事件驱动状态机**，`waitForAppearance = false` 可完全回到 v2.9.5 行为；`Action.waitAppear` 让手动建的找图动作也能由引擎注入同一门控；编辑器与视频导入的提示改为按实际情况描述。
 4. **顺带修两个陷阱**：`repeatCheck` 无条件取 `minOf(脚本间隔, 调参间隔)`，帧同步档会把十几秒的长等待压成 33ms 全屏找图，无限等待现改按脚本节奏（core `WaitGate.pollIntervalMs` 可单测）；候选触点原本**默认全选 60 个**，含全屏特效的游戏视频会检出大量动画噪声，全选 + 无限等待会让脚本卡在永不再现的动画帧上，现改为按时间分桶默认勾选最多 6 个覆盖各阶段的候选。
 
 **可达性实测**：用这段真视频复现候选检测，结算阶段（43–48s）检出 18 个候选、战斗阶段 11 个，用户能勾到关键按钮；门控随后会自己跳过中间的随机动画。新增 15 例单测，全量 **420/420**（48 suite）。**仍无真机复测**；门控是无限等待，请设脚本中止条件或用通知栏停止；找图模板仍来自用户勾选的候选点，不承诺自动识别自绘界面按钮。详见 `../NymphAuto-v2.9.6-发布说明.md` 与 `ENGINEERING.md` ADR-022。
 
-**v2.9.5 是「拾取浮窗抽搐」修复版（历史）**：输入是用户真机录屏（578×1280 / 44fps / 41 秒）反馈「抖动抽搐」。逐帧分析 + 源码定位确认根因并修掉：
+**v2.9.5 是「拾取浮窗抽搐」修复版（历史）**：输入为真机录屏（578×1280 / 44fps / 41 秒），观测到「周期性位置抖动」。逐帧分析 + 源码定位确认根因并修掉：
 
-1. **手柄拖动用「相对窗口增量」，被窗口自身移动抵消（P0，抽搐根因）**：`PickerHandleView.onTouchEvent` 用 `e.x/e.y`（相对 View 坐标）算拖动增量，而**手柄窗口本身就在跟随手指移动**——窗口每动一次，下一帧的相对增量就被抵消掉，手柄于是「一顿一顿」地滞后跳动。视频证据：绿色手柄明显不与粉红准星重合（停在准星上方约 70px），逐帧位移方向反转率高达 **72%**。这与悬浮编辑器 v2.8.1 的 `dragAbsolute` 治理是同一个病，但**只治了悬浮编辑器、漏了拾取链路**（ADR-012 盲区）。
+1. **手柄拖动用「相对窗口增量」，被窗口自身移动抵消（P0，抽搐根因）**：`PickerHandleView.onTouchEvent` 用 `e.x/e.y`（相对 View 坐标）算拖动增量，而**手柄窗口本身就在跟随手指移动**——窗口每动一次，下一帧的相对增量就被抵消掉，手柄于是「周期性」地滞后跳动。视频证据：绿色手柄明显不与粉红准星重合（停在准星上方约 70px），逐帧位移方向反转率高达 **72%**。这与悬浮编辑器 v2.8.1 的 `dragAbsolute` 治理是同一个病，但**只治了悬浮编辑器、漏了拾取链路**（ADR-012 盲区）。
    修复：改用**屏幕绝对坐标 + 抓取偏移**（core `PickerGeometry.placeFromGrab`），目标位置与窗口位置完全无关——零丢增量、零累积漂移，手柄与准星恒定重合。
 2. **同一帧内反复改窗口位置（P0）**：触控采样 120Hz 高于刷新 60Hz，每个 MOVE 都 `updateViewLayout` + `invalidate`，同帧内多次改位置本身就是抖动来源。加 **1px 提交阈值**（`PickerGeometry.shouldCommit`）+ **`Choreographer` 按帧合并**，抬手时立即落地最后一帧。
-3. **拾取浮层残留窗口（P1）**：`show()` 只持有单个 session 引用，一旦 `start()` 中途抛异常，已 `addView` 成功的窗口成为「无主窗口」永远无法移除，与新会话叠加。改为**活跃会话登记 + `show()` 前全量拆净 + 异常路径当场 detach**。
+3. **拾取浮层残留窗口（P1）**：`show()` 只持有单个 session 引用，一旦 `start()` 中途抛异常，已 `addView` 成功的窗口成为「未登记窗口」永远无法移除，与新会话叠加。改为**活跃会话登记 + `show()` 前全量拆净 + 异常路径当场 detach**。
 
 新增 3 例 core 单测（绝对定位不累加 / 越界夹逼 / 提交阈值），全量 **405/405**（47 suite）。**修复后仍无真机复测**——本次只拿到问题录屏作为证据，手感最终确认要等下一份真机录屏。
 
 **v2.9.4 是「不改功能的缺陷修复」版（历史）**：按「不要改变功能，检查 bug、检查代码陷阱」的要求，通读全部 Kotlin 源码做了一轮静态排查，只修正确性缺陷 —— 不新增任何能力、不动 UI 与交互语义、不动五条硬契约。共修 12 处：
 
-1. **录制面板拖动实际不可用（v2.9.3 引入的真 bug）**：`onTouchEvent(ACTION_DOWN)` 返回 false，落点在状态/提示文字这类非 clickable 区域时 DOWN 未被消费，后续 MOVE 不再派发给面板，面板根本拖不动。把拖动手势抽成 core 纯 JVM 状态机 `DragGesture`（可单测），面板只转发事件；同时修掉增量基准被反复覆盖导致的首帧跳变。
+1. **录制面板拖动实际不可用（v2.9.3 引入的真 bug）**：`onTouchEvent(ACTION_DOWN)` 返回 false，落点在状态/提示文字这类非 clickable 区域时 DOWN 未被消费，后续 MOVE 不再派发给面板，面板位移能力完全未生效。把拖动手势抽成 core 纯 JVM 状态机 `DragGesture`（可单测），面板只转发事件；同时修掉增量基准被反复覆盖导致的首帧跳变。
 2. **拖动方向反了 + 悬浮球可丢失**：`gravity=TOP|END` 下 `p.x` 是距右边缘的偏移，旧代码 `p.x + dx` 让水平拖动与手指相反，改为 `p.x - dx`；运行悬浮球补屏幕内 clamp（旧版可拖出屏幕后永久失联）。
 3. **空脚本 + 无限循环空转**：`ScriptRunner` 主循环在动作列表为空且 `repeatCount=0` 时永不结束、`afterScript` 不执行、通知常驻；负 `repeatCount` 也被当成无限循环。收敛到 core `LoopPolicy.isFinished()`。
 4. **原子写失败静默报成功**：`ScriptStore.save()` 忽略 `AtomicTextFile.write()` 的返回值，磁盘满/目录不可写时上层误报「已保存」，脚本实际丢失；现在显式抛 `IOException`，走既有错误提示路径。
@@ -53,55 +163,55 @@
 
 **v2.9.3 是「浮窗视觉统一 + 录制面板可拖动」版（历史）**：输入是 2026-11-10 用户转发的一整条录制链路通读分析 —— 从事件采集（RecorderBus/RecordGate）、锚点选择（AnchorSelector）、编译去噪（RecordCompiler）、能力边界判定（RecordabilityGuard）、回放界面守卫（SceneGuard）到 6 个交互界面，专家给每个界面打了分（整体 8.9/10），并指出两个最该改进点：**(1) 三套浮窗视觉语言分裂**（录制面板红 `#EF4444`、拾取手柄绿 `#059669`、运行悬浮球灰，各写各的硬编码字面量，无统一 token）；**(2) 录制控制面板钉死在右上角不可拖动**，若目标 APP 关键按钮恰好在右上角会被遮挡，而「不干扰其他 APP」的契约本该覆盖所有浮窗。
 
-本版**不推倒地基、不动五条硬契约**，只补这两个确定性缺口：
+本版**不改动既有架构与五条硬契约**，只补这两个确定性缺口：
 
 1. **浮窗视觉单一真源（core `NymphDesignTokens` 新增 12 个浮窗色槽 + app `OverlayTheme` 投影）**：录制控制面板、运行悬浮球、坐标拾取手柄三套浮窗统一引用 `OverlayTheme`，删除全部硬编码字面量；改 `NymphDesignTokens` 一处，所有浮窗同时变。`OverlayThemeTest` 3 例 + `NymphDesignTokensTest` 扩 1 例锁死「浮窗色板不重复定义、且全部来自真源」。
 2. **录制面板可拖动（复用拾取手柄拖动手感）**：`RecordPanel` 用 `onInterceptTouchEvent`/`onTouchEvent` 实现拖动，触摸斜率超过阈值才认定为拖动，**绝不误伤按钮点击**；`RecordingService` 面板 params 加 `FLAG_LAYOUT_IN_SCREEN`/`FLAG_LAYOUT_NO_LIMITS` 并接线 `onDrag` 做屏幕内 clamp，只改 `x/y`、**不改 flags、不拦截外部触摸**——「不干扰其他 APP」对录制面板同样成立。
 
 新增 4 例单测，全量 **391/391**（46 suite）。权限 8 项零新增、禁用 API 全 0、**961 个**本工程类全保留可读名、v2/v3 同钥可原地升级；`verify_release.py` 把 `OverlayTheme` 也纳入 release dex 硬门槛（ADR-008）。详见 `../NymphAuto-v2.9.3-发布说明.md` 与 `ENGINEERING.md` ADR-019。**真机验证仍为零**：8 秒告警/拖动手感/统一配色在真机上的实际观感待下一份真机回归包确认；被动录制能力边界未变（不承诺自动识别自绘界面按钮），找图模板仍来自用户截图/视频。
 
-**v2.9.2 是「自绘界面可自动化」版（历史）**：输入是 2026-11-10 的 40.3 秒横屏手游录屏（1280×578）+ 差评「不满意，不能实现类似操作」。逐帧核对后，视频是**连续「扫荡 → 开箱结算 → 领取 → 再扫荡」循环**：界面结果随机、动画时长不定、循环次数不固定，且全程**没有 NymphAuto 的控制面板**——用户是在演示「想要被自动化的操作」，不是展示回放失败。以源码为准定位后确认，这是**能力边界 + 产品可发现性**问题，不是「录制不够准」：
+**v2.9.2 是「自绘界面可自动化」版（历史）**：输入是 2026-11-10 的 40.3 秒横屏手游录屏（1280×578）+ 能力评估结论「目标复杂操作链路不可达」。逐帧核对后，视频是**连续「扫荡 → 开箱结算 → 领取 → 再扫荡」循环**：界面结果随机、动画时长不定、循环次数不固定，且全程**没有 NymphAuto 的控制面板**——输入演示的是待自动化操作，不是回放失败实录。以源码为准定位后确认，这是**能力边界 + 产品可发现性**问题，不是「录制不够准」：
 
-1. **自绘界面被动无障碍录制物理上收不到点击（根因，不是 bug）**：Unity / Cocos 游戏、视频播放器、地图、全绘页面里的「按钮」不是 Android View，系统不会派发 `VIEW_CLICKED` / `VIEW_SCROLLED`。而第 5 条硬契约要求「录制 / 回放不打断其他 APP：只订阅被动语义事件，不拦截、不重排触摸」——**不能**靠加 `FLAG_WATCH_OUTSIDE_TOUCH`、全屏透明覆盖层或触摸浏览来「修复」，那会打断其他 APP 的触摸分发。用户照常操作几十秒，停止后只得到「未录到有效动作，已取消」，既不知原因也不知替代方式，于是认为「不能实现类似操作」。
+1. **自绘界面被动无障碍录制物理上收不到点击（根因，不是 bug）**：Unity / Cocos 游戏、视频播放器、地图、全绘页面里的「按钮」不是 Android View，系统不会派发 `VIEW_CLICKED` / `VIEW_SCROLLED`。而第 5 条硬契约要求「录制 / 回放不打断其他 APP：只订阅被动语义事件，不拦截、不重排触摸」——**不能**靠加 `FLAG_WATCH_OUTSIDE_TOUCH`、全屏透明覆盖层或触摸浏览来「修复」，那会打断其他 APP 的触摸分发。常规操作数十秒后仅返回「未录到有效动作，已取消」，缺少归因与替代路径提示，导致目标操作链路被判定为不可达。
 2. **引擎本来就能做，但三个入口全缺**：`Script.repeatCount`（`0` = 无限循环）、`GOTO`、中止条件、`CLICK_IMAGE` 找图点击（带轮询重试、会等待按钮出现而不依赖固定延时）**早已实现**，正好覆盖这类「循环次数不固定、结算动画时长随机」的重复操作。但（a）录制失败时零诊断零指引；（b）`repeatCount` 在界面上**完全没有入口**，只能手写 JSON；（c）「视频导入」生成的脚本 `repeatCount` 恒为 1、只跑一遍，且这条路径没被指出来。
 
-本版**不推倒地基、不动五条硬契约**，只把已有能力接通到用户手上，三项落地：
+本版**不改动既有架构与五条硬契约**，只把已有能力接通到用户手上，三项落地：
 
 1. **录制可行性判定（core `RecordabilityGuard` 纯 JVM 单一真源）**：把录制期信号（`armed` / 交互事件 / 窗口事件 / 总事件 / 时长）判定为 `WAITING` / `NO_EVENTS` / `SELF_DRAWN` / `LOW_SIGNAL` / `RECORDABLE` 五态，输出**必达且可操作**的文案——明确说明「这是能力边界而非脚本错误」，并指向工程里真实存在的「视频导入 → 生成找图脚本 → 设置循环」路径。判定与文案由 14 例单测锁死。
 2. **录制链路接线（必达但不打扰）**：`RecorderBus` 新增交互/窗口分类计数与 `signal()`（不改变回调立即返回的轻量契约）；`RecordPanel.setHint()` 承载告警；`RecordingService` 在进入目标 APP 8 秒后若持续收不到交互事件，**只提示一次**（面板 hint + 通知栏 + toast + 日志页四通道），**绝不阻断录制、绝不改变窗口 flags 或触摸分发**；空脚本收尾不再只说「已取消」，而是给出根因 + 替代路径 + 系统诊断。诊断日志页也同步带上指引。
 3. **循环一等入口**：新增 core `LoopPolicy`（`0`=无限 / 1~9999 归一化 / 中文「无限」解析，6 例单测）；`EditorScreen` 脚本名下方新增可点击「循环」状态条 + 对话框（1 次 / 10 次 / 无限，纳入撤销栈）；「视频导入」对话框新增循环选择 chips；`VideoScriptBuilder.build()` 加 `repeatCount` 参数（默认 1，老调用零回归）。找图 + 循环组合即可自动反复执行「扫荡 → 结算 → 领取」。
 
-新增 24 例单测（`RecordabilityGuardTest` 14 / `LoopPolicyTest` 6 / `VideoScriptBuilderTest` 补 4），全量 **387/387**（45 suite）。权限 8 项零新增、禁用 API 全 0、**959 个**本工程类全保留可读名、v2/v3 同钥可原地升级；`verify_release.py` 新增硬门槛：两个新 core 符号必须真的编进 release dex（ADR-008）。详见 `../NymphAuto-v2.9.2-发布说明.md` 与 `ENGINEERING.md` ADR-018。**真机验证仍为零，且不承诺「自动识别自绘界面按钮」**：被动录制的能力边界未突破，本版交付的是「如实告知边界 + 把可实现的替代路径变成一键可达」；找图模板仍来自用户截图/视频，无限循环需用户自设中止条件或手动停止。
+新增 24 例单测（`RecordabilityGuardTest` 14 / `LoopPolicyTest` 6 / `VideoScriptBuilderTest` 补 4），全量 **387/387**（45 suite）。权限 8 项零新增、禁用 API 全 0、**959 个**本工程类全保留可读名、v2/v3 同钥可原地升级；`verify_release.py` 新增硬门槛：两个新 core 符号必须真的编进 release dex（ADR-008）。详见 `../NymphAuto-v2.9.2-发布说明.md` 与 `ENGINEERING.md` ADR-018。**真机验证仍为零，且不承诺「自动识别自绘界面按钮」**：被动录制的能力边界未突破，本版交付的是「告知实际值边界 + 把可实现的替代路径变成一键可达」；找图模板仍来自用户截图/视频，无限循环需用户自设中止条件或手动停止。
 
 **v2.9.1 是真机回放保真度 bugfix 版（历史）**：输入是 2026-11-10 的真机调试包（99 秒 120fps 录屏 + 运行日志 + 5 张失败截图）。逐帧核对录屏与日志后锁定一条完整证据链：用户在**应用抽屉**里滚动找应用（97 个 `VIEW_SCROLLED` → 编译成 **38 个 SWIPE 翻页**），回放时却停在**桌面主屏 / 日历小组件 / 搜索历史页 / 输入法键盘**——38 个翻页手势全部打在错误界面，还误触搜索框弹出键盘，两次回放都被用户手动停止。录屏 t≈16~26s（抽屉按 A–Z 滚动）与 t≈50~82s（回放乱翻页）逐帧可辨；日志两次总结都是「命中 0、跳过 0、失败 0」。以源码为准定位并修复三个确定性缺陷：
 
-1. **回放界面守卫在「同包名不同页面」下结构性失效（主因）**：`SceneGuard` 只比对 `packageName`，而应用抽屉、桌面主屏、搜索页**同属一个 launcher 包名** → `recorded == current` 判为界面一致直接 `PROCEED`；`rootInActiveWindow()` 取不到包名、或回放瞬间前台仍是 NymphAuto 自己 → `SKIP`。两条路径都**静默放行**，日志里连一行界面校验都没有。讽刺的是该文件头注释写的正是「用户在应用抽屉里连续翻页录制，回放却停在桌面/日历」这一场景。修复：新增 core 纯 JVM `hasPositionalActions` 判定与 `PROCEED_WITH_WARNING` 决策，把「同包名≠同界面、被动录制无法还原页面与滚动位置」升级为**执行前必达告警**（日志页 + 运行日志 + toast 三通道）。刻意不阻断执行——同包名在原理上无法证明界面一致，拦死会误伤已手动回到正确界面的正常回放；误报一条警告代价远小于拦死脚本。**守卫关闭 / 老脚本无起始包名**时同样送达，不再让编译期告警只躺在 `Script.description` 里。
-2. **执行总结全是 0（可观测性 bug）**：旧统计类放在 app 层 `ScriptRunner` 内部，`hit/miss` 只在 `withRetry()`（找图/找色/找文字命中）里自增；SWIPE / TAP 这类**直接派发、无目标校验**的手势走 `dispatch()`，不计入任何口径；`executed` 字段定义了却**从未自增**。于是纯翻页脚本必然报「命中 0、跳过 0、失败 0」，用户以为脚本没跑。修复：把 `RunStats` 抽到 core 纯 JVM（新增 `core/runner/RunStats.kt`），主循环无条件自增 `executed`，总结改为「已执行 N 步，命中 X、跳过 Y、失败 Z」；纯手势脚本额外如实标注「无目标校验，命中/失败口径不适用」，**不把坐标手势伪装成命中**。
-3. **诚实边界**：被动无障碍录制拿不到手指真实轨迹与页面/滚动位置，本版**不承诺**「自动把界面还原到录制时的抽屉滚动位置」——那是 ADR-002 已确认的能力边界，不做虚假修复。真正落地的是「不再静默放行、不再报全 0、把风险明确送达用户」。5 张 `miss_目标图片` 截图经时间戳核算为 **2026-11-07 17:13 的历史文件**（距本次 2.5 天，是 APP 未清理的旧失败现场），画面为短视频信息流的**动态视频封面** + 分享面板/控制面板遮挡，属找图能力边界，**不作为本次会话证据**。
+1. **回放界面守卫在「同包名不同页面」下结构性失效（主因）**：`SceneGuard` 只比对 `packageName`，而应用抽屉、桌面主屏、搜索页**同属一个 launcher 包名** → `recorded == current` 判为界面一致直接 `PROCEED`；`rootInActiveWindow()` 取不到包名、或回放瞬间前台仍是 NymphAuto 自己 → `SKIP`。两条路径都**静默放行**，日志里连一行界面校验都没有。值得注意的是，该文件头注释描述的应用场景正是「在应用抽屉中连续翻页录制，回放停留在桌面或日历」。修复：新增 core 纯 JVM `hasPositionalActions` 判定与 `PROCEED_WITH_WARNING` 决策，把「同包名≠同界面、被动录制无法还原页面与滚动位置」升级为**执行前必达告警**（日志页 + 运行日志 + toast 三通道）。刻意不阻断执行——同包名在原理上无法证明界面一致，拦死会误伤已手动回到正确界面的正常回放；误报一条警告代价远小于拦死脚本。**守卫关闭 / 老脚本无起始包名**时同样送达，不再让编译期告警只躺在 `Script.description` 里。
+2. **执行总结全是 0（可观测性 bug）**：旧统计类放在 app 层 `ScriptRunner` 内部，`hit/miss` 只在 `withRetry()`（找图/找色/找文字命中）里自增；SWIPE / TAP 这类**直接派发、无目标校验**的手势走 `dispatch()`，不计入任何口径；`executed` 字段定义了却**从未自增**。于是纯翻页脚本必然报「命中 0、跳过 0、失败 0」，用户以为脚本没跑。修复：把 `RunStats` 抽到 core 纯 JVM（新增 `core/runner/RunStats.kt`），主循环无条件自增 `executed`，总结改为「已执行 N 步，命中 X、跳过 Y、失败 Z」；纯手势脚本额外按实际情况标注「无目标校验，命中/失败口径不适用」，**不把坐标手势伪装成命中**。
+3. **能力边界（未验证项）**：被动无障碍录制拿不到手指真实轨迹与页面/滚动位置，本版**不承诺**「自动把界面还原到录制时的抽屉滚动位置」——那是 ADR-002 已确认的能力边界，不做虚假修复。真正落地的是「不再静默放行、不再报全 0、把风险明确送达用户」。5 张 `miss_目标图片` 截图经时间戳核算为 **2026-11-07 17:13 的历史文件**（距本次 2.5 天，是 APP 未清理的旧失败现场），画面为短视频信息流的**动态视频封面** + 分享面板/控制面板遮挡，属找图能力边界，**不作为本次会话证据**。
 
-新增 17 例单测（`SceneGuardPositionalTest` 11 / `RunStatsTest` 6），全量 **363/363**（43 suite）。新增 core `RunStats` 单一统计真源；`ScriptRunner` / `RunnerService` 接线 `onSceneNotice`。权限 8 项零新增、禁用 API 全 0、**930 个**本工程类全保留可读名、v2/v3 同钥可原地升级。详见 `../NymphAuto-v2.9.1-发布说明.md` 与 `ENGINEERING.md` ADR-017。**真机验证仍为零**：本版修复由真机调试包的录屏+日志驱动，但修复效果本身待下一份真机回归验证，不冒充已在真机跑通。
+新增 17 例单测（`SceneGuardPositionalTest` 11 / `RunStatsTest` 6），全量 **363/363**（43 suite）。新增 core `RunStats` 单一统计真源；`ScriptRunner` / `RunnerService` 接线 `onSceneNotice`。权限 8 项零新增、禁用 API 全 0、**930 个**本工程类全保留可读名、v2/v3 同钥可原地升级。详见 `../NymphAuto-v2.9.1-发布说明.md` 与 `ENGINEERING.md` ADR-017。**真机验证仍为零**：本版修复由真机调试包的录屏+日志驱动，但修复效果本身待下一份真机回归验证，不误标为已在真机跑通。
 
-**v2.9.0 是「平台合规 + 可验证内核」版**：本轮输入是若干外部 agents 的改进建议，逐条核实后**不推倒地基**（core 纯 JVM、零 Android 依赖、100% 单测，以及零 INTERNET / 不加密明文 `.zjs` / 不混淆 / 不抢录屏 / 不打断其他 APP 这五条契约，是可审计、已验证的资产，推倒等于把已验证丢回未验证）。实际落地四件收益确定、可在本环境被真证明的事：
+**v2.9.0 是「平台合规 + 可验证内核」版**：本轮输入是若干外部 agents 的改进建议，逐条核实后**不改动既有架构**（core 纯 JVM、零 Android 依赖、100% 单测，以及零 INTERNET / 不加密明文 `.zjs` / 不混淆 / 不抢录屏 / 不打断其他 APP 这五条契约，是可审计、已验证的资产，重构会使已验证资产回到未验证状态）。实际落地四件收益确定、可在本环境被真证明的事：
 
-1. **16 KB 页对齐（P0 真缺口，实测驱动）**：解包 v2.8.1 产物实测发现，自编译的 `libquickjs-jni.so` 的 ELF LOAD 段 Align 仍是 `0x1000`(4KB)，而 `build.gradle.kts` / README 却把 `useLegacyPackaging=false` 注释成「16KB 页大小对齐」——**文档与产物不符，且无人发现**（那一项只管 ZIP 条目对齐，与 ELF 段对齐是两回事）。Google Play 自 2025-11-01 对 targetSdk 15+ 强制要求 16 KB 支持，本工程 targetSdk 36 已命中。修复：`cpp/CMakeLists.txt` 加 NDK r27 官方 linker flags（`-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384`）重编，实测该 so 已变为 `0x4000`(16KB)；新增 `tools/check_elf_alignment.py` 并接入 `tools/verify_release.py`，**每次发版实测每个 so 的 LOAD 段对齐，自编译 so 未对齐直接判 FAIL**，把合规从注释变成机制。6 个 so 中 5 个对齐；唯一遗留是 TFLite Task Vision 0.4.4 预编译的 `libtask_vision_jni.so`（仍 `0x1000`），本工程 CMake 不可控，**如实列出不冒充修复**——16 KB 页设备上该 so 加载会失败，`AiDetector` 已用 `runCatching` 优雅降级为 AI 找目标不可用、其余能力照常，并补了针对性归因日志。彻底解决需等 LiteRT/上游提供对齐的预编译库或改用单一 ONNX 运行时（需真机验证检测精度）。
+1. **16 KB 页对齐（P0 真缺口，实测驱动）**：解包 v2.8.1 产物实测发现，自编译的 `libquickjs-jni.so` 的 ELF LOAD 段 Align 仍是 `0x1000`(4KB)，而 `build.gradle.kts` / README 却把 `useLegacyPackaging=false` 注释成「16KB 页大小对齐」——**文档与产物不符，且无人发现**（那一项只管 ZIP 条目对齐，与 ELF 段对齐是两回事）。Google Play 自 2025-11-01 对 targetSdk 15+ 强制要求 16 KB 支持，本工程 targetSdk 36 已命中。修复：`cpp/CMakeLists.txt` 加 NDK r27 官方 linker flags（`-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384`）重编，实测该 so 已变为 `0x4000`(16KB)；新增 `tools/check_elf_alignment.py` 并接入 `tools/verify_release.py`，**每次发版实测每个 so 的 LOAD 段对齐，自编译 so 未对齐直接判 FAIL**，把合规从注释变成机制。6 个 so 中 5 个对齐；唯一遗留是 TFLite Task Vision 0.4.4 预编译的 `libtask_vision_jni.so`（仍 `0x1000`），本工程 CMake 不可控，**明确列出不误标为已修复**——16 KB 页设备上该 so 加载会失败，`AiDetector` 已用 `runCatching` 优雅降级为 AI 找目标不可用、其余能力照常，并补了针对性归因日志。彻底解决需等 LiteRT/上游提供对齐的预编译库或改用单一 ONNX 运行时（需真机验证检测精度）。
 2. **设计 token 单一真源**：新增 core 纯 JVM `NymphDesignTokens`，Compose 主界面 `Theme.kt` 与悬浮层 `FloatingEditorTheme` 的色板/尺寸/字号全部引自同一对象；后者降级为「投影层」（保留 v2.8.1 全部公开名，视觉值一字节不变）。消除「同一个警告色两处各写一遍、靠约定维持」，并由单测锁死两处同源、对比度、字号层级、语义色可区分。
-3. **窗口规格约束函数化**：新增 core `OverlayWindowSpec`，把 v2.8.1 靠注释保证的「flags 恒定」变成可执行约束——只允许 `NOT_FOCUSABLE|NOT_TOUCH_MODAL` 与 `NOT_TOUCH_MODAL`（输入焦点临时态）两种取值，`FloatingEditorService` 的 `baseParams()` / `setInputFocusable()` / 按帧拖动提交全部接线；拖动提交前用 `isPositionOnlyUpdate` 校验「只改 x/y、flags/type/format/width/height 逐字不变」，脏规格直接丢弃该帧。**同时如实修正文档表述**：此前 README/ADR 写「flags 全程恒定」，但 `setInputFocusable()` 本就会受控切换，准确说法是「只允许两种受控状态、只由输入焦点触发」。
+3. **窗口规格约束函数化**：新增 core `OverlayWindowSpec`，把 v2.8.1 靠注释保证的「flags 恒定」变成可执行约束——只允许 `NOT_FOCUSABLE|NOT_TOUCH_MODAL` 与 `NOT_TOUCH_MODAL`（输入焦点临时态）两种取值，`FloatingEditorService` 的 `baseParams()` / `setInputFocusable()` / 按帧拖动提交全部接线；拖动提交前用 `isPositionOnlyUpdate` 校验「只改 x/y、flags/type/format/width/height 逐字不变」，脏规格直接丢弃该帧。**同时按实际情况修正文档表述**：此前 README/ADR 写「flags 全程恒定」，但 `setInputFocusable()` 本就会受控切换，准确说法是「只允许两种受控状态、只由输入焦点触发」。
 4. **原子落盘 + schema 迁移链**：新增 core `AtomicTextFile`（临时文件→fsync→rename）接入 `ScriptStore` / `ScriptRepository` / `ScriptGrants`，修掉「编辑中进程被杀留下半截文件、脚本凭空消失」这个真实数据风险；新增 `ScriptMigrations` 接入 `ScriptCodec.decode`，让早已有字段但一直空设的 `schemaVersion` 真正起作用——未来版本脚本被明确挡下而非被 `ignoreUnknownKeys` 静默当 v1 打开、字段按默认值补齐却行为全错。
 
-新增 27 例单测（`NymphDesignTokensTest` 6 / `OverlayWindowSpecTest` 6 / `AtomicTextFileTest` 7 / `ScriptMigrationsTest` 8），全量 **346/346**（41 suite）。权限 8 项零新增、禁用 API 全 0、v2/v3 同钥可原地升级、新符号已确认进 dex。**明确否决（判断为收益小于风险或不可验证）**：端侧 VLM 替换识别链（按需下载违背零 INTERNET、秒级延迟拖垮回放）、全 Compose 化悬浮层（命中 AndroidX issue 399131921「无障碍服务 + 非 Activity 窗口 + LazyColumn fling」，且会让 v2.8.1 刚修好的抗抽搐回到未验证）、预编译手势队列 <1ms / 零拷贝 HardwareBuffer 直通 ONNX（无对应 API，属幻觉）、全量升 compileSdk 37 / AGP 9 / KMP / PrimJS（本环境 SDK 封顶 36、离线依赖固定，升了构建即断且无法验证）。详见 `../NymphAuto-v2.9.0-发布说明.md` 与 `ENGINEERING.md` ADR-013～016。**真机验证仍为零**，本环境无 Android 设备，不冒充已验证。
+新增 27 例单测（`NymphDesignTokensTest` 6 / `OverlayWindowSpecTest` 6 / `AtomicTextFileTest` 7 / `ScriptMigrationsTest` 8），全量 **346/346**（41 suite）。权限 8 项零新增、禁用 API 全 0、v2/v3 同钥可原地升级、新符号已确认进 dex。**明确否决（判断为收益小于风险或不可验证）**：端侧 VLM 替换识别链（按需下载违背零 INTERNET、秒级延迟拖垮回放）、全 Compose 化悬浮层（命中 AndroidX issue 399131921「无障碍服务 + 非 Activity 窗口 + LazyColumn fling」，且会让 v2.8.1 刚修好的抗抽搐回到未验证）、预编译手势队列 <1ms / 零拷贝 HardwareBuffer 直通 ONNX（无对应 API，属幻觉）、全量升 compileSdk 37 / AGP 9 / KMP / PrimJS（本环境 SDK 封顶 36、离线依赖固定，升了构建即断且无法验证）。详见 `../NymphAuto-v2.9.0-发布说明.md` 与 `ENGINEERING.md` ADR-013～016。**真机验证仍为零**，本环境无 Android 设备，不误标为已验证。
 
 
-**v2.8.1 是差评修复版**，专修 v2.8.0 发布后反馈的「一直在抽搐，界面也不美观」。本次对比视频**成功取回**（19.6MB 真 MP4，720×328 / 60fps / 142s），逐帧像素差分析与连续帧放大拼接给出可见证据：连续帧里悬浮面板的**左/上边缘位置在跳动**、**可见内容范围忽多忽少**（有的帧只到「屏幕拾取起点」、有的多出「框选 ROI」一行），即窗口在反复 relayout；画面同时坐实深灰实心方块按钮、10.5sp 小字、拥挤排版与 `⠿`/`▲` 缺字字符。以源码为准锁定 **5 个确定性根因**：① 拖动用局部坐标增量 `e.x-lastX` 累加、且每个 `ACTION_MOVE` 都 `updateViewLayout`，窗口一重布局局部坐标就与屏幕位移脱钩 → 跟手抖动 + 累加漂移；② `height=WRAP_CONTENT` 叠加 60~120Hz 全窗口 relayout，尺寸反复重算；③ `MaxHeightScrollView.onMeasure` 对 `UNSPECIFIED` 取 `getSize()=0` 再构造 `AT_MOST(0)`，把内容高度压成 0、与父布局反复博弈（正是「内容忽多忽少」的直接原因）；④ `setCollapsed()` 每次切 `FLAG_NOT_FOCUSABLE` 并重复 `startForeground()`，flags 变更触发窗口重建/焦点变化 → 软键盘弹出收起 → 沉浸式可用高度变化 → **循环抽搐**；⑤ 每次 MOVE 重读 `displayMetrics`，全屏游戏状态栏切换时 `heightPixels` 跳变让 clamp 边界跳。修复：拖动改用**屏幕绝对坐标 `rawX/rawY` + 按下时窗口坐标**（`FloatingEditorLayout.dragAbsolute`，不累加、不依赖任何 View 局部坐标系），`Choreographer` **按帧合并**窗口更新、`shouldCommit` 过滤 <1px 无效变化；`FLAG_NOT_FOCUSABLE` **全程恒定**，仅在 `EditText` 真正获焦时按需临时申请焦点（`setInputFocusable`）；`measureHeight` 按 `MeasureMode` 正确处理 `UNSPECIFIED`；状态行固定最小高度、屏幕尺寸缓存（`refreshMetrics`）、前台通知去重不再随状态切换重复 `startForeground`。视觉按新增纯 JVM `FloatingEditorTheme` **设计 token 单一真源**重做：深墨蓝玻璃卡片 + 单一翡翠绿强调、次级按钮改描边/低饱和底、胶囊 chips、统一圆角/间距/字号层级（13/12.5/11/10.5sp 严格递减）、去掉全部缺字字符，token 的层级与对比度由 JVM 单测约束而非肉眼猜。新增 `FloatingEditorThemeTest` 5 例 + `FloatingEditorLayoutTest` 补 5 例（绝对坐标不漂移/越界 clamp/提交阈值/UNSPECIFIED 不再压成 0/三种测量模式），全量单测 **319/319**（core 287 + app 32，37 suite）。权限 8 项零新增、禁用 API 全 0、**921 个**本工程类全保留可读名、v2/v3 同钥可原地升级，包体较 v2.8.0 净增 16,384 字节，`FloatingEditorTheme` / `MeasureMode` 等新符号已确认进 dex。**真机验证仍为零**：按帧节流的实际跟手度、软键盘与焦点在各 ROM 的表现、前台服务保活、折叠/展开/拖动手感，仍待真机回归，不冒充已验证；视频只用于定位「窗口反复重算」这一现象，未据其推断任何未在源码中确认的行为。详见 `../NymphAuto-v2.8.1-发布说明.md` 与 `ENGINEERING.md` ADR-012。
+**v2.8.1 是能力评估所涉缺陷修复版**，专修 v2.8.0 发布后反馈的「一直在抽搐，视觉层级不规范」。本次对比视频**成功取回**（19.6MB 真 MP4，720×328 / 60fps / 142s），逐帧像素差分析与连续帧放大拼接给出可见证据：连续帧里悬浮面板的**左/上边缘位置在跳动**、**可见内容范围忽多忽少**（有的帧只到「屏幕拾取起点」、有的多出「框选 ROI」一行），即窗口在反复 relayout；画面同时证实深灰实心方块按钮、10.5sp 小字、拥挤排版与 `⠿`/`▲` 缺字字符。以源码为准锁定 **5 个确定性根因**：① 拖动用局部坐标增量 `e.x-lastX` 累加、且每个 `ACTION_MOVE` 都 `updateViewLayout`，窗口一重布局局部坐标就与屏幕位移脱钩 → 跟手抖动 + 累加漂移；② `height=WRAP_CONTENT` 叠加 60~120Hz 全窗口 relayout，尺寸反复重算；③ `MaxHeightScrollView.onMeasure` 对 `UNSPECIFIED` 取 `getSize()=0` 再构造 `AT_MOST(0)`，把内容高度压成 0、与父布局反复博弈（正是「内容忽多忽少」的直接原因）；④ `setCollapsed()` 每次切 `FLAG_NOT_FOCUSABLE` 并重复 `startForeground()`，flags 变更触发窗口重建/焦点变化 → 软键盘弹出收起 → 沉浸式可用高度变化 → **循环抽搐**；⑤ 每次 MOVE 重读 `displayMetrics`，全屏游戏状态栏切换时 `heightPixels` 跳变让 clamp 边界跳。修复：拖动改用**屏幕绝对坐标 `rawX/rawY` + 按下时窗口坐标**（`FloatingEditorLayout.dragAbsolute`，不累加、不依赖任何 View 局部坐标系），`Choreographer` **按帧合并**窗口更新、`shouldCommit` 过滤 <1px 无效变化；`FLAG_NOT_FOCUSABLE` **全程恒定**，仅在 `EditText` 真正获焦时按需临时申请焦点（`setInputFocusable`）；`measureHeight` 按 `MeasureMode` 正确处理 `UNSPECIFIED`；状态行固定最小高度、屏幕尺寸缓存（`refreshMetrics`）、前台通知去重不再随状态切换重复 `startForeground`。视觉按新增纯 JVM `FloatingEditorTheme` **设计 token 单一真源**重做：深墨蓝玻璃卡片 + 单一翡翠绿强调、次级按钮改描边/低饱和底、胶囊 chips、统一圆角/间距/字号层级（13/12.5/11/10.5sp 严格递减）、去掉全部缺字字符，token 的层级与对比度由 JVM 单测约束而非肉眼猜。新增 `FloatingEditorThemeTest` 5 例 + `FloatingEditorLayoutTest` 补 5 例（绝对坐标不漂移/越界 clamp/提交阈值/UNSPECIFIED 不再压成 0/三种测量模式），全量单测 **319/319**（core 287 + app 32，37 suite）。权限 8 项零新增、禁用 API 全 0、**921 个**本工程类全保留可读名、v2/v3 同钥可原地升级，包体较 v2.8.0 净增 16,384 字节，`FloatingEditorTheme` / `MeasureMode` 等新符号已确认进 dex。**真机验证仍为零**：按帧节流的实际跟手度、软键盘与焦点在各 ROM 的表现、前台服务保活、折叠/展开/拖动手感，仍待真机回归，不误标为已验证；视频只用于定位「窗口反复重算」这一现象，未据其推断任何未在源码中确认的行为。详见 `../NymphAuto-v2.8.1-发布说明.md` 与 `ENGINEERING.md` ADR-012。
 
-**v2.8.0 是差评修复版**，专修「编辑动作的整个界面不支持脱离 NymphAuto 在其他 APK 界面运行」与「界面太大」两条反馈。用户附了一份「系统级悬浮窗（System Overlay / 后台可显示）vs 前台绑定悬浮窗（Activity 生命周期绑定）」的资料并要求**以源码为准**，核实后本工程其实是**混合架构**，比资料的二分法更细：① 被差评的 `ActionEditDialog` 是 Compose `AlertDialog`，画在 `MainActivity.setContent{}` 的视图树里，**连独立 Dialog 窗口都不是**，切后台随 `onStop` 消失、无法在其他 APP 之上呼出——差评属实；② 而 `CoordinatePicker` 非模态拾取、`FloatBall`+`BallPanel` 运行控制、`RecordingService` 录制浮窗早就走 `TYPE_APPLICATION_OVERLAY` + `specialUse` 前台服务，是真正的系统 Overlay。所以问题不是「缺悬浮窗权限」（`SYSTEM_ALERT_WINDOW` 早有、8 项权限零新增），而是**编辑动作这套界面没走系统 Overlay 通道**。修复：新增 `FloatingEditorService`（`specialUse` 前台服务）用 `WindowManager.addView` 以 `TYPE_APPLICATION_OVERLAY` 承载纯 View 面板 `FloatingEditorPanel`，切后台 / 切任意第三方 APP 持续存在、通知栏可「呼出 / 收起 / 关闭」；脚本卡片菜单「悬浮编辑」、编辑器顶栏「悬浮」、设置页「关闭浮窗」三处入口，点入口主动 `moveTaskToBack(true)`。面板 `FLAG_NOT_TOUCH_MODAL`，面板之外照常操作底层 APP。**紧凑化**：折叠态 40dp 小球（< 屏宽 15%），展开态固定 240dp 宽、高度上限屏高 62%（`MaxHeightScrollView.onMeasure` 真正限高，而非只在 clamp 计算里写个数字），高级字段默认折叠进「更多参数」，原 Activity 内 `AlertDialog` 同步限宽 340dp。**复用而非重写**：脚本读写走 `ScriptStore` / `ScriptRepository`、动作保存走 `ActionEditGuard.apply`（`copy` 保真，不丢 `children` / `listeners` / `condition` / `imageData`）、ROI 走 `RoiApplier.apply`（唯一真源 + 命中数如实反馈）、坐标拾取复用 `CoordinatePicker`（拾取期间面板收成小球）。确定性逻辑（尺寸档位 / 折叠 / 位置 clamp / 拖动 / 表单解析 / Locale）抽到纯 JVM `FloatingEditorLayout`，新增 **12 例单测**。**过程中修掉两个真坑**：① 展开态不能加 `FLAG_NOT_FOCUSABLE`，否则悬浮窗里 `EditText` 抢不到焦点、弹不出软键盘（改为折叠态加、展开态去掉）；② 拖动不能写在根 View 的 `onTouchEvent`（`LinearLayout` 会先把 DOWN 分发给子控件，根 View 收不到 MOVE），改为给折叠小球与顶部拖动条各装独立 `OnTouchListener`。全量单测 **309/309**（core 277 + app 32，36 suite），权限 8 项零新增、禁用 API 全 0、v2/v3 同钥可原地升级，`FloatingEditorService` / `FloatingEditorPanel` / `FloatingEditorLayout` / `MaxHeightScrollView` 等新符号已确认进 dex（906 个本工程类全保留可读名）。**真机验证仍为零**：本环境无 Android 设备，Overlay 在各 ROM 的触摸分发、软键盘弹出、`specialUse` 保活、通知栏呼出、折叠 / 展开 / 拖动手感、面板与拾取器同时显示的层级**全部待真机回归**，不冒充已验证；所给对比视频链接缺有效参数、4 种取回方式全部失败，未据其做任何推断。详见 `../NymphAuto-v2.8.0-发布说明.md` 与 `ENGINEERING.md` ADR-011。
+**v2.8.0 是能力评估所涉缺陷修复版**，专修「编辑动作的整个界面不支持脱离 NymphAuto 在其他 APK 界面运行」与「界面太大」两条反馈。用户附了一份「系统级悬浮窗（System Overlay / 后台可显示）vs 前台绑定悬浮窗（Activity 生命周期绑定）」的资料并要求**以源码为准**，核实后本工程为**混合架构**，比资料的二分法更细：① 被标注的 `ActionEditDialog` 是 Compose `AlertDialog`，画在 `MainActivity.setContent{}` 的视图树里，**连独立 Dialog 窗口都不是**，切后台随 `onStop` 消失、无法在其他 APP 之上呼出——评估结论成立；② 而 `CoordinatePicker` 非模态拾取、`FloatBall`+`BallPanel` 运行控制、`RecordingService` 录制浮窗早就走 `TYPE_APPLICATION_OVERLAY` + `specialUse` 前台服务，是真正的系统 Overlay。所以问题不是「缺悬浮窗权限」（`SYSTEM_ALERT_WINDOW` 早有、8 项权限零新增），而是**编辑动作这套界面没走系统 Overlay 通道**。修复：新增 `FloatingEditorService`（`specialUse` 前台服务）用 `WindowManager.addView` 以 `TYPE_APPLICATION_OVERLAY` 承载纯 View 面板 `FloatingEditorPanel`，切后台 / 切任意第三方 APP 持续存在、通知栏可「呼出 / 收起 / 关闭」；脚本卡片菜单「悬浮编辑」、编辑器顶栏「悬浮」、设置页「关闭浮窗」三处入口，点入口主动 `moveTaskToBack(true)`。面板 `FLAG_NOT_TOUCH_MODAL`，面板之外照常操作底层 APP。**紧凑化**：折叠态 40dp 小球（< 屏宽 15%），展开态固定 240dp 宽、高度上限屏高 62%（`MaxHeightScrollView.onMeasure` 真正限高，而非只在 clamp 计算里写个数字），高级字段默认折叠进「更多参数」，原 Activity 内 `AlertDialog` 同步限宽 340dp。**复用而非重写**：脚本读写走 `ScriptStore` / `ScriptRepository`、动作保存走 `ActionEditGuard.apply`（`copy` 保真，不丢 `children` / `listeners` / `condition` / `imageData`）、ROI 走 `RoiApplier.apply`（唯一真源 + 命中数反馈实际值）、坐标拾取复用 `CoordinatePicker`（拾取期间面板收成小球）。确定性逻辑（尺寸档位 / 折叠 / 位置 clamp / 拖动 / 表单解析 / Locale）抽到纯 JVM `FloatingEditorLayout`，新增 **12 例单测**。**过程中修掉两个真坑**：① 展开态不能加 `FLAG_NOT_FOCUSABLE`，否则悬浮窗里 `EditText` 抢不到焦点、弹不出软键盘（改为折叠态加、展开态去掉）；② 拖动不能写在根 View 的 `onTouchEvent`（`LinearLayout` 会先把 DOWN 分发给子控件，根 View 收不到 MOVE），改为给折叠小球与顶部拖动条各装独立 `OnTouchListener`。全量单测 **309/309**（core 277 + app 32，36 suite），权限 8 项零新增、禁用 API 全 0、v2/v3 同钥可原地升级，`FloatingEditorService` / `FloatingEditorPanel` / `FloatingEditorLayout` / `MaxHeightScrollView` 等新符号已确认进 dex（906 个本工程类全保留可读名）。**真机验证仍为零**：本环境无 Android 设备，Overlay 在各 ROM 的触摸分发、软键盘弹出、`specialUse` 保活、通知栏呼出、折叠 / 展开 / 拖动手感、面板与拾取器同时显示的层级**全部待真机回归**，不误标为已验证；所给对比视频链接缺有效参数、4 种取回方式全部失败，未据其做任何推断。详见 `../NymphAuto-v2.8.0-发布说明.md` 与 `ENGINEERING.md` ADR-011。
 
-**v2.7.1 是 bugfix 版**，专修 v2.7.0 发布后反馈的「屏幕拾取起点（非模态）」与「框选搜索区域 ROI / 模板范围」两个功能都有 bug：① 修 `DisposableEffect(pickStamp)` 用会自增的 key 导致浮层刚 `show()` 就被 `onDispose → dismiss()` 关掉（改恒定 `Unit` + `resultSeq` 去重兜底）；② 准星从「手柄窗口中心反算」改为**独立像素真值**（新增纯 JVM `PickerGeometry`），消除工具条展开/贴边夹逼导致的坐标跳变；③ 框选 ROI 从「只写当前坐标动作的 region、运行时根本不读（白框）」改为用纯 JVM `RoiApplier` **真正应用到脚本内所有读取 region 的位置**（找图/找色/找文字/AI/节点动作、条件树、children、listeners、中止条件），如实显示命中数；④ 修会话内点/框切换丢结果（统一投递回调）、`show()` 幂等吞请求、已有 region 不带入、撤销只恢复 actions 等一批缺陷；⑤ 全部 `"%.4f".format` 统一为 `Locale.US`（`PickerGeometry.fmt`），修德语/法语区小数坐标显示成 `34,5678` 被回填解析清零、ROI 表达式被逗号切碎的隐蔽 bug。新增 3 个测试类 21 例 + 1 例 Locale 回归；同时修 `verify_release.py` 此前只统计 `test-results/test/`（漏 app 单测）的口径 bug，全量单测 **297/297**（core 265 + app 32，35 suite）。权限 8 项零新增、禁用录屏 API 引用 0、v2/v3 同钥可原地升级。**真机验证仍为零**：本版修的是从代码链路读出的确定性逻辑缺陷 + JVM 单测，浮层/窗口/各 ROM 仍待真机回归，详见 `../NymphAuto-v2.7.1-发布说明.md` 与 `ENGINEERING.md` ADR-009/010。
+**v2.7.1 是 bugfix 版**，专修 v2.7.0 发布后反馈的「屏幕拾取起点（非模态）」与「框选搜索区域 ROI / 模板范围」两个功能都有 bug：① 修 `DisposableEffect(pickStamp)` 用会自增的 key 导致浮层刚 `show()` 就被 `onDispose → dismiss()` 关掉（改恒定 `Unit` + `resultSeq` 去重兜底）；② 准星从「手柄窗口中心反算」改为**独立像素真值**（新增纯 JVM `PickerGeometry`），消除工具条展开/贴边夹逼导致的坐标跳变；③ 框选 ROI 从「只写当前坐标动作的 region、运行时不读取（白框）」改为用纯 JVM `RoiApplier` **真正应用到脚本内所有读取 region 的位置**（找图/找色/找文字/AI/节点动作、条件树、children、listeners、中止条件），显示实际值命中数；④ 修会话内点/框切换丢结果（统一投递回调）、`show()` 幂等吞请求、已有 region 不带入、撤销只恢复 actions 等一批缺陷；⑤ 全部 `"%.4f".format` 统一为 `Locale.US`（`PickerGeometry.fmt`），修德语/法语区小数坐标显示成 `34,5678` 被回填解析清零、ROI 表达式被逗号切碎的隐蔽 bug。新增 3 个测试类 21 例 + 1 例 Locale 回归；同时修 `verify_release.py` 此前只统计 `test-results/test/`（漏 app 单测）的口径 bug，全量单测 **297/297**（core 265 + app 32，35 suite）。权限 8 项零新增、禁用录屏 API 引用 0、v2/v3 同钥可原地升级。**真机验证仍为零**：本版修的是从代码链路读出的确定性逻辑缺陷 + JVM 单测，浮层/窗口/各 ROM 仍待真机回归，详见 `../NymphAuto-v2.7.1-发布说明.md` 与 `ENGINEERING.md` ADR-009/010。
 
-v2.7 是**针对汇总反馈的全面改进**：① 坐标拾取从全屏模态改为**非模态穿透双窗口**——全屏绘制层 `FLAG_NOT_TOUCHABLE` 只画不挡触摸，独立 30dp 可拖动小手柄 `FLAG_NOT_TOUCH_MODAL`，**手柄之外照常操作底层 APP**；同时新增框选区域（`PickerRegion`）、局部像素放大镜、控件/颜色中心吸附、±1px 长按连发、标尺开关。② 识别从硬编码 300ms 提速到**帧同步 33ms + `MotionPredictor` 运动外推 + 窄 ROI**，设置页可退回 `LEGACY_300`；`Region.expr` ROI 表达式在 8 个找图/条件调用点接线。③ 修掉「录制刚启动就在点击器里自己记自己」真 bug（`RecordGate` 自扰过滤 + 待命态）与编辑器**数据丢失级 bug**（非 4 类动作被静默改成点击、`children`/`listeners` 被清空），新增步骤/源码双视图、实时语法校验、撤销重做。④ 脚本压缩容器 + `ScriptRepository` 版本/回滚（UI 入口「历史版本」）、mp4 半自动导入生成特征脚本。⑤ 新增 `ENGINEERING.md`（8 条 ADR + 路线图 + 验收状态）与 `tools/verify_release.py`（数字自动核对），并发版前做**接线扫描**补齐 `RoiExpr`/`ScriptRepository` 的生产链路。单测 **248/248**（新增 9 类 52 例），权限表无新增，包体较 v2.6 净减 24,775 字节。**三条如实边界**：1ms 找坐标受截图帧率物理上限不可行、mp4 无触点标签只能半自动、本环境无真机故所有版本仍未真机验证（instrumentation 测试仍为零），详见 `../NymphAuto-v2.7.0-发布说明.md` 与 `ENGINEERING.md`。（历史：v2.6 坐标拾取 + 单步编辑器；v2.5 录制回放保真度；v2.4 动作可视化；v2.3 修 4 个录制/找图真 bug；v2.2 修 6 个真机回归；v2.1 工具链升级；v2.0 Compose 界面重写。）
+v2.7 是**针对汇总反馈的全面改进**：① 坐标拾取从全屏模态改为**非模态穿透双窗口**——全屏绘制层 `FLAG_NOT_TOUCHABLE` 只画不挡触摸，独立 30dp 可拖动小手柄 `FLAG_NOT_TOUCH_MODAL`，**手柄之外照常操作底层 APP**；同时新增框选区域（`PickerRegion`）、局部像素放大镜、控件/颜色中心吸附、±1px 长按连发、标尺开关。② 识别从硬编码 300ms 提速到**帧同步 33ms + `MotionPredictor` 运动外推 + 窄 ROI**，设置页可退回 `LEGACY_300`；`Region.expr` ROI 表达式在 8 个找图/条件调用点接线。③ 修掉「录制刚启动就在点击器里自己记自己」真 bug（`RecordGate` 自扰过滤 + 待命态）与编辑器**数据丢失级 bug**（非 4 类动作被静默改成点击、`children`/`listeners` 被清空），新增步骤/源码双视图、实时语法校验、撤销重做。④ 脚本压缩容器 + `ScriptRepository` 版本/回滚（UI 入口「历史版本」）、mp4 半自动导入生成特征脚本。⑤ 新增 `ENGINEERING.md`（8 条 ADR + 路线图 + 验收状态）与 `tools/verify_release.py`（数字自动核对），并发版前做**接线扫描**补齐 `RoiExpr`/`ScriptRepository` 的生产链路。单测 **248/248**（新增 9 类 52 例），权限表无新增，包体较 v2.6 净减 24,775 字节。**三条按实际情况边界**：1ms 找坐标受截图帧率物理上限不可行、mp4 无触点标签只能半自动、本环境无真机故所有版本仍未真机验证（instrumentation 测试仍为零），详见 `../NymphAuto-v2.7.0-发布说明.md` 与 `ENGINEERING.md`。（历史：v2.6 坐标拾取 + 单步编辑器；v2.5 录制回放保真度；v2.4 动作可视化；v2.3 修 4 个录制/找图真 bug；v2.2 修 6 个真机回归；v2.1 工具链升级；v2.0 Compose 界面重写。）
 
 v2.6 新增**坐标拾取 + 单步动作编辑器**（对标参考录屏里「录脚本」与「一步步添加动作」两条路径）：此前脚本只能靠被动无障碍录制或导入 `.zjs`，无法精确指定落点。新增两条能力：① **超高精度坐标拾取浮层** `CoordinatePicker`——用户主动点「屏幕拾取」后弹出全屏 `TYPE_APPLICATION_OVERLAY`，顶部/左侧 0–100 百分比标尺、可拖动准星、实时读数（像素整数 + 百分比 4 位小数）、±1px 微调，确认后把 `PickerResult` 回传编辑器自动填入；② **单步动作编辑器** `EditorScreen`（沿用原 Material3 主题）——新建脚本或从脚本列表「编辑动作」进入，可添加/编辑/删除/上移/下移动作，类型覆盖点击/长按/双击/滑动，坐标支持手输或拾取，参数含按下时长、滑动时长、重复次数、执行前等待、描述，保存为明文 JSON。**关键边界**：拾取浮层是**编辑器态、用户主动触发、确认/取消即销毁**的模态层，不进录制/回放链路、不订阅任何无障碍事件、不常驻、不加 `FLAG_WATCH_OUTSIDE_TOUCH`，与「录制不打断其他 APP」的硬约束并不冲突（详见四条硬约束第 4 条）；回放期 `VisualizerLayer` 仍是 `FLAG_NOT_TOUCHABLE`，两者不会同时存在。新增 5 例单测（`EditorFormatTest`），累计 **219/219**。权限表无新增、包体增量 32,768 字节。（历史：v2.5 录制回放保真度；v2.4 动作可视化；v2.3 修 4 个录制/找图真 bug；v2.2 修 6 个真机回归；v2.1 工具链升级；v2.0 Compose 界面重写。）
 
-v2.5 修复**录制回放动作失真**（真机录屏复现）：用户在应用抽屉里 12 秒连续翻页，回放却在日历界面执行 15 次慢速滑动并误触打开内容页。根因是被动无障碍录制只上报「滚动容器中心 + 内容滚动增量」，拿不到真实手指轨迹；多数 ROM 的 `scrollDelta` 直接返回 0，旧版据此生成**起点=终点的零长度 SWIPE**，回放退化成点击/长按。修复四处：① `SCROLL → SWIPE` 改为屏幕中轴、受控幅度（默认 34%）、安全边距内的标准翻页，方向只取 delta 符号，幅度绝不依赖不可靠的绝对值；② 连续同向滚动折叠为「1 个动作 + times 次数」由回放循环快速连续翻页，不再把 39 次滚动压成 15 个 400ms 慢速长滑；③ 翻页等待上限收紧到 500ms，避免 12s 操作被 8 段停顿拖成 19s；④ 脚本写入 `startPackage`，回放前比对当前前台包名，界面不一致就明确中止并告知，**不再把动作打在错误界面上还报成功**。设置页新增「录制回放 → 回放界面校验」开关（默认开，可关）；老脚本 / 手写脚本无起始包名自动跳过，行为与 v2.4 完全一致。方向未知、无法还原页面状态等能力边界如实写入告警与脚本描述，不猜落点。新增 18 例单测（`RecordFidelityTest`），累计 **214/214**。权限表无新增、包体增量 16KB。（历史：v2.4 动作可视化；v2.3 修 4 个录制/找图真 bug；v2.2 修 6 个真机回归；v2.1 工具链升级；v2.0 Compose 界面重写。）
+v2.5 修复**录制回放动作失真**（真机录屏复现）：用户在应用抽屉里 12 秒连续翻页，回放却在日历界面执行 15 次慢速滑动并误触打开内容页。根因是被动无障碍录制只上报「滚动容器中心 + 内容滚动增量」，拿不到真实手指轨迹；多数 ROM 的 `scrollDelta` 直接返回 0，旧版据此生成**起点=终点的零长度 SWIPE**，回放退化成点击/长按。修复四处：① `SCROLL → SWIPE` 改为屏幕中轴、受控幅度（默认 34%）、安全边距内的标准翻页，方向只取 delta 符号，幅度绝不依赖不可靠的绝对值；② 连续同向滚动折叠为「1 个动作 + times 次数」由回放循环快速连续翻页，不再把 39 次滚动压成 15 个 400ms 慢速长滑；③ 翻页等待上限收紧到 500ms，避免 12s 操作被 8 段停顿拖成 19s；④ 脚本写入 `startPackage`，回放前比对当前前台包名，界面不一致就明确中止并告知，**不再把动作打在错误界面上还报成功**。设置页新增「录制回放 → 回放界面校验」开关（默认开，可关）；老脚本 / 手写脚本无起始包名自动跳过，行为与 v2.4 完全一致。方向未知、无法还原页面状态等能力边界按实际情况写入告警与脚本描述，不猜落点。新增 18 例单测（`RecordFidelityTest`），累计 **214/214**。权限表无新增、包体增量 16KB。（历史：v2.4 动作可视化；v2.3 修 4 个录制/找图真 bug；v2.2 修 6 个真机回归；v2.1 工具链升级；v2.0 Compose 界面重写。）
 
 v2.4 新增**动作可视化**（设置页「动作可视化」分组，默认关闭）：脚本回放时把真实落点、长按进度、滑动轨迹、多指编号以简洁矢量特效叠加到屏幕，便于在系统录屏下看清自动化流程。实现要点：**零录屏权限**——只用 `TYPE_APPLICATION_OVERLAY` + `FLAG_NOT_TOUCHABLE` 的透明悬浮层，纯硬件加速 Canvas 矢量绘制（圆点/圆环/轨迹带/箭头/数字角标，绝不 `drawText`、绝不模糊后处理、绝不引用 MediaProjection/VirtualDisplay/MediaCodec）；**数据来自动作引擎**——`ScriptRunner` 在 `gesture.dispatch()` 前把最终像素坐标（含 jitter/offset/命中修正）作为 `VisualCue` 上报，不从无障碍事件反推手指，零误差；**默认关闭零回归**——总开关关闭时不 `addView`、不产生回调、不增加任何延迟，与 v2.3 行为完全一致；**不影响找色**——活跃特效的合并包围盒接入 v2.3 `ImageMask` 通路，只在匹配用图像副本上抑制，不改截图/帧缓存/失败存证；**空闲停帧**——`Choreographer` 帧驱动、无活跃 cue 立即停帧，配置表驱动（新增手势只加一行，不动渲染代码）。核心状态机 `VisualCueReducer` 与轨迹采样 `VisualGeometry` 落在纯 JVM `core` 层。新增 24 例单测，累计 **196/196**。四条硬约束未改动、权限表无新增、包体增量 16KB。（历史：v2.3 修 4 个录制/找图真 bug；v2.2 修 6 个真机回归；v2.1 工具链升级；v2.0 Compose 界面重写。）
 
@@ -221,7 +331,7 @@ NymphAuto/
 
 ## 坐标拾取 v2.7.0：非模态穿透 + 帧同步识别（本次主改）
 
-**用户第一诉求**：「甚至可以一边操作拾取坐标，一边可以操作指针外的任意区域」。v2.6 的全屏可触摸模态层盖上之后底层 APP 完全收不到触摸，且底部大按钮常挡住待拾取位置。v2.7 拆成两个窗口（ADR-001）：
+**首要需求**：拾取坐标的同时，指针覆盖区域之外仍可正常操作底层界面。v2.6 的全屏可触摸模态层盖上之后底层 APP 完全收不到触摸，且底部大按钮常挡住待拾取位置。v2.7 拆成两个窗口（ADR-001）：
 
 | 窗口 | 参数 | 作用 |
 |---|---|---|
@@ -267,7 +377,7 @@ NymphAuto/
 
 `SceneGuard`（纯 JVM）负责界面校验：老脚本无起始包名直接跳过，零回归；新脚本界面一致则放行，目标可启动则自动拉起一次，桌面/系统界面无启动入口则**明确中止并提示手动回到录制时的界面**。设置页「录制回放 → 回放界面校验」可关闭。
 
-**诚实的能力边界**：被动无障碍录制无法还原列表滚动位置、页面层级与真实手指轨迹，这些不猜、不硬凑，方向未知 / 需手动回界面都写进告警与脚本描述。若需要像素级复现手势，应改用带坐标的手动编排脚本，而不是依赖事件录制。
+**按实际状态的能力边界**：被动无障碍录制无法还原列表滚动位置、页面层级与真实手指轨迹，这些不猜、不硬凑，方向未知 / 需手动回界面都写进告警与脚本描述。若需要像素级复现手势，应改用带坐标的手动编排脚本，而不是依赖事件录制。
 
 ## 动作可视化（v2.4.0，默认关闭）
 
@@ -314,7 +424,7 @@ gradle :app:assembleRelease :app:assembleDebug
 - **单测 387/387**，failures=0 / errors=0 / skipped=0（45 个 suite）。v2.9.2 新增 24 例：`RecordabilityGuardTest` 14（五态判定、零事件超时、纯函数、必达文案指向视频导入与无限循环、只提示不阻断）+ `LoopPolicyTest` 6（`0`=无限不被当成执行零次、钳制、中文解析、非法输入用 null）+ `VideoScriptBuilderTest` 补 4（默认 1 次零回归、无限循环产物、归一化、循环不改动找图锚定）。v2.9.1 新增 17 例：`SceneGuardPositionalTest` 11（位置敏感识别、同包名/取不到包名/自家界面三条静默放行升级为必达告警、既有四种决策逐字不变、告警只提示不阻断）+ `RunStatsTest` 6（纯手势脚本显示已执行步数、坐标手势不伪装成命中、查找类口径不变、多轮/无限循环文案、零步不误报）。v2.9.0 新增 27 例：`NymphDesignTokensTest` 6（悬浮层色板/尺寸/约束逐槽等于真源、警告色同源、语义色可区分、对比度构造性达标、asArgb 高低位）、`OverlayWindowSpecTest` 6（位掩码与 AOSP 一致、两态 flags、非法 flag 被拒、合法切换、拖动只改 x/y、非位移改动被丢弃）、`AtomicTextFileTest` 7（首次写/覆盖写/20 轮连续覆盖无半截、遗留 tmp 清理不误删、UTF-8 往返、ScriptStore 接线、目录自动创建）、`ScriptMigrationsTest` 8（CURRENT 同源、历史脚本、v1 行为不变、未来版本被挡、非法版本、isSupported、apply 幂等、steps 非负）。v2.8.1 的 319 例全部保留。
 - **aapt2**：`versionCode=20` / `versionName=2.9.2` / `targetSdk 36`；原生库仅 `lib/arm64-v8a/`；权限表与 v2.3～v2.8.1 **完全一致**（8 项），无 `INTERNET` / 网络状态 / 存储 / 电话状态 / 任何录屏或音频类权限。
 - **dex 扫描**（`dexdump` 精确类型/方法引用）：`MediaProjection` / `VirtualDisplay` / `createVirtualDisplay` / `MediaCodec` / `FLAG_SECURE` / `RECORD_AUDIO` / `WATCH_OUTSIDE_TOUCH` / `createScreenCaptureIntent` **全部为 0**（唯一 `Landroid/media/AudioRecord;` 来自 TFLite 传递依赖 `TensorAudio`，非本工程调用）；**959 个** `dev/nymph/auto` 类全部保留原始可读名（无混淆），新增 `NymphDesignTokens` / `OverlayWindowSpec` / `AtomicTextFile` / `ScriptMigrations` / `RunStats` / `RecordabilityGuard` / `LoopPolicy` 等符号已确认进 dex；`verify_release.py` 新增硬门槛：`RecordabilityGuard` 与 `LoopPolicy` 必须真的编进 release dex，否则判 FAIL（ADR-008）。
-- **16 KB 页对齐（v2.9.0 核心修复，实测）**：`tools/check_elf_alignment.py` 逐个解包核验 6 个 so 的 ELF LOAD 段 Align —— 自编译 `libquickjs-jni.so` 由 v2.8.1 的 `0x1000` **实测变为 `0x4000`**；`libandroidx.graphics.path.so` / `libmlkit_google_ocr_pipeline.so` / `libonnxruntime.so` / `libonnxruntime4j_jni.so` 均 `0x4000`；`zipalign -c -P 16` ZIP 条目对齐通过。**如实列出唯一遗留**：TFLite Task Vision 0.4.4 预编译 `libtask_vision_jni.so` 仍 `0x1000`，本工程 CMake 不可控，不冒充修复；16 KB 页设备上其加载失败由 `AiDetector.ensure()` 的 `runCatching` 优雅降级。该核验已接入 `verify_release.py`，自编译 so 未对齐直接判 FAIL。
+- **16 KB 页对齐（v2.9.0 核心修复，实测）**：`tools/check_elf_alignment.py` 逐个解包核验 6 个 so 的 ELF LOAD 段 Align —— 自编译 `libquickjs-jni.so` 由 v2.8.1 的 `0x1000` **实测变为 `0x4000`**；`libandroidx.graphics.path.so` / `libmlkit_google_ocr_pipeline.so` / `libonnxruntime.so` / `libonnxruntime4j_jni.so` 均 `0x4000`；`zipalign -c -P 16` ZIP 条目对齐通过。**明确列出唯一遗留**：TFLite Task Vision 0.4.4 预编译 `libtask_vision_jni.so` 仍 `0x1000`，本工程 CMake 不可控，不误标为已修复；16 KB 页设备上其加载失败由 `AiDetector.ensure()` 的 `runCatching` 优雅降级。该核验已接入 `verify_release.py`，自编译 so 未对齐直接判 FAIL。
 - **界面守卫同包名回归（v2.9.1）**：`SceneGuard.hasPositionalActions` 识别直接派发的坐标手势；含翻页/点击手势时，`PROCEED`（同包名）、`SKIP`（取不到前台包名 / 仍在自家界面）三条静默放行路径全部升级为 `PROCEED_WITH_WARNING`，文案来自 core 单一真源 `positionalWarning`，经 `emitSceneNotice`（日志页 + `RunLog.w` + `onSceneNotice` toast）必达；`RESTORE_APP` 拉起应用后同样送达。守卫关闭 / 老脚本无起始包名亦提示。由 `SceneGuardPositionalTest` 11 例锁死，既有四种决策（默认参数）逐字不变。
 - **执行统计口径回归（v2.9.1）**：core `RunStats` 为单一真源，主循环无条件 `executed++`；`ScriptRunner` 移除内部私有 `RunStats`，`roundSummary` 与轮次日志委托 core 格式化。纯坐标手势脚本总结「已执行 N 步」并标注「无目标校验」，不再全是 0。由 `RunStatsTest` 6 例锁死。
 - **录制可行性判定回归（v2.9.2）**：core `RecordabilityGuard` 纯 JVM 五态判定，自绘界面（有窗口事件、零交互事件）必然得到 `SELF_DRAWN` 与「能力边界 + 视频导入 + 循环」替代路径；零事件超时即使仍在待命也提示检查无障碍；正常录制不打扰；8 秒门槛避免刚进入目标 APP 就误报。由 `RecordabilityGuardTest` 14 例锁死。
@@ -326,7 +436,7 @@ gradle :app:assembleRelease :app:assembleDebug
 - **找色保护**：`RunnerService` 启动回放、`RecordingService.begin()` 均先 `CoordinatePicker.dismiss()`；悬浮编辑面板在拾取期间自动收成 40dp 小球。
 - **接线扫描**：新增 core 符号 `NymphDesignTokens`（Theme.kt + FloatingEditorTheme）、`OverlayWindowSpec`（FloatingEditorService 三处）、`AtomicTextFile`（三个 store）、`ScriptMigrations`（ScriptCodec）均由生产链路消费，无「写了没接」残留。
 - **自动核对**：`python3.11 tools/verify_release.py` 从真实产物只读核对版本/字节数/SHA-256/权限/ABI/v2v3 签名/类数/禁用 API/单测数/源码包/**16KB ELF 对齐**，结论 **PASS**；README 与发布说明数字均引用其输出。
-- **包体**：73,882,407 字节；APK SHA-256 `5eac52d9ab0ce504da213935a0e1388eff05e2d71b9b68b6e9e22550bbec4ae9`。v2/v3 同钥签名，证书 SHA-256 `361722d6…6271`，与 v1.x～v2.9.1 全部历史版本同钥可原地升级。
+- **包体**：v2.9.46 为 74,095,399 字节；APK SHA-256 `853366b9fffdf488555e6721cc3db50a69a5d2ee4a1adbefa7361d86ad6250e5`。v2/v3 同钥签名，证书 SHA-256 `361722d6…6271`，与 v1.x～v2.9.1 全部历史版本同钥可原地升级。
 - **无障碍配置**：`canTakeScreenshot=true`（唯一截图能力）、`canRequestTouchExplorationMode=false`，仅订阅被动语义事件，不含 `typeWindowContentChanged`。
 - **apksigner**：release 包 v2/v3 通过，证书 SHA-256 `361722d6…6271` 与 v1.x 至 v2.8.1 全部历史版本同钥，支持原地升级。
 - **对比视频**：本次链接带签名参数，**成功取回** 19.6MB 真 MP4（720×328 / 60fps / 142s）。逐帧像素差 + 连续帧放大拼接确认面板边缘跳位、可见内容行数变化，作为「窗口反复 relayout」的证据；未据视频推断任何未在源码中确认的行为。
@@ -369,7 +479,7 @@ gradle :app:assembleRelease :app:assembleDebug
 | 机制 | 实现 | 位置 |
 | --- | --- | --- |
 | 能力矩阵四档 | FULL / DEGRADED / RESTRICTED / UNAVAILABLE，运行前浮窗显示，UNAVAILABLE 明确拦截 | `core/runner/CapabilityMatrix.kt` |
-| AAPM 检测 | Android 17 高级防护模式（`QUERY_ADVANCED_PROTECTION_MODE`）检测到即诚实告知，**不绕过** | `app/engine/ScreenSource.kt` |
+| AAPM 检测 | Android 17 高级防护模式（`QUERY_ADVANCED_PROTECTION_MODE`）检测到即明确告知，**不绕过** | `app/engine/ScreenSource.kt` |
 | 敏感页检测 | `isAccessibilityDataSensitive()` → 降档 RESTRICTED 并明示 | `app/engine/NodeFinder.kt` |
 | 预检 | 导入即推导依赖清单（目标包/截图/参考分辨率/方向/图片步数/AI 可用性），环境不符事前拦截 | `core/runner/Preflight.kt` |
 | 后置断言 | 断言失败与坐标未命中分开归因（ASSERT_FAIL / COORD_MISS） | `ScriptRunner.kt` |
@@ -395,7 +505,7 @@ v1.2.0 实机日志停在「开始录制…」后一片空白。根因不是服�
 
 | # | 真 bug | 根因 → 修复 |
 | --- | --- | --- |
-| ① | **回放首次点击必崩（API 26–32）** | `JitterSampler.uniformDeltaMs` 用了 Java 17 / Android API 33 才有的 `java.util.Random.nextLong(origin, bound)`；本工程 minSdk 26 且未启用 core library desugaring，`jitterEnabled` 默认 true、每次点击 DOWN-UP 都调用 → 低版本 `NoSuchMethodError`。v1.2.2 dex 反汇编已坐实该调用 → 改用全 API 可用的 `nextDouble` 均匀抖动；修复后 dex 中 `Ljava/util/Random;.nextLong:(JJ)J` 引用由 1 降为 0 |
+| ① | **回放首次点击必崩（API 26–32）** | `JitterSampler.uniformDeltaMs` 用了 Java 17 / Android API 33 才有的 `java.util.Random.nextLong(origin, bound)`；本工程 minSdk 26 且未启用 core library desugaring，`jitterEnabled` 默认 true、每次点击 DOWN-UP 都调用 → 低版本 `NoSuchMethodError`。v1.2.2 dex 反汇编已证实该调用 → 改用全 API 可用的 `nextDouble` 均匀抖动；修复后 dex 中 `Ljava/util/Random;.nextLong:(JJ)J` 引用由 1 降为 0 |
 | ② | 录制结尾增强丢失 | `RecordingSession.finish()` 停止时立即 `cancel()` + 取快照，队列里最依赖 OCR/模板的点击增强结果未回填就被丢弃 → 关闭队列后以 `CountDownLatch` 有限等待（1200ms 上限）后台排空再编译；保持同步签名，不引入重入竞态 |
 | ③ | OCR 引擎资源泄漏 | `RecordingService` 每次录制 `OcrEngineFactory.create()`（契约要求调用方 `close()`）却从不释放 `OrtSession`/`TextRecognizer` 原生资源（回放侧已正确关闭）→ 提升为成员变量，在增强排空之后与 `onDestroy` 中关闭置空 |
 
@@ -479,15 +589,15 @@ v1.2.1 实机日志确认录制链路完全跑通（65 事件 → 17 步并成�
 | 包信息 | `dev.nymph.auto` v2.9.0(18)，minSdk 26 / targetSdk 36 / compileSdk 36，仅 `arm64-v8a` |
 | 权限核验 | 与 v2.3～v2.8.1 完全一致（8 项）：悬浮窗 / 前台服务（含 specialUse）/ 通知 / 震动 / 电池优化白名单 / AAPM 查询 / 动态接收器；无 INTERNET / 网络状态 / 存储 / 电话状态 / 任何录屏或音频类权限 |
 | 无混淆核验 | dexdump：**972 个**本工程类全部保留原始可读名（含 `NymphDesignTokens` / `OverlayWindowSpec` / `AtomicTextFile` / `ScriptMigrations` / `RecordabilityGuard` / `LoopPolicy` / `OverlayTheme` / `DragGesture` / `WaitGate`），新符号已确认进 dex |
-| 录屏 API | `MediaProjection` / `VirtualDisplay` / `createVirtualDisplay` / `MediaCodec` / `FLAG_SECURE` / `RECORD_AUDIO` / `WATCH_OUTSIDE_TOUCH` / `createScreenCaptureIntent` 类型与方法引用全为 0 |
-| **16KB 页对齐（v2.9.0 核心）** | `tools/check_elf_alignment.py` 实测：自编译 `libquickjs-jni.so` LOAD Align `0x1000 → 0x4000`；6 个 so 中 5 个 `0x4000`，`zipalign -c -P 16` 通过；**如实列出 TFLite 预编译 `libtask_vision_jni.so` 仍 `0x1000`（本工程不可控）**；接入发版硬门槛 PASS |
+| 录屏 API | `MediaProjection` / `VirtualDisplay` / `createVirtualDisplay` / `MediaCodec` / `FLAG_SECURE` / `RECORD_AUDIO` / `WATCH_OUTSIDE_TOUCH` / `createScreenCaptureIntent` / `MediaProjectionManager` / `getMediaProjection` / `ACTION_MEDIA_PROJECTION` 类型与方法引用全为 0；v2.9.43 起由双层门禁强制：dex 层 `BANNED` 13 项 + 源码级 `v2943_no_screen_capture_api` 扫描全量 main 源码非注释代码行，并正向锁定无障碍截图通道。v2.9.44 的场景驱动节点 fallback 走无障碍节点树（零截图），不引入任何录屏 API，双层门禁保持不变 |
+| **16KB 页对齐（v2.9.0 核心）** | `tools/check_elf_alignment.py` 实测：自编译 `libquickjs-jni.so` LOAD Align `0x1000 → 0x4000`；6 个 so 中 5 个 `0x4000`，`zipalign -c -P 16` 通过；**明确列出 TFLite 预编译 `libtask_vision_jni.so` 仍 `0x1000`（本工程不可控）**；接入发版硬门槛 PASS |
 | 包体增量 | 与 v2.8.1 同为 73,866,023 字节（改动全为纯 JVM 逻辑 + linker flags，zipalign 后凑巧同尺寸，SHA 已变） |
 | 签名 | 测试密钥 `nymphauto.jks`（CN=NymphAuto，证书 SHA-256 `361722d6…6271`），与 v1.x 至 v2.8.1 全部历史版本同钥，支持原地升级 |
 | 自动核对 | `python3.11 tools/verify_release.py` → **PASS**（版本/字节数/SHA/权限/ABI/签名/类数/禁用 API/单测/源码包/**16KB ELF 对齐**全部取自真实产物） |
 
 **体积说明**：v1.1.0 为 30.6 MB，本版增量几乎全部来自 ONNX Runtime 1.31.1 完整 operator 库 `libonnxruntime.so`（解压后 34.2 MB）。ABI 仍只有 arm64-v8a。如不需要离线 ONNX 通道，移除 `com.microsoft.onnxruntime:onnxruntime-android` 依赖重新打包即可回到约 30MB，OCR 自动降级到 ML Kit / 节点文本，录制与回放不受影响。
 
-## 已知边界（如实说明）
+## 已知边界（按实际情况说明）
 
 - 离线 ONNX OCR 需自备 PP-OCR 兼容的 `det.onnx` / `rec.onnx` / `keys.txt`；未放置时自动回退。ML Kit 兜底依赖 GMS 已缓存模型，而 APK 无 `INTERNET` 权限，该通道在无 GMS 设备上不可用。
 - 被动语义事件由目标 APP 的 View 实现决定：自绘界面（游戏 / Flutter / 部分 Compose）可能不产生 `TYPE_VIEW_CLICKED`，此时由 OCR / 模板 / 坐标锚点补足，**无法保证 100% 还原多点触控、压力等手势细节**。

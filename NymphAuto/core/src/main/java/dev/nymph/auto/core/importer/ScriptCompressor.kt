@@ -1,5 +1,6 @@
 package dev.nymph.auto.core.importer
 
+import java.util.Locale
 import dev.nymph.auto.core.model.Action
 import dev.nymph.auto.core.model.Condition
 import dev.nymph.auto.core.model.Listeners
@@ -31,12 +32,15 @@ import java.util.zip.Inflater
  * 无感知**，不需要改动任何找图代码。老脚本（无 assets 字段）解析为空 Map，
  * 行为与 v2.6.0 一致。
  *
- * 安全：解压设 64MB 上限，防畸形/恶意文件把内存打爆。
+ * 安全：解压设 64MB 上限，防畸形/恶意文件把内存耗尽。
  */
 object ScriptCompressor {
 
     const val MAGIC = "NAZ1:"
     private const val REF_PREFIX = "ref:"
+    /** v3.0.2 画布资源前缀：随脚本留存、不参与 ref: 展开清空。 */
+    private const val CANVAS_PREFIX = "canvas:"
+    private const val FEAT_PREFIX = "feat:"
     private const val MIN_DEDUP_LEN = 256
     private const val MAX_INFLATED_BYTES = 64 * 1024 * 1024
 
@@ -105,7 +109,12 @@ object ScriptCompressor {
 
     /** 模板去重：返回带 assets 的等价脚本。 */
     fun dedup(script: Script): Script {
+        // v3.0.2：画布资源（canvas:/feat:）是持久资源，不能像 ref: 那样被展开清空，
+        // 必须先原样并入 assets，再叠加本轮动作模板去重结果。
         val assets = LinkedHashMap<String, String>()
+        script.assets.forEach { (k, v) ->
+            if (k.startsWith(CANVAS_PREFIX) || k.startsWith(FEAT_PREFIX)) assets.putIfAbsent(k, v)
+        }
         fun ref(b64: String): String {
             if (b64.length < MIN_DEDUP_LEN || b64.startsWith(REF_PREFIX)) return b64
             val key = REF_PREFIX + sha16(b64)
@@ -125,11 +134,16 @@ object ScriptCompressor {
         if (script.assets.isEmpty()) return script
         fun deref(v: String): String =
             if (v.startsWith(REF_PREFIX)) script.assets[v] ?: v else v
+        // v3.0.2：只清空 ref: 去重条目；画布资源（canvas:/feat:）必须随脚本留存，
+        // 否则画布底图/特征模板在解码后丢失，"后续维护"无从谈起。
+        val kept = script.assets.filter { (k, _) ->
+            k.startsWith(CANVAS_PREFIX) || k.startsWith(FEAT_PREFIX)
+        }
         return script.copy(
             actions = walkActions(script.actions, ::deref),
             listeners = walkListeners(script.listeners, ::deref),
             abortCondition = script.abortCondition?.let { walkCondition(it, ::deref) },
-            assets = emptyMap(),
+            assets = kept,
         )
     }
 
@@ -177,11 +191,17 @@ object ScriptCompressor {
         try {
             inf.setInput(bytes)
             val buf = ByteArray(8192)
+            // v2.9.35：损坏/非 deflate 载荷可能让 inflate 返回 0 且既不需字典也不需
+            // 新输入，此前无跳出分支 → 空转死循环卡死脚本加载线程与界面。空转计数
+            // 达上限即放弃。
+            var stalls = 0
             while (!inf.finished()) {
                 val n = inf.inflate(buf)
                 if (n == 0) {
                     if (inf.needsDictionary() || inf.needsInput()) break
+                    if (++stalls >= 3) return null
                 } else {
+                    stalls = 0
                     bos.write(buf, 0, n)
                 }
                 if (bos.size() > MAX_INFLATED_BYTES) return null
@@ -194,6 +214,6 @@ object ScriptCompressor {
 
     private fun sha16(s: String): String {
         val d = MessageDigest.getInstance("SHA-256").digest(s.toByteArray(Charsets.UTF_8))
-        return d.take(8).joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        return d.take(8).joinToString("") { String.format(Locale.US, "%02x", it.toInt() and 0xff) }
     }
 }

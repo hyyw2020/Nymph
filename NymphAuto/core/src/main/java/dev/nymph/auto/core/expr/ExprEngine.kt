@@ -54,7 +54,9 @@ class ConditionEvaluator(private val engine: ExprEngine) {
             dev.nymph.auto.core.model.ConditionKind.JS_EXPR ->
                 runCatching { engine.evalBool(cond.jsExpr, vars) }.getOrDefault(false)
             dev.nymph.auto.core.model.ConditionKind.RANDOM ->
-                (0..100).random() < cond.randomPercent.coerceIn(0, 100)
+                // v2.9.35：采样域 0..100 共 101 值，100% 时取到 100 会被
+                // `100 < 100` 误判为不满足（1/101 概率漏触发）。改 0 until 100。
+                (0 until 100).random() < cond.randomPercent.coerceIn(0, 100)
             dev.nymph.auto.core.model.ConditionKind.RUN_COUNT ->
                 runCount(runCountKey) < cond.runCountLimit
             dev.nymph.auto.core.model.ConditionKind.COMBINE -> {
@@ -62,7 +64,9 @@ class ConditionEvaluator(private val engine: ExprEngine) {
                 when (cond.combine) {
                     dev.nymph.auto.core.model.Combine.ALL -> results.all { it }
                     dev.nymph.auto.core.model.Combine.ANY -> results.any { it }
-                    dev.nymph.auto.core.model.Combine.N -> results.count { it } >= cond.runCountLimit
+                    // v2.9.35：runCountLimit 默认 0，未填阈值时 >=0 恒真，
+                    // 组合条件形同不存在；对齐 ScriptRunner 主路径的 coerceAtLeast(1)。
+                    dev.nymph.auto.core.model.Combine.N -> results.count { it } >= cond.runCountLimit.coerceAtLeast(1)
                 }
             }
             // APPEAR_* / INTERVAL 由 app 层视觉与状态机求值后经 vars 注入，

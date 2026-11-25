@@ -12,7 +12,7 @@ import kotlin.math.hypot
  * 结果留下两个真实缺陷：
  *  1. `onTouchEvent(ACTION_DOWN)` 返回 false。落点在状态文字这类非 clickable
  *     区域时 DOWN 未被任何 View 消费，面板不会成为 touch target，后续 MOVE
- *     根本不再派发过来 —— 面板实际拖不动；
+ *     不再派发过来 —— 面板实际无位移响应；
  *  2. `onInterceptTouchEvent` 每次 MOVE 都覆盖 `lastX/lastY`，与 onTouchEvent
  *     共用的增量基准互相打架，拦截路径下首帧位移丢失或突跳。
  *

@@ -112,16 +112,24 @@ object ZdjlImporter {
     }
 
     private fun importWhole(root: JsonObject, curVerCode: Int): Importer.Result? {
-        // zdjl 脚本可能带外层壳：{"script": {...}} 或直接是动作列表壳
-        val s = root["script"]?.jsonObject ?: root["scriptBean"]?.jsonObject ?: root
+        // v2.9.35：外层壳取值此前用会抛异常的 .jsonObject，字段是字符串/标量时
+        // 直接在导入主路径抛出（外层调用无 try）→ 整个导入崩溃。改用安全转型，
+        // 单个坏字段退化为按原对象处理，不中断导入。
+        val s = (root["script"] as? JsonObject)
+            ?: (root["scriptBean"] as? JsonObject)
+            ?: root
         val minVer = s["minVerCode"]?.jsonPrimitive?.intOrNull ?: 0
         if (minVer > curVerCode) return null // 版本协商：由调用方转换为 Fail.VersionTooOld
 
         val stats = Stats()
         val actions = mutableListOf<Action>()
-        val rawActions = s["actions"]?.jsonArray ?: s["actionList"]?.jsonArray ?: s["config"]?.jsonArray
+        // v2.9.35：actions 标量/对象形态用 as? 安全转型；循环内每个元素也用 as?，
+        // 避免某个标量元素触发 el.jsonObject 抛异常穿透整个导入。
+        val rawActions = (s["actions"] as? JsonArray)
+            ?: (s["actionList"] as? JsonArray)
+            ?: (s["config"] as? JsonArray)
         rawActions?.forEach { el ->
-            el.jsonObject.takeIf { it.isNotEmpty() }?.let { obj ->
+            (el as? JsonObject)?.takeIf { it.isNotEmpty() }?.let { obj ->
                 // 单动作级隔离：单个动作结构异常不拖垮整包（宽容导入）
                 runCatching { convertAction(obj, actions, stats, 0) }
                     .onFailure { stats.skipped++ }
@@ -357,10 +365,14 @@ object ZdjlImporter {
         val (ux, uy, unit) = readPoint(obj)
         val end = obj["endPosData"]?.jsonObject ?: obj["posData2"]?.jsonObject
         val (ux2, uy2, _) = if (end != null) readPoint(end) else Triple(0.0, 0.0, CoordUnit.PCT)
+        // v2.9.35：动作级 repeatCount=0 在 zdjl 语义中是"无限"，与顶层一致。
+        // 此前这里 coerceAtLeast(1) 把无限吞成 1 次，同一字段在不同动作类型上
+        // 出现"无限"与"1 次"两种相反结果。统一保留 0。
+        val rc = readRepeatCount(obj, base.times).first.coerceAtLeast(0)
         return base.copy(
             type = type,
             x = ux, y = uy, x2 = ux2, y2 = uy2, unit = unit,
-            times = readRepeatCount(obj, 1).first.coerceAtLeast(1),
+            times = rc,
         )
     }
 
@@ -441,9 +453,16 @@ object ZdjlImporter {
             text = obj["text"]?.jsonPrimitive?.contentOrNull
                 ?: (cText?.get("text") as? JsonObject)?.get("text")?.jsonPrimitive?.contentOrNull
                 ?: (cText?.get("text") as? JsonPrimitive)?.contentOrNull ?: "",
+            // v2.9.35：v2.21 的 colorData 是对象（见 readCondition 的 color 分支），
+            // 对其调 .jsonPrimitive 会抛异常，被单动作隔离吞掉后整条点击颜色动作丢失。
+            // 改为安全转型：对象形态取其 color/data 子字段，标量形态直取。
             color = parseColor(obj["color"]?.jsonPrimitive?.contentOrNull
                 ?: cond?.get("color")?.jsonPrimitive?.contentOrNull
-                ?: cond?.get("colorData")?.jsonPrimitive?.contentOrNull),
+                ?: (cond?.get("colorData") as? JsonPrimitive)?.contentOrNull
+                ?: (cond?.get("colorData") as? JsonObject)?.let { cd ->
+                    (cd["color"] as? JsonPrimitive)?.contentOrNull
+                        ?: (cd["data"] as? JsonPrimitive)?.contentOrNull
+                }),
             colorSimilarity = obj["minSimilarPercent"]?.jsonPrimitive?.intOrNull
                 ?: obj["colorSimilarity"]?.jsonPrimitive?.intOrNull
                 ?: cond?.get("minSimilarPercent")?.jsonPrimitive?.intOrNull ?: 90,
@@ -636,12 +655,14 @@ object ZdjlImporter {
     }
 
     private fun readListeners(obj: JsonObject): Listeners {
+        // v2.9.35：数组元素此前用 el.jsonObject 强转，标量元素直接抛异常穿透
+        // 导入主路径；改 as? 安全转型，坏元素跳过不拖垮整包。
         fun list(key: String) = (obj[key] as? JsonArray)?.mapNotNull { el ->
-            convertOne(el.jsonObject, Stats())
+            (el as? JsonObject)?.let { convertOne(it, Stats()) }
         }.orEmpty()
         // v2.21 起回调是 scriptCallbacks:{"时机名": 单个动作} 的字典；旧版是顶层 listener* 数组；
         // 脚本级（.zjs 第 1 行元数据）的回调字典叫 globalCallbacks
-        val callbacks = obj["scriptCallbacks"]?.jsonObject ?: obj["globalCallbacks"]?.jsonObject
+        val callbacks = (obj["scriptCallbacks"] as? JsonObject) ?: (obj["globalCallbacks"] as? JsonObject)
         fun cb(key: String): List<Action> {
             val v = callbacks?.get(key) ?: obj[key] ?: return emptyList()
             val one = (v as? JsonObject)?.let { convertOne(it, Stats()) }

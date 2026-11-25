@@ -65,11 +65,27 @@ object LineImporter {
                 val set = obj["scriptSet"] as? kotlinx.serialization.json.JsonArray ?: run { stats.skipped++; return }
                 val repeat = (obj["repeatCount"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 1).coerceIn(1, 100)
                 val tmp = mutableListOf<Action>()
-                set.forEach { c -> convertLineAction(c.jsonObject, tmp, stats, depth + 1) }
+                set.forEach { c ->
+                    (c as? kotlinx.serialization.json.JsonObject)?.let {
+                        convertLineAction(it, tmp, stats, depth + 1)
+                    }
+                }
                 repeat(repeat) { out.addAll(tmp) }
             }
             "点击", "长按", "滑动" -> convertLinePoint(obj)?.let { out.add(it) } ?: run { stats.skipped++ }
-            "控制执行", "等待" -> { /* 纯延时：并入上一个动作的 waitMs */ }
+            // v2.9.35：此前分支体为空，行分隔脚本里显式的"等待/控制执行"延时整条
+            // 丢失，回放节奏过快、界面未就绪就点空。把延时并入上一个动作的 waitMs。
+            "控制执行", "等待" -> {
+                val delayMs = obj["delay"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
+                    ?: obj["time"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
+                    ?: obj["milliseconds"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
+                    ?: obj["timeValue"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
+                    ?: 0L
+                if (delayMs > 0 && out.isNotEmpty()) {
+                    val last = out.removeAt(out.size - 1)
+                    out.add(last.copy(waitMs = last.waitMs + delayMs))
+                } else stats.skipped++
+            }
             else -> stats.skipped++
         }
     }
@@ -77,16 +93,25 @@ object LineImporter {
     private fun convertLinePoint(obj: JsonObject): Action? {
         val pos = obj["posData"]?.jsonObject ?: return null
         val type = obj["type"]?.jsonPrimitive?.contentOrNull ?: "点击"
-        val x = parsePercent(pos["x"]?.jsonPrimitive?.contentOrNull)
-        val y = parsePercent(pos["y"]?.jsonPrimitive?.contentOrNull)
-        if (x <= 0.0 && y <= 0.0) return null
+        // v2.9.40（P0-09）：原 parsePercent 失败补 0.0，导致「x 解析失败、y 合法」的
+        // 点被保留成 (0,45) 贴左边框点击，用户看到脚本乱点且无从排查。解析失败改为
+        // 丢弃整条（上层 skipped++ 并在导入摘要可见）。
+        // v2.9.42（③）：此前残留 `x<=0&&y<=0` 起点双零丢弃，与 v2.9.41「终点合法零
+        // 坐标保留」口径不一致——从屏幕左上角 (0,0) 出发的合法角滑被整条丢弃。
+        // x/y 既已由 parsePercent 保证为解析成功的非负有限值，(0,0) 即合法坐标；
+        // 起点与终点统一为「解析成功即保留」，不再对起点双零另设丢弃。
+        val x = parsePercent(pos["x"]?.jsonPrimitive?.contentOrNull) ?: return null
+        val y = parsePercent(pos["y"]?.jsonPrimitive?.contentOrNull) ?: return null
         var x2 = 0.0; var y2 = 0.0
         if (type == "滑动") {
+            // v2.9.41（①）：起点已改为解析失败即丢整条，终点此前仍 `?: 0.0`，
+            // endPosData 缺失或终点坐标非法时会生成「从 (x,y) 滑到 (0,0)」的 SWIPE，
+            // 而 (0,0) 是合法屏幕坐标、下游无任何拦截，用户看到脚本乱滑到左上角。
+            // 与起点同款语义：终点整体缺失或任一坐标非法/非有限 → 丢弃整条（上层 skipped++）。
             val end = obj["endPosData"]?.jsonObject ?: obj["posData2"]?.jsonObject
-            if (end != null) {
-                x2 = parsePercent(end["x"]?.jsonPrimitive?.contentOrNull)
-                y2 = parsePercent(end["y"]?.jsonPrimitive?.contentOrNull)
-            }
+                ?: return null
+            x2 = parsePercent(end["x"]?.jsonPrimitive?.contentOrNull) ?: return null
+            y2 = parsePercent(end["y"]?.jsonPrimitive?.contentOrNull) ?: return null
         }
         val repeat = obj["repeatCount"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 1
         return Action(
@@ -108,8 +133,11 @@ object LineImporter {
         )
     }
 
-    private fun parsePercent(raw: String?): Double =
-        raw?.trim()?.removeSuffix("%")?.toDoubleOrNull() ?: 0.0
+    /** 解析百分比坐标；非数字、NaN、无穷、负值一律视为解析失败（返回 null）。 */
+    private fun parsePercent(raw: String?): Double? {
+        val v = raw?.trim()?.removeSuffix("%")?.toDoubleOrNull() ?: return null
+        return if (v.isFinite() && v >= 0.0) v else null
+    }
 
     private fun parseOrRepair(line: String, stats: Stats): JsonObject? {
         runCatching { return LenientJson.parseToJsonElement(line).jsonObject }

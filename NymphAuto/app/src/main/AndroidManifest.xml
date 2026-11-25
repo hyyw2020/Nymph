@@ -22,10 +22,16 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!--
+      争抢录屏权限取帧模式（HudCaptureService）：Android 14+ 用 MediaProjection
+      必须以前台服务运行并声明此权限。该模式为用户显式选择的增强选项，默认仍走
+      无障碍截图（不争抢）。权限本身不申请网络，不影响零 INTERNET 契约。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-    <!-- AAPM（高级保护模式）状态查询：Android 16+；开启时自动化工具无豁免，需诚实告知 -->
+    <!-- AAPM（高级保护模式）状态查询：Android 16+；开启时自动化工具无豁免，需明确告知 -->
     <uses-permission android:name="android.permission.QUERY_ADVANCED_PROTECTION_MODE" />
 
     <!-- Android 11+ 包可见性：只声明脚本需要打开/查询的 App，替代 QUERY_ALL_PACKAGES -->
@@ -61,6 +67,17 @@
             android:parentActivityName=".ui.MainActivity" />
 
         <!--
+          崩溃可见诊断页（v2.9.38）。独立进程 :crash：主进程崩溃被系统结束后此页仍可显示，
+          把完整堆栈直接呈现给用户截图/分享，解决「打开即闪退、进不去日志页」的证据缺口。
+          无网络、无导出 provider，仅本机文本展示。
+        -->
+        <activity
+            android:name=".ui.CrashReportActivity"
+            android:exported="false"
+            android:process=":crash"
+            android:theme="@style/AppTheme" />
+
+        <!--
           无障碍服务：手势注入 + 截图（Android 11+）+ 节点树。
           注意 canTakeScreenshot 而非 MediaProjection —— 不与用户录屏抢权限。
         -->
@@ -86,6 +103,17 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="本地脚本无障碍手势自动执行（dispatchGesture 触摸注入，不读取屏幕内容，不创建录屏会话）" />
         </service>
+
+        <!--
+          HUD 取帧服务（争抢录屏权限模式，用户显式选择时启用）。
+          仅用于 MediaProjection 取帧：Android 14+ 要求 MediaProjection 以前台服务运行，
+          foregroundServiceType=mediaProjection。默认不启动，仍走无障碍截图（不争抢）。
+          零网络、无导出、不可被外部 App 绑定。
+        -->
+        <service
+            android:name=".service.HudCaptureService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
 
         <!--
           录制编排服务（前台服务 specialUse）。

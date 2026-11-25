@@ -50,7 +50,7 @@ NymphAuto 对上游代码以 **vendored 源码 / Maven 固定版本依赖** 两�
 | `com.google.android.material:material` | 1.14.0 | UI 组件 | Apache-2.0 |
 | `junit:junit`（仅测试期，不随 APK 分发） | 4.13.2 | 单元测试 | EPL-1.0 |
 
-### 3.1 版本选择说明（工具链上限，如实记录）
+### 3.1 版本选择说明（工具链上限，按实际情况记录）
 
 「使用最新版本」受构建工具链约束，以下为**当前工具链支持的最新 release**，
 未盲目取最高版本号：
@@ -73,7 +73,7 @@ NymphAuto 对上游代码以 **vendored 源码 / Maven 固定版本依赖** 两�
   未迁移原因：`ObjectDetector` 属 TFLite Task Vision 高层 API，
   LiteRT 2.x 的 `CompiledModel` 无对应封装，迁移需重写检测后处理与 NMS；
   现有 `tensorflow-lite-task-vision:0.4.4` 仍可用且模型 `.tflite` 格式兼容，
-  故保留并在本表如实固定版本，避免无收益的破坏性升级。
+  故保留并在本表按实际情况固定版本，避免无收益的破坏性升级。
 
 ## 4. 模型与二进制资产
 

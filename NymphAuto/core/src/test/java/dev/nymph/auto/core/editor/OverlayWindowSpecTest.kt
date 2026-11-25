@@ -16,8 +16,16 @@ class OverlayWindowSpecTest {
     fun `flag 位掩码与 AOSP WindowManager 常量一致`() {
         assertEquals(0x00000008, OverlayWindowSpec.FLAG_NOT_FOCUSABLE)
         assertEquals(0x00000020, OverlayWindowSpec.FLAG_NOT_TOUCH_MODAL)
-        assertEquals(0x28, OverlayWindowSpec.STANDARD_FLAGS)
-        assertEquals(0x20, OverlayWindowSpec.INPUT_FLAGS)
+        assertEquals(0x00000100, OverlayWindowSpec.FLAG_LAYOUT_IN_SCREEN)
+        assertEquals(0x00000200, OverlayWindowSpec.FLAG_LAYOUT_NO_LIMITS)
+        // v2.9.18：两种受控态均含全屏绝对坐标布局标志（修悬浮窗可见但位移交互未生效的根因）。
+        // 0x08(NOT_FOCUSABLE)|0x20(NOT_TOUCH_MODAL)|0x100(IN_SCREEN)|0x200(NO_LIMITS)
+        assertEquals(0x328, OverlayWindowSpec.STANDARD_FLAGS)
+        assertEquals(0x320, OverlayWindowSpec.INPUT_FLAGS)
+        assertTrue(OverlayWindowSpec.STANDARD_FLAGS and OverlayWindowSpec.FLAG_LAYOUT_IN_SCREEN != 0)
+        assertTrue(OverlayWindowSpec.STANDARD_FLAGS and OverlayWindowSpec.FLAG_LAYOUT_NO_LIMITS != 0)
+        assertTrue(OverlayWindowSpec.INPUT_FLAGS and OverlayWindowSpec.FLAG_LAYOUT_IN_SCREEN != 0)
+        assertTrue(OverlayWindowSpec.INPUT_FLAGS and OverlayWindowSpec.FLAG_LAYOUT_NO_LIMITS != 0)
     }
 
     @Test
@@ -37,7 +45,7 @@ class OverlayWindowSpecTest {
     fun `只允许两种受控 flags 任何新增 flag 都被拒绝`() {
         assertTrue(OverlayWindowSpec.isAllowed(OverlayWindowSpec.STANDARD_FLAGS))
         assertTrue(OverlayWindowSpec.isAllowed(OverlayWindowSpec.INPUT_FLAGS))
-        // 后来者顺手加 NOT_TOUCHABLE / WATCH_OUTSIDE_TOUCH / SECURE 都会失败
+        // 后来者一并添加 NOT_TOUCHABLE / WATCH_OUTSIDE_TOUCH / SECURE 都会失败
         assertFalse(OverlayWindowSpec.isAllowed(OverlayWindowSpec.STANDARD_FLAGS or 0x00000010))
         assertFalse(OverlayWindowSpec.isAllowed(OverlayWindowSpec.STANDARD_FLAGS or 0x00040000))
         assertFalse(OverlayWindowSpec.isAllowed(OverlayWindowSpec.STANDARD_FLAGS or 0x00002000))
@@ -94,5 +102,40 @@ class OverlayWindowSpecTest {
         assertTrue(OverlayWindowSpec.isPositionOnlyUpdate(before, before.copy(y = 21)))
         // 完全没动不算「有效提交」，应被丢弃（与 shouldCommit 的 1px 阈值呼应）
         assertFalse(OverlayWindowSpec.isPositionOnlyUpdate(before, before))
+    }
+
+    // ------------------------------------------------------------ v2.9.21 IME 焦点位级切换
+
+    @Test
+    fun `位级焦点切换在标准态可聚焦且仅动焦点位`() {
+        val before = OverlayWindowSpec.STANDARD_FLAGS
+        val after = OverlayWindowSpec.focusableFlags(before, true)
+        assertTrue(OverlayWindowSpec.isFocusable(after))
+        assertTrue(OverlayWindowSpec.isFocusToggleOnly(before, after))
+        assertEquals(before and OverlayWindowSpec.FLAG_NOT_FOCUSABLE.inv(), after)
+        // 非模态透传位保留
+        assertTrue(after and OverlayWindowSpec.FLAG_NOT_TOUCH_MODAL != 0)
+    }
+
+    @Test
+    fun `系统追加标志位时位级切换仍生效 不受严格相等闸阻断`() {
+        // 模拟 OEM ROM 在 addView 之后追加的未知标志位
+        val withExtra = OverlayWindowSpec.STANDARD_FLAGS or 0x00040000 or 0x00002000
+        assertFalse(OverlayWindowSpec.isAllowed(withExtra))
+        val focusable = OverlayWindowSpec.focusableFlags(withExtra, true)
+        assertTrue(OverlayWindowSpec.isFocusable(focusable))
+        // 追加位逐字保留
+        assertEquals(withExtra and 0x00042000, focusable and 0x00042000)
+        val restored = OverlayWindowSpec.focusableFlags(focusable, false)
+        assertFalse(OverlayWindowSpec.isFocusable(restored))
+        assertEquals(withExtra, restored)
+    }
+
+    @Test
+    fun `失焦恢复逐位还原初始标志`() {
+        val s = OverlayWindowSpec.STANDARD_FLAGS
+        val restored = OverlayWindowSpec.focusableFlags(
+            OverlayWindowSpec.focusableFlags(s, true), false)
+        assertEquals(s, restored)
     }
 }

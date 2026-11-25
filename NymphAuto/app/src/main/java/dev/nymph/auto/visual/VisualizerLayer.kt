@@ -14,6 +14,7 @@ import dev.nymph.auto.core.visual.VisualConfig
 import dev.nymph.auto.core.visual.VisualCue
 import dev.nymph.auto.core.visual.VisualCueReducer
 import dev.nymph.auto.core.vision.ImageMask
+import dev.nymph.auto.engine.SceneDebugBox
 
 /**
  * 动作可视化的窗口层：只依赖 Context + WindowManager 的独立组件。
@@ -59,22 +60,25 @@ class VisualizerLayer(
     /** 运行中切换配置：从关到开补 addView，从开到关立即清理。 */
     fun updateConfig(cfg: VisualConfig) {
         reducer.updateConfig(cfg)
-        if (cfg.enabled && !enabled) {
+        val needWindow = cfg.enabled || cfg.sceneDebugEnabled
+        if (needWindow && !enabled) {
             enabled = true
             ensureAttached()
-        } else if (!cfg.enabled && enabled) {
+        } else if (!needWindow && enabled) {
             enabled = false
             detach()
         }
+        // 场景诊断开关关闭时立即清空残留框，避免窗口仍显示上一轮的静态层
+        if (!cfg.sceneDebugEnabled) view?.sceneBoxes = emptyList()
         view?.currentRestrained = cfg.restrained
     }
 
-    /** 运行开始时调用：按当前配置决定是否挂载窗口。 */
+    /** 运行开始时调用：手势特效或场景诊断任一开关启用即挂载窗口。 */
     fun start() {
         val cfg = configProvider()
         reducer.clear()
         lastBoundsPx = null
-        enabled = cfg.enabled
+        enabled = cfg.enabled || cfg.sceneDebugEnabled
         if (enabled) ensureAttached()
         view?.currentRestrained = cfg.restrained
     }
@@ -83,7 +87,7 @@ class VisualizerLayer(
         if (attached) return
         if (!Settings.canDrawOverlays(ctx)) {
             // 没权限只关闭自身，绝不阻塞脚本执行
-            RunLog.w("Visual", "缺少悬浮窗权限，动作可视化已静默关闭（脚本不受影响）")
+            RunLog.w("Visual", "缺少悬浮窗权限，回放可视化已静默关闭（脚本不受影响）")
             enabled = false
             return
         }
@@ -148,6 +152,27 @@ class VisualizerLayer(
         }.onFailure { RunLog.w("Visual", "cue 入队失败：${it.javaClass.simpleName}") }
     }
 
+    /**
+     * 场景规则诊断覆盖层出口（复用同一 overlay 窗口，零新增窗口/权限/前台服务，
+     * `FLAG_NOT_TOUCHABLE` 不拦截触摸）。
+     *
+     * v2.9.16 起由**独立开关** `VisualConfig.sceneDebugEnabled` 控制，与手势特效
+     * 总开关解耦：单独开启即可显示每条规则的 ROI 框、命中状态与落点，不需要先打开
+     * 动作可视化。`ScriptRunner` 每轮恒定构造纯数据框并回调本方法（成本仅为 N 个数据
+     * 对象），是否绘制由此处判定；关闭时只清空静态层，不占用 vsync 帧循环。
+     */
+    fun onSceneDebug(boxes: List<SceneDebugBox>) {
+        if (!configProvider().sceneDebugEnabled) return
+        if (!attached) {
+            enabled = true
+            ensureAttached()
+        }
+        val v = view ?: return
+        v.sceneBoxes = boxes
+        if (boxes.isNotEmpty()) v.visibility = View.VISIBLE
+        v.invalidate()
+    }
+
     // ------------------------------------------------------------ 帧循环
 
     private fun startFrameLoop() {
@@ -175,7 +200,9 @@ class VisualizerLayer(
         v.currentRestrained = configProvider().restrained
         runCatching { v.submit(f) }
         if (f.isEmpty) {
-            v.visibility = View.GONE // 无动画：停帧，不再 post 下一帧
+            // v2.9.15：还有场景调试框要常驻显示时不能隐藏窗口（框由 onSceneDebug
+            // 直接 invalidate 更新，不需要持续 vsync），否则「等待场景出现」时框会闪一下就没。
+            if (v.sceneBoxes.isEmpty()) v.visibility = View.GONE
         } else {
             startFrameLoop()
         }

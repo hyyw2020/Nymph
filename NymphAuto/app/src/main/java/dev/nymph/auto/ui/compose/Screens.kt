@@ -1,6 +1,7 @@
 package dev.nymph.auto.ui.compose
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,6 +27,7 @@ import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -35,6 +37,8 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -44,14 +48,23 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import dev.nymph.auto.core.editor.ExecutionParadigm
+import dev.nymph.auto.core.editor.ScenePreset
 import dev.nymph.auto.core.runner.PollMode
 import dev.nymph.auto.core.runner.RecognitionTuning
 import dev.nymph.auto.core.visual.VisualConfig
+import dev.nymph.auto.ui.DragDiagnostics
 import java.util.Locale
 
 // ---------------------------------------------------------------- 脚本库
@@ -69,6 +82,7 @@ fun ScriptsScreen(
     onDelete: (String) -> Unit,
     onImport: () -> Unit,
     onVideoImport: () -> Unit = {},
+    onSimpleTap: () -> Unit = {},
     onStopRun: () -> Unit,
 ) {
     val filtered = if (state.query.isBlank()) {
@@ -81,6 +95,9 @@ fun ScriptsScreen(
         }
     }
     val totalSteps = state.scripts.sumOf { it.steps }
+
+    // A 减负：次要入口（快速点击 / 视频导入）收进溢出菜单，顶栏只留主动作。
+    var moreExpanded by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize()) {
         if (state.running) {
@@ -136,23 +153,44 @@ fun ScriptsScreen(
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 2.dp),
+                .padding(horizontal = Ds.LG, vertical = Ds.XS),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                "共 ${state.scripts.size} 个脚本 · 合计 $totalSteps 步",
-                style = MaterialTheme.typography.labelSmall,
+                "共 ${state.scripts.size} 个脚本 · 合计 $totalSteps 个场景",
+                style = Ds.Label,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.weight(1f),
             )
+            // 主动作：新建脚本（唯一常驻按钮，保证标题/统计不再被挤）
             TextButton(onClick = onCreate) {
                 Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(4.dp))
                 Text("新建脚本")
             }
-            TextButton(onClick = onVideoImport) { Text("视频导入") }
             if (state.loading) {
                 CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp)
+            }
+            // 次要入口收进溢出菜单：快速点击 / 视频导入
+            Box {
+                IconButton(onClick = { moreExpanded = true }) {
+                    Icon(Icons.Filled.MoreVert, contentDescription = "更多入口")
+                }
+                DropdownMenu(
+                    expanded = moreExpanded,
+                    onDismissRequest = { moreExpanded = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("快速点击") },
+                        onClick = { moreExpanded = false; onSimpleTap() },
+                        leadingIcon = { Icon(Icons.Filled.PlayArrow, contentDescription = null) },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("视频导入") },
+                        onClick = { moreExpanded = false; onVideoImport() },
+                        leadingIcon = { Icon(Icons.Filled.Edit, contentDescription = null) },
+                    )
+                }
             }
         }
 
@@ -172,10 +210,13 @@ fun ScriptsScreen(
 
                 else -> LazyColumn(
                     modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 24.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    contentPadding = PaddingValues(start = Ds.LG, end = Ds.LG, top = Ds.SM, bottom = Ds.XL),
+                    verticalArrangement = Arrangement.spacedBy(Ds.MD),
                 ) {
-                    items(filtered, key = { it.name }) { item ->
+                    // v2.9.39：key 必须用文件名 id，不能用 name。老版本遗留的
+                    // script.json 与新版同名脚本会解出相同 name，以 name 作 key
+                    // 触发 `Key "未命名脚本" was already used` 崩溃。
+                    items(filtered, key = { it.id }) { item ->
                         ScriptCard(
                             item = item,
                             onRun = { onRun(item.name) },
@@ -197,13 +238,13 @@ private fun EmptyScripts(hasQuery: Boolean, onImport: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(32.dp),
+            .padding(Ds.XXL),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
         Box(
             Modifier
-                .size(64.dp)
+                .size(72.dp)
                 .background(MaterialTheme.colorScheme.surfaceVariant, CircleShape),
             contentAlignment = Alignment.Center,
         ) {
@@ -211,22 +252,23 @@ private fun EmptyScripts(hasQuery: Boolean, onImport: () -> Unit) {
                 Icons.AutoMirrored.Filled.List,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(32.dp),
             )
         }
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(Ds.LG))
         Text(
             if (hasQuery) "没有匹配的脚本" else "还没有脚本",
-            style = MaterialTheme.typography.titleMedium,
+            style = Ds.Title,
         )
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(Ds.SM))
         Text(
             if (hasQuery) "换个关键词，或清空搜索框" else "录一段操作，或导入自动精灵 .zjs 脚本",
-            style = MaterialTheme.typography.bodySmall,
+            style = Ds.BodySecondary,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
         )
         if (!hasQuery) {
-            Spacer(Modifier.height(18.dp))
+            Spacer(Modifier.height(Ds.XL))
             Surface(
                 color = MaterialTheme.colorScheme.primary,
                 shape = CircleShape,
@@ -330,11 +372,13 @@ fun RecordScreen(
             val latest = state.scripts.first()
             Surface(
                 color = MaterialTheme.colorScheme.surfaceContainerHigh,
-                shape = MaterialTheme.shapes.medium,
-                modifier = Modifier.fillMaxWidth(),
+                shape = Ds.RadiusMd,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(Dp.Hairline, MaterialTheme.colorScheme.outlineVariant, Ds.RadiusMd),
             ) {
                 Row(
-                    Modifier.padding(14.dp),
+                    Modifier.padding(Ds.LG),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Icon(
@@ -343,12 +387,12 @@ fun RecordScreen(
                         tint = MaterialTheme.colorScheme.primary,
                         modifier = Modifier.size(20.dp),
                     )
-                    Spacer(Modifier.width(10.dp))
+                    Spacer(Modifier.width(Ds.MD))
                     Column(Modifier.weight(1f)) {
-                        Text(latest.name, style = MaterialTheme.typography.titleMedium)
+                        Text(latest.name, style = Ds.ItemTitle)
                         Text(
-                            "${latest.steps} 步 · ${latest.depsLine}",
-                            style = MaterialTheme.typography.bodySmall,
+                            "${latest.steps} 个场景 · ${latest.depsLine}",
+                            style = Ds.BodySecondary,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
@@ -449,7 +493,7 @@ private fun RecordingCard(state: AppUiState, onStop: () -> Unit) {
                 )
                 Spacer(Modifier.width(14.dp))
                 Text(
-                    "${state.recordCount} 步",
+                    "${state.recordCount} 个场景",
                     style = MaterialTheme.typography.titleLarge,
                     color = MaterialTheme.colorScheme.onErrorContainer,
                 )
@@ -495,19 +539,27 @@ fun SettingsScreen(
     onCloseFloatingEditor: () -> Unit = {},
 ) {
     val visual = state.visual
+    // v2.9.17 / D3：进入设置页即记录一次两路位移自检快照，供日志页导出取证。
+    LaunchedEffect(Unit) { DragDiagnostics.writeLog() }
     Column(
         Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 16.dp),
     ) {
-        SectionTitle("动作可视化", trailing = "回放时显示落点/轨迹")
+        SectionTitle("回放可视化", trailing = "回放时显示落点/轨迹")
         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
             VisualSwitch(
-                title = "动作可视化总开关",
+                title = "回放可视化总开关",
                 subtitle = "开启后回放时在屏幕叠加手势特效，可被系统录屏录到",
                 checked = visual.enabled,
                 onChecked = { onVisual(visual.copy(enabled = it)) },
+            )
+            VisualSwitch(
+                title = "场景规则诊断框",
+                subtitle = "独立开关：显示每条场景规则的搜索区域、命中状态与落点，不叠加手势特效",
+                checked = visual.sceneDebugEnabled,
+                onChecked = { onVisual(visual.copy(sceneDebugEnabled = it)) },
             )
             VisualSwitch(
                 title = "点击与长按反馈",
@@ -524,14 +576,14 @@ fun SettingsScreen(
                 onChecked = { onVisual(visual.copy(trailEnabled = it)) },
             )
             VisualSwitch(
-                title = "步骤数字角标",
-                subtitle = "预告时显示 3/12 形式的步骤号",
+                title = "场景定位角标",
+                subtitle = "预告时显示 3/12 形式的定位号",
                 checked = visual.stepBadgeEnabled,
                 enabled = visual.enabled,
                 onChecked = { onVisual(visual.copy(stepBadgeEnabled = it)) },
             )
             VisualSwitch(
-                title = "落点预告（每动作 +350ms）",
+                title = "落点预告（每场景 +350ms）",
                 subtitle = "执行前先画虚线细环 + 倒计时，会有意放慢脚本",
                 checked = visual.previewEnabled,
                 enabled = visual.enabled,
@@ -545,11 +597,11 @@ fun SettingsScreen(
                 onChecked = { onVisual(visual.copy(restrained = it)) },
             )
         }
-        SectionTitle("录制回放", trailing = "动作保真度")
+        SectionTitle("录制回放", trailing = "场景保真度")
         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
             VisualSwitch(
                 title = "回放界面校验",
-                subtitle = "界面与录制时不一致就中止并提示，避免动作打在错误界面上",
+                subtitle = "界面与录制时不一致就中止并提示，避免落点打在错误界面上",
                 checked = sceneGuard,
                 onChecked = onSceneGuard,
             )
@@ -597,7 +649,7 @@ fun SettingsScreen(
             title = "关于被动录制的边界",
             lines = listOf(
                 "无障碍只上报语义事件（点击/滚动），拿不到真实手指轨迹与页面状态。",
-                "滚动按受控幅度的标准翻页重建，方向未知时如实告警，绝不猜落点。",
+                "滚动按受控幅度的标准翻页重建，方向未知时按实际状态提示，不推断落点。",
                 "回放前请手动回到录制起始界面；列表滚动位置无法自动还原。",
                 "关闭本开关可退回旧行为（不校验、不中止）。老脚本不受影响。",
             ),
@@ -638,8 +690,8 @@ fun SettingsScreen(
             // + 前台服务，能脱离本 APP 浮在其他 APK 上编辑、切后台仍可呼出。
             InfoRow(
                 icon = Icons.Filled.Edit,
-                title = "系统悬浮动作编辑器",
-                subtitle = "脚本菜单「悬浮编辑」或编辑器「悬浮」开启：可浮在其他 APP 上编辑动作，" +
+                title = "系统悬浮场景编辑器",
+                subtitle = "脚本菜单「悬浮编辑」或编辑器「悬浮」开启：可浮在其他 APP 上编辑场景，" +
                     "切后台仍显示，通知栏呼出/收起/关闭；折叠成 40dp 小球不遮挡",
                 tone = Tone.NEUTRAL,
                 statusText = "v2.8.0",
@@ -674,7 +726,7 @@ fun SettingsScreen(
                 icon = Icons.Filled.PlayArrow,
                 title = "截图通道",
                 subtitle = if (state.sdk >= 30) "无障碍 takeScreenshot，不占用系统录屏"
-                else "系统低于 Android 11，仅节点/文字动作可用",
+                else "系统低于 Android 11，仅节点/文字场景可用",
                 tone = if (state.sdk >= 30) Tone.OK else Tone.WARN,
                 statusText = if (state.sdk >= 30) "可用" else "不可用",
             )
@@ -695,6 +747,46 @@ fun SettingsScreen(
             ActionRow("重新检测状态", "权限变更后立即刷新", Icons.Filled.Refresh, onRefresh)
         }
 
+        // v2.9.17 / D1：档位后果查阅区。主层只呈现档位名，实际参数、运行时效果
+        // 与权衡在此按维度分组展开，界面信息自足，不依赖真机回归确认档位语义。
+        SectionTitle("意图档位后果", trailing = "展开后的实际效果与权衡")
+        val optionCatalog = ScenePreset.optionCatalog()
+        listOf("触发时机", "防抖强度", "重复与重试").forEach { dimension ->
+            NoteCard(
+                title = dimension,
+                lines = optionCatalog.filter { it.dimension == dimension }.map {
+                    "${it.choice}：${it.effect}；权衡：${it.tradeoff}。实际生效：${it.actual}"
+                },
+                accent = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        // v2.9.17 / D2：两种执行范式共用一组四字段维度，随时可查，不依赖首次
+        // 装配的一次性提示。
+        SectionTitle("执行范式对照", trailing = "两种范式共用一组维度")
+        NoteCard(
+            title = "场景触发 与 顺序执行",
+            lines = ExecutionParadigm.comparison().map {
+                "${it.label}｜场景触发：${it.sceneDriven}；顺序执行：${it.sequential}"
+            },
+            accent = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        // v2.9.17 / D3：两路悬浮窗口最近一次手势的结构化结论与原始观测量。
+        SectionTitle("悬浮窗口位移自检", trailing = "一次拖动即可取证")
+        DragDiagnostics.snapshot().forEach { s ->
+            NoteCard(
+                title = "${s.target}：${s.report.headline}",
+                lines = listOfNotNull(
+                    s.report.detail,
+                    s.report.action,
+                    "结论与原始观测量已写入运行日志，可在「运行日志」或「导出调试包」中导出。",
+                ),
+                accent = if (s.report.ok) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.error,
+            )
+        }
+
         SectionTitle("关于")
         NoteCard(
             title = "离线 · 明文 · 可审计",
@@ -710,7 +802,7 @@ fun SettingsScreen(
     }
 }
 
-/** 动作可视化开关行：标题 + 副标题 + Material3 Switch。 */
+/** 回放可视化开关行：标题 + 副标题 + Material3 Switch。 */
 @Composable
 private fun VisualSwitch(
     title: String,

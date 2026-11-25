@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 package dev.nymph.auto.core.recorder
 
+import java.util.Locale
+
 /**
  * 多模态锚点选择器（纯 JVM）。
  *
@@ -67,7 +69,7 @@ object AnchorSelector {
         if (e.hasScreen) {
             val pctX = pct(e.x, e.screenW)
             val pctY = pct(e.y, e.screenH)
-            out += Anchor(AnchorKind.COORD, STABILITY_COORD, "坐标 ${"%.1f".format(pctX)}% / ${"%.1f".format(pctY)}%")
+            out += Anchor(AnchorKind.COORD, STABILITY_COORD, "坐标 ${String.format(Locale.US, "%.1f", pctX)}% / ${String.format(Locale.US, "%.1f", pctY)}%")
         }
 
         return out.sortedByDescending { it.stability }

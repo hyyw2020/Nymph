@@ -1,5 +1,7 @@
 package dev.nymph.auto.core.runner
 
+import java.util.Locale
+
 /**
  * 等待浮层状态（裁定阶段 3.5）："正在等待'确认'按钮 3.2s / 15s"。
  *
@@ -14,8 +16,8 @@ data class WaitStatus(
     /** 浮层一行文案。 */
     fun render(): String = buildString {
         append("正在等待「$target」")
-        append(" ${"%.1f".format(elapsedMs / 1000.0)}s")
-        if (timeoutMs > 0) append(" / ${"%.0f".format(timeoutMs / 1000.0)}s")
+        append(" ${String.format(Locale.US, "%.1f", elapsedMs / 1000.0)}s")
+        if (timeoutMs > 0) append(" / ${String.format(Locale.US, "%.0f", timeoutMs / 1000.0)}s")
         else append("（无超时上限）")
     }
 }

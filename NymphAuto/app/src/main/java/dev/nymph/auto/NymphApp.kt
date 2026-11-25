@@ -12,6 +12,9 @@ class NymphApp : Application() {
     override fun onCreate() {
         super.onCreate()
         LogStore.init(this) // 日志文件持久化（无网络，仅本机）
+        // 离线视觉栈：按依赖顺序加载 vendored so（libc++_shared → ncnn → ncnn-jni → opencv_java5）。
+        // 全部随 APK 走、零网络；失败由各门面 fail-closed 降级，不影响其余功能。
+        dev.nymph.auto.vision.NcnnNative.loadLibraries()
         installCrashHandler()
         if (Build.VERSION.SDK_INT >= 26) {
             val nm = getSystemService(NotificationManager::class.java)
@@ -37,10 +40,25 @@ class NymphApp : Application() {
     private fun installCrashHandler() {
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, ex ->
+            // v2.9.38：冷启动即崩时用户进不去日志页，无法导出 last_crash.txt。
+            // 崩溃时在独立进程拉起错误页直接显示堆栈，用户截图即可提供定位证据。
+            // 全部 runCatching：诊断逻辑任何失败都不得干扰系统默认崩溃处理链。
             runCatching {
                 RunLog.e("Crash", "未捕获异常：${ex.javaClass.name}: ${ex.message}")
                 RunLog.e("Crash", ex.stackTraceToString())
                 LogStore.writeCrash(thread.name, ex)
+
+                // 错误页自身崩溃时不再拉起，避免 :crash 进程无限重启循环。
+                if (!dev.nymph.auto.ui.CrashReportActivity.isCrashProcess(this)) {
+                    val text = buildString {
+                        appendLine("线程：${thread.name}")
+                        appendLine("异常：${ex.javaClass.name}: ${ex.message}")
+                        appendLine("Android API ${android.os.Build.VERSION.SDK_INT} / ${android.os.Build.MODEL}")
+                        appendLine("---- 堆栈 ----")
+                        append(ex.stackTraceToString())
+                    }
+                    dev.nymph.auto.ui.CrashReportActivity.launch(this, text)
+                }
             }
             previous?.uncaughtException(thread, ex)
                 ?: run {

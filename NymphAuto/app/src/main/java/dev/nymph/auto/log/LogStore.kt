@@ -33,6 +33,13 @@ object LogStore {
         RunLog.addListener { entry -> append(entry) }
     }
 
+    /**
+     * v2.9.45：[RunLog] 在锁外通知监听器，append 可能被脚本线程、主线程、无障碍
+     * 回调等并发进入。裸的 `length()` 检查 + rename 轮转 + appendText 会交错，
+     * 造成写丢失、重复轮转或写入已改名的旧文件。@Synchronized 与 init/tail/clear
+     * 共用实例锁，把「检查—轮转—追加」串行化。
+     */
+    @Synchronized
     private fun append(entry: LogEntry) {
         val f = file ?: return
         runCatching {
@@ -46,7 +53,8 @@ object LogStore {
         }
     }
 
-    /** 读取最近 [lines] 行（供日志页展示）。 */
+    /** 读取最近 [lines] 行（供日志页展示）。与写入共用实例锁，避免读到轮转中间态。 */
+    @Synchronized
     fun tail(lines: Int = 500): List<String> {
         val f = file ?: return RunLog.snapshot().map { it.format() }
         val all = runCatching { f.readLines() }.getOrDefault(emptyList())
@@ -55,6 +63,7 @@ object LogStore {
 
     fun exportText(): String = tail(2000).joinToString("\n")
 
+    @Synchronized
     fun clear() {
         RunLog.clear()
         runCatching { file?.writeText("") }

@@ -19,7 +19,7 @@ import java.nio.file.StandardOpenOption
  * 这是「一致性靠约定」最实的一个洞，也是刷新率/悬浮窗之外的真实数据风险。
  *
  * 标准做法：**临时文件 → fsync → rename**。rename 在同一文件系统内是原子操作，
- * 读者要么看到完整的旧版本，要么看到完整的新版本，永远看不到半截。
+ * 读者要么看到完整的旧版本，要么看到完整的新版本，不会读取到中间态。
  *
  * ## 约束
  *
@@ -41,7 +41,11 @@ object AtomicTextFile {
     fun write(target: File, text: String): Boolean {
         val parent = target.parentFile
         if (parent != null) runCatching { parent.mkdirs() }
-        val tmp = File(target.path + TMP_SUFFIX)
+        // v2.9.35：临时文件名固定 <target>.tmp 时，同一目标的并发写（脚本保存 +
+        // 授权落盘 + 历史快照）会共用临时文件、交叉 move 导致数据丢失或误报失败。
+        // 附加纳秒 + 线程 id 使每次写独占自己的临时文件，失败清理也只删自己的。
+        val tmp = File(target.path + TMP_SUFFIX + "-" +
+            System.nanoTime().toString(36) + "-" + Thread.currentThread().id.toString(36))
         return try {
             // 先写临时文件并强制刷盘，确保 rename 之前数据已落介质。
             FileOutputStream(tmp, false).use { fos ->
@@ -77,12 +81,30 @@ object AtomicTextFile {
     }
 
     /**
-     * 启动恢复检查：列出目录里遗留的 `*.tmp`。
+     * 启动恢复检查：列出目录里遗留的本工具临时文件。
      * 这些是上次写入在 rename 之前被中断留下的半成品，**不应被当作脚本加载**。
+     *
+     * v2.9.40（P0-15）：原实现用 `name.contains(".tmp")` 子串匹配，会把用户自己
+     * 命名的 `备份.tmp.bak`、`test.tmp.txt` 等一并删掉——`ScriptStore.init` 启动
+     * 即触发清理，造成用户数据无提示丢失。改为严格匹配本工具的两种临时命名。
+     *
+     * v2.9.41（③）：v2.9.40 的老格式分支 `.+\.tmp$` 收得过宽——会误删用户精确以
+     * `.tmp` 结尾的自有文件（如 `备份.tmp`），两个分支一并收紧到 `<target>.tmp` 锚点。
+     *
+     * v2.9.42（③ 事实澄清）：v2.9.41 注释里关于「写入目标后缀」的断言并不准确——
+     * [ScriptRepository] 的历史快照写入 `.history/<name>.r<N>.naz`，同样走本对象，
+     * 崩溃残留形态是 `.naz.tmp-<nano>-<tid>`，旧正则结构上永远匹配不到。按真实写入
+     * 目标把分支扩为 `.json` / `.naz` 两类；且 [ScriptRepository] 的 `.history` 目录
+     * 必须接 [cleanupStale]，否则快照临时文件从未被清、持续堆积。非本工具后缀的
+     * `.tmp` 用户文件一律不碰。
      */
+    private val STALE_TMP = Regex(
+        """(.+\.(json|naz)\.tmp-[0-9a-z-]+-[0-9a-z]+|.+\.(json|naz)\.tmp)$"""
+    )
+
     fun staleTempFiles(dir: File): List<File> =
         (dir.listFiles() ?: emptyArray())
-            .filter { it.isFile && it.name.endsWith(TMP_SUFFIX) }
+            .filter { it.isFile && STALE_TMP.matches(it.name) }
             .toList()
 
     /** 清理遗留临时文件，返回清理数量。只删 `.tmp`，绝不碰正式文件。 */
