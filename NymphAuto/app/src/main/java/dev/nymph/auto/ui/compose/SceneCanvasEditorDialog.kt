@@ -9,6 +9,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -52,6 +53,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -125,6 +127,8 @@ fun SceneCanvasEditorDialog(
     // N5 整图门：从脚本级字段读入，本页可改，保存时写回 Script（不进 canvas、不进运行链之外）
     var workMethod by remember { mutableStateOf(globalMethod) }
     var workSimilarity by remember { mutableStateOf(globalVerifySimilarity) }
+    // 保存门槛：至少抓到画面 + 1 个点击坐标 + 1 个识别特征；缺项时给出明确提示。
+    val canSave = canvas.hasBackground() && canvas.points.isNotEmpty() && canvas.features.isNotEmpty()
 
     // 底图 Bitmap（从 assets 取回；空则占位）
     val bgBitmap by remember(canvas.backgroundKey, assets) {
@@ -330,8 +334,8 @@ fun SceneCanvasEditorDialog(
         ) {
             Text(
                 "抓一张当前画面作底图，然后在图上拾取点击坐标、框住要识别的元素。画面会自动保存，可随时回来继续编辑。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
             )
 
             // 同屏三态切换：拾取坐标 / 框特征 / 整图校验
@@ -388,7 +392,7 @@ fun SceneCanvasEditorDialog(
                 if (tab == 1) {
                     Text("触发门控 · 框特征（1 个或多个）", fontWeight = FontWeight.Bold)
                     if (canvas.features.isEmpty()) {
-                        Text("尚未框特征。点上方「+ 加特征框」，在底图上拖出稳定元素。", style = MaterialTheme.typography.labelSmall)
+                        Text("尚未框特征。点上方「+ 加特征框」，在底图上拖出稳定元素。", style = MaterialTheme.typography.bodyMedium)
                     }
                     canvas.features.forEachIndexed { i, f ->
                         Column(Modifier.fillMaxWidth().border(1.dp, if (selectedFeature == i) Color(0xFFFFD54F) else Color.Transparent).padding(6.dp)) {
@@ -428,9 +432,9 @@ fun SceneCanvasEditorDialog(
                             )
                         }
                         Text(
-                            "求值顺序：整图校验 → 特征合取 → 点位派发 → 失配不点；任一门不过整批不派发（fail-closed）。",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            "运行时先校验画面和特征，都匹配了才会按坐标点击；只要有一项对不上就不会动作。",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
                         )
                     }
                 }
@@ -441,8 +445,8 @@ fun SceneCanvasEditorDialog(
                 if (canvas.points.isEmpty()) {
                     Text(
                         "尚未拾取坐标。点上方「拾取坐标」后，在画布上拖动青色坐标点定位，逐点选手势与间隔。",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
                     )
                 }
                 canvas.points.forEachIndexed { i, p ->
@@ -499,11 +503,11 @@ fun SceneCanvasEditorDialog(
                         }
                     }
                 }
-                // 执行关系（裁决 3）：默认按编号顺序 + waitMs；「与某点同时」灰标后续，不提供可勾选项。
+                // 执行关系：默认按编号顺序 + 间隔 ms；「与某点同时」为后续能力，不提供不可用的勾选项。
                 Text(
-                    "执行关系：按编号顺序 + 间隔 ms（默认，已生效） · 「与某点同时」灰标：后续能力（同型多点同时轻击为 P0 缺口，本轮不提供，禁止勾了没反应）。",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    "执行顺序：按编号依次点击，每步之间等待设定的间隔。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
                 )
                 } // tab==0 标点态结束
 
@@ -511,10 +515,9 @@ fun SceneCanvasEditorDialog(
                 if (tab == 2) {
                     Text("整图基线校验（NCC）", fontWeight = FontWeight.Bold)
                     Text(
-                        "基线 = 当前画布原画质底图；求值顺序第 1 步。仅「同宽高比 + 同方向 + 同 UI」生效，" +
-                            "跨宽高比 / 转方向 fail-closed（已知未覆盖、排后续）。",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        "以当前画布作参照，画面不一致时不会动作。仅在相同界面、相同方向下有效。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         FilterChip(
@@ -536,9 +539,9 @@ fun SceneCanvasEditorDialog(
                         onValueChange = { workSimilarity = it.toInt().coerceIn(1, 100) },
                     )
                     Text(
-                        "宁可不点非提高命中：收紧只把「疑似错位」判为不派发。真机 NCC 精度未验证。",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        "阈值越高越严格：画面稍有不同就不会动作。建议先用默认值试跑，再按实际效果调整。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
                     )
                 }
 
@@ -558,7 +561,21 @@ fun SceneCanvasEditorDialog(
                     }
                 }
 
-                if (message.isNotBlank()) Text(message, style = MaterialTheme.typography.bodySmall)
+                if (message.isNotBlank()) Text(message, style = MaterialTheme.typography.bodyMedium)
+
+                // 保存门槛提示：明确告知还差什么，避免「抓了图、加了坐标，保存却是灰的」无从判断。
+                if (!canSave) {
+                    val missing = buildList {
+                        if (!canvas.hasBackground()) add("抓取画面")
+                        if (canvas.points.isEmpty()) add("拾取至少一个点击坐标")
+                        if (canvas.features.isEmpty()) add("框选至少一个识别特征")
+                    }
+                    Text(
+                        "还差：${missing.joinToString("、")}即可保存",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
             }
         // 底部保存条：把整图门配置一并写回 Script（onConfirm 参数扩展）
         Row(
@@ -568,7 +585,7 @@ fun SceneCanvasEditorDialog(
             TextButton(onClick = onDismiss) { Text("取消") }
             Button(
                 // 至少标 1 个落点 + 至少 1 个特征才允许保存，杜绝空画布降级成裸 TAP。
-                enabled = canvas.hasBackground() && canvas.points.isNotEmpty() && canvas.features.isNotEmpty(),
+                enabled = canSave,
                 onClick = {
                     // 保存前为尚无模板的特征从底图裁一次原画质模板（同步更新 canvas/assets state）
                     canvas.features.forEachIndexed { i, f ->
@@ -595,18 +612,20 @@ private fun CanvasBoard(
     onZone: (Region) -> Unit,
     onPoint: (Double, Double) -> Unit,
 ) {
-    var boxW by remember { mutableStateOf(1f) }
-    var boxH by remember { mutableStateOf(1f) }
+    var boxW by remember { mutableStateOf(1f) } // 画布实测宽度（px），与 onSizeChanged / dragAmount 同单位
+    var boxH by remember { mutableStateOf(1f) } // 画布实测高度（px）
+    val density = LocalDensity.current
     val imgW = bitmap.width.coerceAtLeast(1)
     val imgH = bitmap.height.coerceAtLeast(1)
 
-    // 底图显示宽度铺满，高度按比例
-    val shownH = boxW * imgH / imgW
-
+    // 底图按原图宽高比铺满宽度，高度由 aspectRatio 精确推导。
+    // 旧实现 shownH=boxW*imgH/imgW（px）却写成 .height(shownH.dp)，把像素当 dp，
+    // 画布被放大 density 倍 → 截图只占顶部一条、下方纯黑、坐标点算到屏幕外。
+    // 此处交给 Compose 用同一密度换算，px/dp 全程自洽。
     Box(
         Modifier
             .fillMaxWidth()
-            .height(shownH.dp.coerceAtLeast(140.dp))
+            .aspectRatio(imgW.toFloat() / imgH)
             .background(Color.Black)
             .onSizeChanged { boxW = it.width.toFloat(); boxH = it.height.toFloat() },
     ) {
@@ -654,13 +673,15 @@ private fun CanvasBoard(
         }
 
         // 落点标记（N 个编号圆点）：每个点位相对同一锚，各自可拖动定位
+        // 标记圆心对齐百分比位置：IntOffset 用 px，需把 24dp 半径按密度换算，勿用裸 12px。
+        val markerHalfPx = with(density) { 12.dp.toPx() }.toInt()
         canvas.points.forEachIndexed { i, p ->
             val px = (p.x / 100.0 * boxW).toInt()
             val py = (p.y / 100.0 * boxH).toInt()
             val markerColor = if (selectedPoint == i) Color(0xFF00E5FF) else Color.Cyan
             Box(
                 Modifier
-                    .offset { IntOffset(px - 12, py - 12) }
+                    .offset { IntOffset(px - markerHalfPx, py - markerHalfPx) }
                     .size(24.dp)
                     .border(2.dp, markerColor, RoundedCornerShape(50))
                     .pointerInput(p.id) {
@@ -689,7 +710,7 @@ private fun CanvasBoard(
             val py = (canvas.pointY / 100.0 * boxH).toInt()
             Box(
                 Modifier
-                    .offset { IntOffset(px - 12, py - 12) }
+                    .offset { IntOffset(px - markerHalfPx, py - markerHalfPx) }
                     .size(24.dp)
                     .border(2.dp, Color.Cyan, RoundedCornerShape(50))
                     .pointerInput(Unit) {
@@ -726,14 +747,19 @@ private fun DraggableRect(
     onDrag: (Double, Double) -> Unit,
     onDragEnd: () -> Unit = {},
 ) {
+    // boxW/boxH 与 below 的 l/t 均为 px：offset 用 IntOffset(px) 正确；
+    // size 必须把 px 转 dp，否则把像素当 dp，框被放大 density 倍错位。
+    val density = LocalDensity.current
     val l = (region.leftPct / 100.0 * boxW).toInt()
     val t = (region.topPct / 100.0 * boxH).toInt()
     val w = ((region.rightPct - region.leftPct) / 100.0 * boxW).toInt().coerceAtLeast(8)
     val h = ((region.bottomPct - region.topPct) / 100.0 * boxH).toInt().coerceAtLeast(8)
+    val wDp = with(density) { w.toDp() }
+    val hDp = with(density) { h.toDp() }
     Box(
         Modifier
             .offset { IntOffset(l, t) }
-            .size(w.dp, h.dp)
+            .size(wDp, hDp)
             .border(2.dp, color)
             .pointerInput(Unit) {
                 detectDragGestures(

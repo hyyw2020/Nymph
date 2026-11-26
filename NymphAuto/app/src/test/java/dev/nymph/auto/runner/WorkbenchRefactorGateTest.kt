@@ -229,4 +229,26 @@ class WorkbenchRefactorGateTest {
         assertFalse("撤销回调已移除", panel.contains("onUndo"))
         assertTrue("showUndo 保留签名兼容调用点", panel.contains("fun showUndo("))
     }
+
+    // ── v3.1.3：画布宽高比几何修复（px/dp 混用导致截图下半纯黑、坐标点算到屏外）──
+    @Test
+    fun `画布按原图宽高比绘制且几何单位自洽`() {
+        val wb = codeOnly(read("ui/compose/SceneCanvasEditorDialog.kt"))
+        // 高度必须由 aspectRatio 按原图宽高比推导，不得再把像素 shownH 当 dp 用。
+        assertTrue("画布用 aspectRatio 按原图宽高比", wb.contains(".aspectRatio(imgW.toFloat() / imgH)"))
+        assertFalse("不得再把像素高度当 dp（画布被撑高数倍的根因）", wb.contains(".height(shownH.dp"))
+        // 所有百分比几何以实测像素 boxW/boxH 为基准，offset 用 IntOffset(px)，size 用 px→dp 换算。
+        assertTrue("点位圆心偏移按密度换算，非裸像素", wb.contains("12.dp.toPx()"))
+        assertTrue("拖拽框尺寸 px 转 dp", wb.contains("w.toDp()") && wb.contains("h.toDp()"))
+        assertTrue("LocalDensity 参与几何换算", wb.contains("LocalDensity.current"))
+    }
+
+    @Test
+    fun `保存门槛有明确缺项提示且辅助文案可读`() {
+        val wb = codeOnly(read("ui/compose/SceneCanvasEditorDialog.kt"))
+        // 抓图加坐标仍存不了的根因是缺特征框；须显式告知缺什么，而非让按钮无声变灰。
+        assertTrue("保存门槛提示缺项", wb.contains("还差：") && wb.contains("即可保存"))
+        assertTrue("门槛提示用可读字号", wb.contains("missing.joinToString"))
+        assertTrue("辅助说明不再压暗为 variant", wb.contains("style = MaterialTheme.typography.bodyMedium"))
+    }
 }
