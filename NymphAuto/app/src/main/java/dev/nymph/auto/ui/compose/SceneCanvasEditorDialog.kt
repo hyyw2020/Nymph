@@ -365,10 +365,14 @@ fun SceneCanvasEditorDialog(
                         onFeatureRect = { i, r -> updateFeatureRect(i, r) },
                         onFeatureTemplate = { i, r -> captureFeatureTemplate(i, r) },
                         onZone = { r -> canvas = canvas.copy(clickZone = r) },
-                        onPoint = { x, y ->
-                            if (selectedPoint in canvas.points.indices) {
-                                updatePoint(selectedPoint) { it.copy(x = x, y = y) }
+                        // 拖拽回调携带明确索引，不再依赖 selectedPoint 状态推断目标点。
+                        // 原因：onDragStart 里设置 selectedPoint 是异步 state 更新，drag 首帧
+                        // 闭包读到的可能仍是旧值 -1，导致走兼容落点分支、points 纹丝不动。
+                        onPointMove = { idx, x, y ->
+                            if (idx in canvas.points.indices) {
+                                updatePoint(idx) { it.copy(x = x, y = y) }
                             } else {
+                                // idx == -1：老脚本单落点（points 为空）的兼容分支
                                 canvas = canvas.copy(pointX = x, pointY = y)
                             }
                         },
@@ -610,11 +614,15 @@ private fun CanvasBoard(
     onFeatureRect: (Int, Region) -> Unit,
     onFeatureTemplate: (Int, Region) -> Unit,
     onZone: (Region) -> Unit,
-    onPoint: (Double, Double) -> Unit,
+    /** 点位拖拽：索引 + 绝对百分比坐标。idx==-1 表示老脚本单落点兼容分支。 */
+    onPointMove: (Int, Double, Double) -> Unit,
 ) {
     var boxW by remember { mutableStateOf(1f) } // 画布实测宽度（px），与 onSizeChanged / dragAmount 同单位
     var boxH by remember { mutableStateOf(1f) } // 画布实测高度（px）
     val density = LocalDensity.current
+    // 点位拖拽手势内读取最新数据：pointerInput 的 lambda 捕获的是组合时的旧值，
+    // 用手势开始时快照 + 累计 dragAmount 计算绝对坐标，避免每帧都基于冻结的旧基准。
+    val latestPoints by rememberUpdatedState(canvas.points)
     val imgW = bitmap.width.coerceAtLeast(1)
     val imgH = bitmap.height.coerceAtLeast(1)
 
@@ -636,18 +644,18 @@ private fun CanvasBoard(
             modifier = Modifier.fillMaxWidth(),
         )
 
-        // 落点限制区（蓝框）——拖拽整体平移
+        // 落点限制区（蓝框）——拖拽整体平移。用 latestZone 取手势起始快照，避免捕获旧 region。
         val zone = canvas.clickZone
         DraggableRect(
             region = zone,
             boxW = boxW, boxH = boxH,
             color = Color(0xFF448AFF),
-            onDrag = { dr, dt ->
-                onZone(zone.copy(
-                    leftPct = (zone.leftPct + dr).coerceIn(0.0, 100.0),
-                    rightPct = (zone.rightPct + dr).coerceIn(0.0, 100.0),
-                    topPct = (zone.topPct + dt).coerceIn(0.0, 100.0),
-                    bottomPct = (zone.bottomPct + dt).coerceIn(0.0, 100.0),
+            onDrag = { startRegion, dxPct, dyPct ->
+                onZone(startRegion.copy(
+                    leftPct = (startRegion.leftPct + dxPct).coerceIn(0.0, 100.0),
+                    rightPct = (startRegion.rightPct + dxPct).coerceIn(0.0, 100.0),
+                    topPct = (startRegion.topPct + dyPct).coerceIn(0.0, 100.0),
+                    bottomPct = (startRegion.bottomPct + dyPct).coerceIn(0.0, 100.0),
                 ))
             },
         )
@@ -660,69 +668,107 @@ private fun CanvasBoard(
                 color = if (selectedFeature == i) Color(0xFFFFD54F) else Color(0xFFE53935),
                 label = f.label.ifBlank { "特征${i + 1}" },
                 onDragStart = { onSelectFeature(i) },
-                onDrag = { dr, dt ->
-                    onFeatureRect(i, f.region.copy(
-                        leftPct = (f.region.leftPct + dr).coerceIn(0.0, 100.0),
-                        rightPct = (f.region.rightPct + dr).coerceIn(0.0, 100.0),
-                        topPct = (f.region.topPct + dt).coerceIn(0.0, 100.0),
-                        bottomPct = (f.region.bottomPct + dt).coerceIn(0.0, 100.0),
+                onDrag = { startRegion, dxPct, dyPct ->
+                    onFeatureRect(i, startRegion.copy(
+                        leftPct = (startRegion.leftPct + dxPct).coerceIn(0.0, 100.0),
+                        rightPct = (startRegion.rightPct + dxPct).coerceIn(0.0, 100.0),
+                        topPct = (startRegion.topPct + dyPct).coerceIn(0.0, 100.0),
+                        bottomPct = (startRegion.bottomPct + dyPct).coerceIn(0.0, 100.0),
                     ))
                 },
-                onDragEnd = { onFeatureTemplate(i, f.region) },
+                onDragEnd = { endRegion -> onFeatureTemplate(i, endRegion) },
             )
         }
 
-        // 落点标记（N 个编号圆点）：每个点位相对同一锚，各自可拖动定位
-        // 标记圆心对齐百分比位置：IntOffset 用 px，需把 24dp 半径按密度换算，勿用裸 12px。
-        val markerHalfPx = with(density) { 12.dp.toPx() }.toInt()
+        // 落点标记（N 个编号圆点）：每个点位独立拖拽定位。
+        // 关键修复：拖拽回调携带点位索引 idx（不再依赖有重组延迟的 selectedPoint），
+        // 且手势内用「起点快照 + 累计 dragAmount」算绝对坐标——pointerInput lambda 捕获的
+        // p.x/p.y 在手势期间是冻结的旧值，逐帧加到旧基准上会导致点位跳一下就卡住。
+        // 视觉圆点仍 24dp，但触摸热区扩到 44dp，解决小圆点难以命中的问题。
+        val hitHalfPx = with(density) { 22.dp.toPx() }.toInt() // 44dp 热区半径
         canvas.points.forEachIndexed { i, p ->
             val px = (p.x / 100.0 * boxW).toInt()
             val py = (p.y / 100.0 * boxH).toInt()
             val markerColor = if (selectedPoint == i) Color(0xFF00E5FF) else Color.Cyan
             Box(
                 Modifier
-                    .offset { IntOffset(px - markerHalfPx, py - markerHalfPx) }
-                    .size(24.dp)
-                    .border(2.dp, markerColor, RoundedCornerShape(50))
+                    .offset { IntOffset(px - hitHalfPx, py - hitHalfPx) }
+                    .size(44.dp)
                     .pointerInput(p.id) {
+                        // 手势起点百分比快照（点按瞬间取最新值），累计位移只在本协程内累积。
+                        var startX = p.x
+                        var startY = p.y
+                        var accDx = 0f
+                        var accDy = 0f
                         detectDragGestures(
-                            onDragStart = { onSelectPoint(i) },
+                            onDragStart = {
+                                latestPoints.getOrNull(i)?.let { fresh ->
+                                    startX = fresh.x; startY = fresh.y
+                                }
+                                accDx = 0f; accDy = 0f
+                                onSelectPoint(i)
+                            },
                         ) { change, dragAmount ->
                             change.consume()
-                            onPoint(
-                                (p.x + dragAmount.x / boxW * 100.0).coerceIn(0.0, 100.0),
-                                (p.y + dragAmount.y / boxH * 100.0).coerceIn(0.0, 100.0),
+                            accDx += dragAmount.x
+                            accDy += dragAmount.y
+                            onPointMove(
+                                i,
+                                (startX + accDx / boxW * 100.0).coerceIn(0.0, 100.0),
+                                (startY + accDy / boxH * 100.0).coerceIn(0.0, 100.0),
                             )
                         }
                     },
+                contentAlignment = Alignment.Center,
             ) {
-                Text(
-                    "${i + 1}",
-                    color = markerColor,
-                    style = MaterialTheme.typography.labelSmall,
-                    modifier = Modifier.align(Alignment.Center),
-                )
+                Box(
+                    Modifier
+                        .size(24.dp)
+                        .border(2.dp, markerColor, RoundedCornerShape(50)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "${i + 1}",
+                        color = markerColor,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
             }
         }
-        // 老画布脚本（无 points）仍显示单个兼容落点
+        // 老画布脚本（无 points）仍显示单个兼容落点，idx=-1 走宿主兼容分支。
         if (canvas.points.isEmpty()) {
             val px = (canvas.pointX / 100.0 * boxW).toInt()
             val py = (canvas.pointY / 100.0 * boxH).toInt()
             Box(
                 Modifier
-                    .offset { IntOffset(px - markerHalfPx, py - markerHalfPx) }
-                    .size(24.dp)
-                    .border(2.dp, Color.Cyan, RoundedCornerShape(50))
+                    .offset { IntOffset(px - hitHalfPx, py - hitHalfPx) }
+                    .size(44.dp)
                     .pointerInput(Unit) {
-                        detectDragGestures { change, dragAmount ->
+                        var startX = canvas.pointX
+                        var startY = canvas.pointY
+                        var accDx = 0f
+                        var accDy = 0f
+                        detectDragGestures(
+                            onDragStart = { accDx = 0f; accDy = 0f },
+                        ) { change, dragAmount ->
                             change.consume()
-                            onPoint(
-                                (canvas.pointX + dragAmount.x / boxW * 100.0).coerceIn(0.0, 100.0),
-                                (canvas.pointY + dragAmount.y / boxH * 100.0).coerceIn(0.0, 100.0),
+                            accDx += dragAmount.x
+                            accDy += dragAmount.y
+                            onPointMove(
+                                -1,
+                                (startX + accDx / boxW * 100.0).coerceIn(0.0, 100.0),
+                                (startY + accDy / boxH * 100.0).coerceIn(0.0, 100.0),
                             )
                         }
                     },
-            )
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(
+                    Modifier
+                        .size(24.dp)
+                        .border(2.dp, Color.Cyan, RoundedCornerShape(50)),
+                )
+            }
         }
     }
 }
@@ -744,12 +790,16 @@ private fun DraggableRect(
     color: Color,
     label: String = "",
     onDragStart: () -> Unit = {},
-    onDrag: (Double, Double) -> Unit,
-    onDragEnd: () -> Unit = {},
+    /** [start] 是手势起点快照；[dxPct]/[dyPct] 是相对起点的累计位移（百分比）。 */
+    onDrag: (start: Region, dxPct: Double, dyPct: Double) -> Unit,
+    /** 拖拽结束时回传最终矩形，供宿主裁模板等。 */
+    onDragEnd: (end: Region) -> Unit = {},
 ) {
     // boxW/boxH 与 below 的 l/t 均为 px：offset 用 IntOffset(px) 正确；
     // size 必须把 px 转 dp，否则把像素当 dp，框被放大 density 倍错位。
     val density = LocalDensity.current
+    // pointerInput lambda 捕获组合时的旧 region；手势开始时取最新快照，累计 dragAmount 算绝对位移。
+    val latestRegion by rememberUpdatedState(region)
     val l = (region.leftPct / 100.0 * boxW).toInt()
     val t = (region.topPct / 100.0 * boxH).toInt()
     val w = ((region.rightPct - region.leftPct) / 100.0 * boxW).toInt().coerceAtLeast(8)
@@ -762,12 +812,30 @@ private fun DraggableRect(
             .size(wDp, hDp)
             .border(2.dp, color)
             .pointerInput(Unit) {
+                var start = latestRegion
+                var accDx = 0f
+                var accDy = 0f
                 detectDragGestures(
-                    onDragStart = { onDragStart() },
-                    onDragEnd = { onDragEnd() },
+                    onDragStart = {
+                        start = latestRegion
+                        accDx = 0f; accDy = 0f
+                        onDragStart()
+                    },
+                    onDragEnd = {
+                        val dx = accDx / boxW * 100.0
+                        val dy = accDy / boxH * 100.0
+                        onDragEnd(start.copy(
+                            leftPct = (start.leftPct + dx).coerceIn(0.0, 100.0),
+                            rightPct = (start.rightPct + dx).coerceIn(0.0, 100.0),
+                            topPct = (start.topPct + dy).coerceIn(0.0, 100.0),
+                            bottomPct = (start.bottomPct + dy).coerceIn(0.0, 100.0),
+                        ))
+                    },
                 ) { change, dragAmount ->
                     change.consume()
-                    onDrag(dragAmount.x / boxW * 100.0, dragAmount.y / boxH * 100.0)
+                    accDx += dragAmount.x
+                    accDy += dragAmount.y
+                    onDrag(start, accDx / boxW * 100.0, accDy / boxH * 100.0)
                 }
             },
     ) {

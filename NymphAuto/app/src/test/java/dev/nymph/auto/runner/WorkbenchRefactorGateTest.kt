@@ -238,7 +238,9 @@ class WorkbenchRefactorGateTest {
         assertTrue("画布用 aspectRatio 按原图宽高比", wb.contains(".aspectRatio(imgW.toFloat() / imgH)"))
         assertFalse("不得再把像素高度当 dp（画布被撑高数倍的根因）", wb.contains(".height(shownH.dp"))
         // 所有百分比几何以实测像素 boxW/boxH 为基准，offset 用 IntOffset(px)，size 用 px→dp 换算。
-        assertTrue("点位圆心偏移按密度换算，非裸像素", wb.contains("12.dp.toPx()"))
+        // v3.1.4：触摸热区扩到 44dp，圆心偏移改 22.dp.toPx()，仍是密度换算、非裸像素。
+        assertTrue("点位圆心偏移按密度换算，非裸像素",
+            wb.contains("12.dp.toPx()") || wb.contains("22.dp.toPx()"))
         assertTrue("拖拽框尺寸 px 转 dp", wb.contains("w.toDp()") && wb.contains("h.toDp()"))
         assertTrue("LocalDensity 参与几何换算", wb.contains("LocalDensity.current"))
     }
@@ -250,5 +252,40 @@ class WorkbenchRefactorGateTest {
         assertTrue("保存门槛提示缺项", wb.contains("还差：") && wb.contains("即可保存"))
         assertTrue("门槛提示用可读字号", wb.contains("missing.joinToString"))
         assertTrue("辅助说明不再压暗为 variant", wb.contains("style = MaterialTheme.typography.bodyMedium"))
+    }
+
+    // ── v3.1.4：点位拖拽交互失效修复 ──
+    @Test
+    fun `点位拖拽携带索引并用累计偏移算绝对坐标`() {
+        val wb = codeOnly(read("ui/compose/SceneCanvasEditorDialog.kt"))
+        // 根因1：旧 onPoint(x,y) 不带索引，宿主靠 selectedPoint 猜目标点，drag 首帧读到 -1
+        // 走兼容分支导致 points 不变。修复：回调必须带索引。
+        assertTrue("点位拖拽回调带索引", wb.contains("onPointMove: (Int, Double, Double) -> Unit"))
+        assertFalse("不得再有无索引的 onPoint 回调", wb.contains("onPoint: (Double, Double) -> Unit"))
+        // 宿主按索引直接更新点位，不依赖 selectedPoint 推断。
+        assertTrue("宿主按索引更新点位", wb.contains("updatePoint(idx) { it.copy(x = x, y = y) }"))
+        // 根因2：dragAmount 是每帧增量，旧代码加到闭包捕获的旧 p.x 上（手势期间冻结），
+        // 每帧基于同一旧基准 → 点位跳一下就卡住。修复：手势起点快照 + 局部累计偏移。
+        assertTrue("点位手势起点快照", wb.contains("startX = fresh.x; startY = fresh.y"))
+        assertTrue("点位累计水平位移", wb.contains("accDx += dragAmount.x"))
+        assertTrue("点位累计垂直位移", wb.contains("accDy += dragAmount.y"))
+        assertTrue("点位用起点加累计算绝对X", wb.contains("startX + accDx / boxW * 100.0"))
+        assertTrue("点位用起点加累计算绝对Y", wb.contains("startY + accDy / boxH * 100.0"))
+        // latestPoints 保证 onDragStart 读到最新点位，而非组合时冻结的旧值。
+        assertTrue("手势内读最新点位列表", wb.contains("val latestPoints by rememberUpdatedState(canvas.points)"))
+        assertTrue("起点快照取最新点位", wb.contains("latestPoints.getOrNull(i)?.let"))
+    }
+
+    @Test
+    fun `点位触摸热区扩大且拖拽框用累计偏移`() {
+        val wb = codeOnly(read("ui/compose/SceneCanvasEditorDialog.kt"))
+        // 视觉圆点 24dp 太小难以命中，触摸热区扩到 44dp（视觉圆点嵌套居中）。
+        assertTrue("点位触摸热区扩到44dp", wb.contains("val hitHalfPx = with(density) { 22.dp.toPx() }.toInt()"))
+        assertTrue("点位外层热区44dp", wb.contains(".size(44.dp)"))
+        assertTrue("点位视觉圆点仍24dp", wb.contains(".size(24.dp)"))
+        // 特征框/落点区同样改用起点快照 + 累计偏移，避免每帧基于冻结旧 region。
+        assertTrue("拖拽框起点快照取最新region", wb.contains("val latestRegion by rememberUpdatedState(region)"))
+        assertTrue("拖拽框累计偏移", wb.contains("accDx += dragAmount.x") && wb.contains("accDx / boxW * 100.0"))
+        assertTrue("拖拽框回调携带起点region", wb.contains("onDrag: (start: Region, dxPct: Double, dyPct: Double) -> Unit"))
     }
 }
