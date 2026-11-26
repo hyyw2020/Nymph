@@ -109,6 +109,8 @@ fun EditorScreen(
     viewModel: AppViewModel,
     onBack: () -> Unit,
     onSave: (Script) -> Unit,
+    /** v3.1.2：静默落盘——写盘但不退出编辑器、不弹提示，供抓帧瞬间/返回时防丢调用。 */
+    onSilentSave: (Script) -> Unit = {},
     /** v2.8.0：把当前脚本切到系统级悬浮编辑器（可浮在其他 APP 上）。 */
     onFloatEdit: (String) -> Unit = {},
 ) {
@@ -278,21 +280,36 @@ fun EditorScreen(
     // Column(fillMaxSize) 被同时组合、层叠绘制，底层「未命名脚本/执行1次」等透出。
     // 采用 early-return 后，工作台与步骤视图互斥，任一时刻只组合其一。
     if (showSceneCanvas) {
+        // v3.1.2：画布写回+落盘的单一真源。onConfirm（显式保存）与 onAutoSave（抓帧瞬间/
+        // 返回防丢）共用同一 mergeInto，杜绝两套逻辑漂移。差别仅在是否 pushUndo/关闭页面。
+        fun persistCanvas(
+            canvas: SceneCanvas,
+            updatedAssets: Map<String, String>,
+            method: dev.nymph.auto.core.model.GlobalVerifyMethod,
+            similarity: Int,
+        ) {
+            // v3.0.4：画布仅作可视化编辑视图，保存时编译进现有 Action/sceneRule。
+            // 编译 + 合并统一走 SceneCanvas.mergeInto（测试共用同一函数，杜绝门控绕过）。
+            // N5 整图校验配置写回 Script 级字段（不进 canvas、不进运行链模型）。
+            scriptBase = SceneCanvas.mergeInto(scriptBase, canvas, updatedAssets).copy(
+                globalMethod = method,
+                globalVerifySimilarity = similarity.coerceIn(1, 100),
+            )
+            // 静默落盘：抓到图即写盘，返回/进程被回收都不丢；不退出编辑器、不弹提示。
+            onSilentSave(buildScript())
+        }
         SceneCanvasEditorDialog(
             initial = scriptBase.canvas,
             initialAssets = scriptBase.assets,
             globalMethod = scriptBase.globalMethod,
             globalVerifySimilarity = scriptBase.globalVerifySimilarity,
             onDismiss = { showSceneCanvas = false },
+            onAutoSave = { canvas, updatedAssets, method, similarity ->
+                persistCanvas(canvas, updatedAssets, method, similarity)
+            },
             onConfirm = { canvas, updatedAssets, method, similarity ->
                 pushUndo()
-                // v3.0.4：画布仅作可视化编辑视图，保存时编译进现有 Action/sceneRule。
-                // 编译 + 合并统一走 SceneCanvas.mergeInto（测试共用同一函数，杜绝门控绕过）。
-                // N5 整图校验配置写回 Script 级字段（不进 canvas、不进运行链模型）。
-                scriptBase = SceneCanvas.mergeInto(scriptBase, canvas, updatedAssets).copy(
-                    globalMethod = method,
-                    globalVerifySimilarity = similarity.coerceIn(1, 100),
-                )
+                persistCanvas(canvas, updatedAssets, method, similarity)
                 showSceneCanvas = false
             },
         )

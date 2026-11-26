@@ -1,0 +1,3 @@
+/workspace/NymphAuto/app/.cxx/RelWithDebInfo/4a6o4q2d/arm64-v8a/CMakeFiles/quickjs-jni.dir
+/workspace/NymphAuto/app/.cxx/RelWithDebInfo/4a6o4q2d/arm64-v8a/CMakeFiles/edit_cache.dir
+/workspace/NymphAuto/app/.cxx/RelWithDebInfo/4a6o4q2d/arm64-v8a/CMakeFiles/rebuild_cache.dir

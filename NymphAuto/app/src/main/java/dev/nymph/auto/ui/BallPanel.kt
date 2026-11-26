@@ -33,10 +33,7 @@ class BallPanel(context: Context) : LinearLayout(context) {
     var onStop: (() -> Unit)? = null
     var onCollapse: (() -> Unit)? = null
 
-    /** 撤销本步（仅预告窗口内可见）。 */
-    var onUndo: (() -> Unit)? = null
-
-    /** 从终止位置继续。 */
+    /** 从终止位置继续（预留；当前由通知栏承载，面板不暴露，避免不可用的死按钮）。 */
     var onResume: (() -> Unit)? = null
 
     /** 任一按钮点击后由宿主收起（C 方案：操作后自动收起）。 */
@@ -45,7 +42,6 @@ class BallPanel(context: Context) : LinearLayout(context) {
     private val btnToggle: Button
     private val btnStop: Button
     private val btnCollapse: Button
-    private val btnUndo: Button
     private val tvStatus: TextView
 
     /** 状态文本优先级：终止卡 > 等待 > 告警 > 下一步 > 档位。一次只显示一条。 */
@@ -87,7 +83,9 @@ class BallPanel(context: Context) : LinearLayout(context) {
             setOnClickListener { onAction?.invoke() }
         }
 
-        // 一行四个等宽按钮：撤销（按需）/ 启停 / 停止 / 收起。
+        // v3.1.2：一行三个等宽按钮（启停 / 停止 / 收起）。
+        // 旧版「撤销」按钮的 onUndo 从未接线（核心层无单步撤销 API），点了没反应，
+        // 属虚假交互，移除以降低视觉噪音与误触；继续由通知栏承载恢复能力。
         val row = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER
@@ -96,11 +94,9 @@ class BallPanel(context: Context) : LinearLayout(context) {
                 LinearLayout.LayoutParams.WRAP_CONTENT,
             )
         }
-        btnUndo = compactButton("撤销", OverlayTheme.WARNING).apply { visibility = View.GONE }
         btnToggle = compactButton("开始", OverlayTheme.BTN_TEXT)
         btnStop = compactButton("停止", OverlayTheme.DANGER)
         btnCollapse = compactButton("收起", OverlayTheme.BTN_TEXT)
-        row.addView(btnUndo)
         row.addView(btnToggle)
         row.addView(btnStop)
         row.addView(btnCollapse)
@@ -123,7 +119,6 @@ class BallPanel(context: Context) : LinearLayout(context) {
         btnToggle.setOnClickListener { onToggle?.invoke() }
         btnStop.setOnClickListener { onStop?.invoke() }
         btnCollapse.setOnClickListener { onCollapse?.invoke() }
-        btnUndo.setOnClickListener { dismissUndo(); onUndo?.invoke() }
     }
 
     /** 合并状态文本到单行：按优先级取第一条，无内容则隐藏。 */
@@ -171,24 +166,17 @@ class BallPanel(context: Context) : LinearLayout(context) {
         refreshStatus()
     }
 
-    /** 显示撤销键并在 [windowMs] 后自动收起。 */
-    fun showUndo(windowMs: Long) {
-        btnUndo.visibility = View.VISIBLE
-        btnUndo.removeCallbacks(hideUndo)
-        btnUndo.postDelayed(hideUndo, windowMs.coerceAtLeast(0L))
-    }
+    /**
+     * 撤销预告入口（v3.1.2 起为 no-op）：核心层无单步撤销 API，按钮已移除，
+     * 保留方法签名使 RunnerService 调用点零改动，避免「勾了/点了没反应」的虚假交互。
+     */
+    fun showUndo(@Suppress("UNUSED_PARAMETER") windowMs: Long) = Unit
 
-    private val hideUndo = Runnable { btnUndo.visibility = View.GONE }
-
-    /** 主动收起撤销键（用户已点或窗口被新的预告替换）。 */
-    fun dismissUndo() {
-        btnUndo.removeCallbacks(hideUndo)
-        btnUndo.visibility = View.GONE
-    }
+    /** 兼容旧调用点；撤销键已移除，无状态可清。 */
+    fun dismissUndo() = Unit
 
     /** 终止卡：null=清除；非空=显示原因与位置。 */
     fun setHalt(report: HaltReport.Report?) {
-        dismissUndo()
         if (report != null) suspectText = ""
         if (report == null) {
             haltText = ""

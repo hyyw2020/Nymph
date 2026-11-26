@@ -1,0 +1,17 @@
+[
+{
+  "directory": "/workspace/NymphAuto/app/.cxx/RelWithDebInfo/z5t636i3/arm64-v8a",
+  "command": "/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target=aarch64-none-linux-android26 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot -D_GNU_SOURCE -Dquickjs_jni_EXPORTS -I/workspace/NymphAuto/app/src/main/cpp -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -O2 -g -DNDEBUG -fPIC -ffunction-sections -fdata-sections -fvisibility=hidden -std=gnu11 -o CMakeFiles/quickjs-jni.dir/quickjs_jni.c.o -c /workspace/NymphAuto/app/src/main/cpp/quickjs_jni.c",
+  "file": "/workspace/NymphAuto/app/src/main/cpp/quickjs_jni.c"
+},
+{
+  "directory": "/workspace/NymphAuto/app/.cxx/RelWithDebInfo/z5t636i3/arm64-v8a",
+  "command": "/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target=aarch64-none-linux-android26 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot -D_GNU_SOURCE -Dquickjs_jni_EXPORTS -I/workspace/NymphAuto/app/src/main/cpp -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -O2 -g -DNDEBUG -fPIC -ffunction-sections -fdata-sections -fvisibility=hidden -std=gnu11 -o CMakeFiles/quickjs-jni.dir/quickjs/quickjs.c.o -c /workspace/NymphAuto/app/src/main/cpp/quickjs/quickjs.c",
+  "file": "/workspace/NymphAuto/app/src/main/cpp/quickjs/quickjs.c"
+},
+{
+  "directory": "/workspace/NymphAuto/app/.cxx/RelWithDebInfo/z5t636i3/arm64-v8a",
+  "command": "/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android26 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dncnn_jni_EXPORTS -I/workspace/NymphAuto/app/src/main/cpp -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security   -O2 -g -DNDEBUG -fPIC -ffunction-sections -fdata-sections -fvisibility=hidden -fexceptions -frtti -o CMakeFiles/ncnn-jni.dir/ncnn_jni.cpp.o -c /workspace/NymphAuto/app/src/main/cpp/ncnn_jni.cpp",
+  "file": "/workspace/NymphAuto/app/src/main/cpp/ncnn_jni.cpp"
+}
+]

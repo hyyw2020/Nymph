@@ -91,9 +91,11 @@ class WorkbenchRefactorGateTest {
     @Test
     fun `工作台同屏三态与合取UI接线存在`() {
         val wb = codeOnly(read("ui/compose/SceneCanvasEditorDialog.kt"))
-        assertTrue("标点态", wb.contains("标点"))
+        // v3.1.2：标点/落点内部黑话统一改为用户可理解的「拾取坐标 / 坐标点」。
+        assertTrue("坐标拾取态", wb.contains("拾取坐标"))
+        assertTrue("坐标点文案", wb.contains("点击坐标"))
         assertTrue("框特征态", wb.contains("框特征"))
-        assertTrue("整图门态", wb.contains("整图门"))
+        assertTrue("整图校验态", wb.contains("整图校验"))
         // N4：ALL / N-of-M 控件接 canvas.combine / minCount（编译层 compileToActions 不动）
         assertTrue("合取combine接线", wb.contains("copy(combine = cb)"))
         assertTrue("N-of-M minCount接线", wb.contains("copy(minCount = n)"))
@@ -187,5 +189,44 @@ class WorkbenchRefactorGateTest {
         // 只保留一处工作台调用——此前分支重复（前置独占 + 末尾叠绘）是界面重合根因。
         val callCount = Regex(Regex.escape(wbCall)).findAll(editor).count()
         assertEquals("工作台调用点必须恰好 1 处", 1, callCount)
+    }
+
+    // ── v3.1.2：抓帧瞬间自动保存 ──
+    @Test
+    fun `抓帧瞬间静默落盘_返回不丢场景`() {
+        val wb = read("ui/compose/SceneCanvasEditorDialog.kt")
+        assertTrue("工作台须暴露 onAutoSave 瞬间落盘回调", wb.contains("onAutoSave: ("))
+        assertTrue("抓帧成功后须调用瞬间落盘", wb.contains("latestAutoSave(nextCanvas, nextAssets"))
+        assertTrue("瞬间落盘回调用 rememberUpdatedState 持新闭包",
+            wb.contains("val latestAutoSave by rememberUpdatedState(onAutoSave)"))
+        assertTrue("顶栏返回须先落盘再退出", wb.contains("contentDescription = \"返回并保存\""))
+
+        val editor = codeOnly(read("ui/compose/EditorScreen.kt"))
+        assertTrue("EditorScreen 须有静默落盘参数", editor.contains("onSilentSave: (Script) -> Unit"))
+        // 显式保存与瞬间落盘共用同一 mergeInto 真源，杜绝两套逻辑漂移。
+        assertTrue("落盘须走 mergeInto 单一真源", editor.contains("SceneCanvas.mergeInto(scriptBase, canvas, updatedAssets)"))
+        assertTrue("瞬间落盘须接线 onAutoSave", editor.contains("onAutoSave = { canvas, updatedAssets, method, similarity ->"))
+
+        val app = read("ui/compose/App.kt")
+        assertTrue("App 须绑定静默落盘到存盘", app.contains("onSilentSave = { next -> vm.saveScript(next) }"))
+    }
+
+    // ── v3.1.2：悬浮球单球化 + 缩小 + 移除死按钮 ──
+    @Test
+    fun `建档期单球化且球缩小并移除撤销死按钮`() {
+        val svc = read("service/RunnerService.kt")
+        assertTrue("须记录建档期临时隐藏运行球", svc.contains("ballHiddenForCapture"))
+        assertTrue("建档期隐藏运行球", svc.contains("ball?.visibility = View.GONE"))
+        assertTrue("退出建档恢复运行球", svc.contains("ball?.visibility = View.VISIBLE"))
+        assertTrue("运行球缩到 46dp", svc.contains("width = dp(46)"))
+
+        val cam = read("ui/CameraBall.kt")
+        assertTrue("相机球用强调色描边与运行球区分", cam.contains("OverlayTheme.ACCENT"))
+        assertTrue("相机球深色底", cam.contains("OverlayTheme.PANEL_DARK"))
+
+        val panel = codeOnly(read("ui/BallPanel.kt"))
+        assertFalse("撤销按钮已移除", panel.contains("btnUndo"))
+        assertFalse("撤销回调已移除", panel.contains("onUndo"))
+        assertTrue("showUndo 保留签名兼容调用点", panel.contains("fun showUndo("))
     }
 }

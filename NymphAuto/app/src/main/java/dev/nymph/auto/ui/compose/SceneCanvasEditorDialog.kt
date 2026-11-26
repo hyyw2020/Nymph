@@ -101,6 +101,16 @@ fun SceneCanvasEditorDialog(
         method: GlobalVerifyMethod,
         similarity: Int,
     ) -> Unit,
+    /**
+     * 抓帧瞬间静默落盘：底图一抓到就写回脚本并存盘，防丢失。
+     * 与 [onConfirm] 的区别——不关闭工作台、不弹提示，用户可继续标注。
+     */
+    onAutoSave: (
+        canvas: SceneCanvas,
+        assets: Map<String, String>,
+        method: GlobalVerifyMethod,
+        similarity: Int,
+    ) -> Unit = { _, _, _, _ -> },
 ) {
     val scope = rememberCoroutineScope()
 
@@ -128,6 +138,9 @@ fun SceneCanvasEditorDialog(
             }
         )
     }
+
+    // 抓帧瞬间落盘：rememberUpdatedState 保证协程内回调读到最新的宿主闭包。
+    val latestAutoSave by rememberUpdatedState(onAutoSave)
 
     /** 抓一帧原画质整屏作为画布底图。走 AutoClickService 唯一合法取屏出口。 */
     fun grabFrame() {
@@ -158,8 +171,8 @@ fun SceneCanvasEditorDialog(
                 }
                 val key = SceneCanvas.BG_PREFIX + UUID.randomUUID().toString().replace("-", "").take(16)
                 withContext(Dispatchers.Main) {
-                    assets = assets.toMutableMap().apply { put(key, b64) }
-                    canvas = canvas.copy(
+                    val nextAssets = assets.toMutableMap().apply { put(key, b64) }
+                    val nextCanvas = canvas.copy(
                         backgroundKey = key,
                         widthPx = bmp.width, heightPx = bmp.height,
                         rotation = 0,             // 方向由用户在下方显式选择，避免依赖服务内部状态
@@ -168,9 +181,14 @@ fun SceneCanvasEditorDialog(
                         clickZone = Region(),
                         pointX = 50.0, pointY = 50.0,
                     )
+                    assets = nextAssets
+                    canvas = nextCanvas
                     selectedFeature = -1
                     selectedPoint = -1
-                    message = "已抓取原画质画布 ${bmp.width}×${bmp.height}px，随脚本保存，可反复编辑。"
+                    message = "已抓取原画质画布 ${bmp.width}×${bmp.height}px，已自动保存，可继续标注。"
+                    // 抓帧瞬间落盘：底图一到位就写回脚本，用户直接返回也不会丢。
+                    // onAutoSave 用 rememberUpdatedState 持有，闭包内读到的是最新 method/similarity。
+                    latestAutoSave(nextCanvas, nextAssets, workMethod, workSimilarity)
                 }
             } catch (t: Throwable) {
                 RunLog.w("SceneCanvas", "抓帧失败：${t.message}")
@@ -245,7 +263,7 @@ fun SceneCanvasEditorDialog(
     /** 新增一个编号点位（相对同一锚，各自绑手势与间隔）。 */
     fun addPoint() {
         if (!canvas.hasBackground()) {
-            message = "请先抓取画布底图，再加落点。"
+            message = "请先抓取画布底图，再拾取点击坐标。"
             return
         }
         val id = "p" + UUID.randomUUID().toString().take(8)
@@ -257,7 +275,7 @@ fun SceneCanvasEditorDialog(
         )
         canvas = canvas.copy(points = canvas.points + point)
         selectedPoint = canvas.points.size - 1
-        message = "已加点位 ${canvas.points.size}：在画布上拖动青色圆点定位，下方选手势与间隔。"
+        message = "已添加点击坐标 ${canvas.points.size}：在画布上拖动青色坐标点定位，下方选手势与间隔。"
     }
 
     fun updatePoint(index: Int, transform: (CanvasPoint) -> CanvasPoint) {
@@ -290,8 +308,15 @@ fun SceneCanvasEditorDialog(
         TopAppBar(
             title = { Text("场景工作台") },
             navigationIcon = {
-                IconButton(onClick = onDismiss) {
-                    Icon(Icons.Filled.Close, contentDescription = "返回")
+                // 返回前先静默落盘当前画布（含抓到的底图与标注），用户直接返回不丢场景。
+                // mergeInto 幂等（替换旧画布产物），与抓帧瞬间的落盘重复调用也无副作用。
+                IconButton(onClick = {
+                    if (canvas.hasBackground()) {
+                        latestAutoSave(canvas, assets, workMethod, workSimilarity)
+                    }
+                    onDismiss()
+                }) {
+                    Icon(Icons.Filled.Close, contentDescription = "返回并保存")
                 }
             },
         )
@@ -304,17 +329,16 @@ fun SceneCanvasEditorDialog(
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text(
-                "一张原画质底图 + 三态标注；保存时只写 Action / sceneRule，画布仅作可视化视图。" +
-                    "真机命中率 / NCC 精度未验证。",
+                "抓一张当前画面作底图，然后在图上拾取点击坐标、框住要识别的元素。画面会自动保存，可随时回来继续编辑。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
-            // 同屏三态切换：标点 / 框特征 / 整图门
+            // 同屏三态切换：拾取坐标 / 框特征 / 整图校验
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                FilterChip(selected = tab == 0, onClick = { tab = 0 }, label = { Text("标点") })
+                FilterChip(selected = tab == 0, onClick = { tab = 0 }, label = { Text("拾取坐标") })
                 FilterChip(selected = tab == 1, onClick = { tab = 1 }, label = { Text("框特征") })
-                FilterChip(selected = tab == 2, onClick = { tab = 2 }, label = { Text("整图门") })
+                FilterChip(selected = tab == 2, onClick = { tab = 2 }, label = { Text("整图校验") })
             }
 
             // 建档：悬浮球点一下 = 抓当前帧（无障碍链），本页按钮同能力；相机球见工作台入口。
@@ -323,7 +347,7 @@ fun SceneCanvasEditorDialog(
                     Text(if (grabbing) "抓帧中…" else if (canvas.hasBackground()) "重新抓画布" else "抓取当前画面")
                 }
                 if (tab == 1) TextButton(onClick = { addFeature() }, enabled = canvas.hasBackground()) { Text("+ 加特征框") }
-                if (tab == 0) TextButton(onClick = { addPoint() }, enabled = canvas.hasBackground()) { Text("+ 加落点") }
+                if (tab == 0) TextButton(onClick = { addPoint() }, enabled = canvas.hasBackground()) { Text("+ 拾取坐标") }
             }
 
                 if (bgBitmap != null) {
@@ -413,10 +437,10 @@ fun SceneCanvasEditorDialog(
 
                 // ── 标点态（tab==0）：每点独立手势 + 参数 + 执行关系
                 if (tab == 0) {
-                Text("落点（${canvas.points.size}）· 按编号顺序执行", fontWeight = FontWeight.Bold)
+                Text("点击坐标（${canvas.points.size}）· 按编号顺序执行", fontWeight = FontWeight.Bold)
                 if (canvas.points.isEmpty()) {
                     Text(
-                        "尚未加点位。加落点后在画布上拖动青色圆点定位，逐点选手势与间隔。",
+                        "尚未拾取坐标。点上方「拾取坐标」后，在画布上拖动青色坐标点定位，逐点选手势与间隔。",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -437,7 +461,7 @@ fun SceneCanvasEditorDialog(
                             FilterChip(
                                 selected = selectedPoint == i,
                                 onClick = { selectedPoint = i },
-                                label = { Text(p.label.ifBlank { "点位${i + 1}" }) },
+                                label = { Text(p.label.ifBlank { "坐标${i + 1}" }) },
                             )
                             Text(
                                 "(${fmt(p.x)}, ${fmt(p.y)})%",

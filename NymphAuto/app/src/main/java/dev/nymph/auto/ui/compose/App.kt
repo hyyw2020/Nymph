@@ -199,6 +199,8 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
                     toast(err)
                 }
             },
+            // v3.1.2：静默落盘——抓帧瞬间/返回时写盘，不弹提示、不退出编辑器。
+            onSilentSave = { next -> vm.saveScript(next) },
             onFloatEdit = ::floatEdit,
         )
         return

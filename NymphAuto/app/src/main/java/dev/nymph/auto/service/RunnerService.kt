@@ -295,6 +295,8 @@ class RunnerService : Service() {
     // v3.1.1：建档相机球独立于运行球，二者进程内并存、互不引用。
     private var cameraBall: dev.nymph.auto.ui.CameraBall? = null
     private var cameraParams: WindowManager.LayoutParams? = null
+    /** v3.1.2：建档取景期间运行球是否被临时隐藏——退出建档时据此恢复，杜绝双球并存遮挡。 */
+    private var ballHiddenForCapture = false
     /** 紧凑面板自动收起任务（C 方案：展开后无操作超时收起）。 */
     private val panelAutoHide = Runnable { hidePanel() }
     /** 动作可视化层（v2.4.0）；默认关闭时全程为 null，零开销。 */
@@ -932,11 +934,12 @@ class RunnerService : Service() {
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-            width = dp(52)
-            height = dp(52)
+            // v3.1.2：球从 52dp 缩到 46dp，降低对目标界面的遮挡。
+            width = dp(46)
+            height = dp(46)
             gravity = Gravity.TOP or Gravity.START
             // v2.9.19：初始位置与边界收敛使用同一全屏绝对坐标真源。
-            x = (screenW - dp(72)).coerceAtLeast(0)
+            x = (screenW - dp(64)).coerceAtLeast(0)
             y = screenH / 3
         }
         attachBallTouch(v, p)
@@ -966,8 +969,8 @@ class RunnerService : Service() {
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-            // B 方案：4 等宽按钮单行，宽度按紧凑条重算；高度自适应（按钮行+单行状态）。
-            width = dp(176)
+            // v3.1.2：移除无效的「撤销」按钮后为 3 等宽按钮，宽度进一步收窄以减少遮挡。
+            width = dp(140)
             height = WindowManager.LayoutParams.WRAP_CONTENT
             gravity = Gravity.TOP or Gravity.START
         }
@@ -987,9 +990,10 @@ class RunnerService : Service() {
     private fun layoutPanel(ballX: Int, ballY: Int) {
         val p = panelParams ?: return
         val v = panel ?: return
-        // v3.1.1 B 方案：紧凑条仅一行按钮 + 至多一行状态，高度按 56dp 估算。
-        val panelH = dp(56)
-        val preferredY = if (ballY + dp(56) + panelH <= screenH) ballY + dp(56)
+        // v3.1.2：球缩到 46dp，面板贴球下方的间距同步收紧。
+        val panelH = dp(52)
+        val gap = dp(52)
+        val preferredY = if (ballY + gap + panelH <= screenH) ballY + gap
         else (ballY - panelH - dp(8)).coerceAtLeast(0)
         // v2.9.19：边界收敛统一走全屏绝对坐标契约，与运行球、编辑面板一致。
         val (cx, cy) = OverlayBounds.clamp(
@@ -1026,11 +1030,18 @@ class RunnerService : Service() {
             toast("缺少悬浮窗权限，无法使用相机球抓帧")
             return
         }
+        // v3.1.2 建档期单球化：先临时隐藏运行球与面板，屏幕上只保留相机球。
+        // 这样既消除「双球并存」的视觉混乱，也避免两个球互相遮挡目标界面。
+        ballHiddenForCapture = ball != null
+        if (ballHiddenForCapture) {
+            hidePanel()
+            ball?.visibility = View.GONE
+        }
         val v = dev.nymph.auto.ui.CameraBall(this)
         v.onCapture = onCapture
-        // 默认位置：运行球右下方错开 60dp，避免两球重叠；无运行球则屏幕右侧 1/2 高度。
-        val baseX = ballParams?.x ?: (screenW - dp(72))
-        val baseY = ballParams?.y ?: (screenH / 2)
+        // 默认位置：屏幕右侧中部（建档期唯一悬浮控件，不再与运行球错开）。
+        val baseX = screenW - dp(64)
+        val baseY = screenH / 2 - dp(24)
         val p = WindowManager.LayoutParams().apply {
             type = overlayType()
             format = PixelFormat.TRANSLUCENT
@@ -1038,11 +1049,12 @@ class RunnerService : Service() {
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-            width = dp(52)
-            height = dp(52)
+            // v3.1.2：球从 52dp 缩到 46dp，降低对目标界面的遮挡。
+            width = dp(46)
+            height = dp(46)
             gravity = Gravity.TOP or Gravity.START
             val (cx, cy) = OverlayBounds.clamp(
-                baseX + dp(60), baseY + dp(48), dp(52), dp(52),
+                baseX, baseY, dp(46), dp(46),
                 OverlayBounds.Size(screenW, screenH),
             )
             x = cx
@@ -1059,7 +1071,7 @@ class RunnerService : Service() {
         RunLog.i("Runner", "相机球已显示：点击抓整页帧")
     }
 
-    /** v3.1.1：退出建档态立即移除相机球并清空回调。 */
+    /** v3.1.1：退出建档态立即移除相机球并清空回调；v3.1.2：恢复此前临时隐藏的运行球。 */
     fun hideCameraBall() {
         cameraBall?.let { v ->
             v.onCapture = null
@@ -1067,6 +1079,10 @@ class RunnerService : Service() {
         }
         cameraBall = null
         cameraParams = null
+        if (ballHiddenForCapture) {
+            ball?.visibility = View.VISIBLE
+            ballHiddenForCapture = false
+        }
     }
 
     /** 相机球触摸：拖动收敛边界；点击（未移动）只抓帧，无长按/启停语义。 */
