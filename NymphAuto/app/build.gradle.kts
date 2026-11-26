@@ -16,8 +16,8 @@ android {
         applicationId = "dev.nymph.auto"
         minSdk = 26          // Android 8.0
         targetSdk = 36       // Android 16（预留 17 升级位）
-        versionCode = 74
-        versionName = "3.1.0"
+        versionCode = 75
+        versionName = "3.1.1"
         // 只构建/打包 arm64-v8a 原生库（QuickJS so ~1MB），与其他 ABI 无关
         ndk {
             abiFilters += "arm64-v8a"

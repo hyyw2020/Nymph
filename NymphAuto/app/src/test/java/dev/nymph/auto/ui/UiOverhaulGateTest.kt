@@ -45,6 +45,18 @@ class UiOverhaulGateTest {
         assertTrue("一次性标记对象", ob.contains("object OnboardingPrefs"))
         assertTrue("标记键", ob.contains("KEY_ONBOARDING_DONE"))
         assertTrue("末页主动作", ob.contains("开始使用"))
+        // v3.1.1：页序即操作序——权限 → 整页截图 → 编辑 → 保存后可再编辑。
+        val perm = ob.indexOf("0 -> PagePermissions(")
+        val capture = ob.indexOf("1 -> PageCapture(")
+        val edit = ob.indexOf("2 -> PageEdit(")
+        val save = ob.indexOf("else -> PageSave(")
+        assertTrue("首页必须是权限", perm >= 0)
+        assertTrue("第二页整页截图", capture > perm)
+        assertTrue("第三页编辑", edit > capture)
+        assertTrue("末页保存后可再编辑", save > edit)
+        assertTrue("相机球抓整页引导", ob.contains("点相机球抓整页"))
+        assertTrue("强调保存后仍可编辑", ob.contains("保存后随时可再编辑"))
+        assertTrue("编辑可自定义", ob.contains("判定条件由你决定"))
     }
 
     // ── 2. 分组标题对齐：不再叠加水平内边距 ──

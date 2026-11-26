@@ -1,6 +1,7 @@
 package dev.nymph.auto.ui
 
 import android.content.Context
+import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.view.View
@@ -11,23 +12,20 @@ import dev.nymph.auto.core.runner.HaltReport
 import dev.nymph.auto.service.RunnerService
 
 /**
- * 悬浮球展开的控制面板：开始/暂停、停止、收起 + 等待浮层行。
+ * 悬浮球长按展开的紧凑控制条（v3.1.1 A+B+C 方案）。
  *
- * 交互约定（与悬浮球配合）：
- *  - 点悬浮球 → 展开/收起本面板
- *  - 长按悬浮球 → 停止并移除（快捷退出）
- *  - 拖动悬浮球 → 移动位置（面板跟随）
+ * 交互约定（与 [FloatBall] 配合）：
+ *  - 点击运行球 → 直接启停（A 方案，不展开本面板）；
+ *  - 长按运行球 → 展开本条；操作任一按钮或点击外部 → 自动收起（C 方案）；
+ *  - 拖动运行球 → 本条跟随。
  *
- * 等待浮层（裁定阶段 3.5）：主界面只显示"正在等待'确认'按钮 3.2s / 15s"，
- * 隐藏时让位给状态行；绝对时间轴、注入模式等不进主界面。
+ * 形态（B 方案）：由旧版 9 行竖排（约 200dp 高、遮挡目标应用视野）压缩为
+ * 「一行操作按钮 + 至多一行状态文本」，静止高度约 44dp。所有运行时信息
+ * （等待/告警/下一步/终止卡/档位）合并进单行状态文本，超长省略；同一份
+ * 信息仍进前台通知（见 RunnerService.refreshForeground），不因压缩而丢失
+ * 可达性。背景半透明（C 方案），透出下层应用，进一步降低遮挡感。
  *
- * v2.9.30 新增两块：
- *  - **常驻「下一步」**（[setNext]）：不阻塞地显示即将执行的动作用于已确认的
- *    重复循环。它与 FULL 级预告的分工见 core.runner.AnnouncePolicy。
- *  - **撤销键**（[showUndo]）：只在预告窗口内出现，窗口结束自动消失。
- *    撤销只影响本步，不影响后续——「全局撤销」是通知栏的暂停/归还/停止。
- *  - **终止卡**（[setHalt]）：停在哪、为什么停、能不能继续。面板可被目标应用
- *    遮挡，因此同一份信息也进通知栏（见 RunnerService.refreshForeground）。
+ * 公开 API 全部保留，调用方零改动；仅内部布局与可见性策略变化。
  */
 class BallPanel(context: Context) : LinearLayout(context) {
 
@@ -41,33 +39,41 @@ class BallPanel(context: Context) : LinearLayout(context) {
     /** 从终止位置继续。 */
     var onResume: (() -> Unit)? = null
 
+    /** 任一按钮点击后由宿主收起（C 方案：操作后自动收起）。 */
+    var onAction: (() -> Unit)? = null
+
     private val btnToggle: Button
     private val btnStop: Button
     private val btnCollapse: Button
     private val btnUndo: Button
-    private val tvWait: TextView
-    private val tvSuspect: TextView
-    private val tvTier: TextView
-    private val tvNext: TextView
-    private val tvHalt: TextView
+    private val tvStatus: TextView
+
+    /** 状态文本优先级：终止卡 > 等待 > 告警 > 下一步 > 档位。一次只显示一条。 */
+    private var haltText = ""
+    private var waitText = ""
+    private var suspectText = ""
+    private var nextText = ""
+    private var tierText = ""
 
     init {
         orientation = VERTICAL
         gravity = Gravity.CENTER
         val d = resources.displayMetrics.density
+        // C 方案：PANEL_BG 保留品牌色，覆以 0.92 alpha——足以辨认控件，又能透出下层应用。
+        val bg = OverlayTheme.PANEL_BG
         background = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = OverlayTheme.RADIUS_PANEL_DP * d
-            setColor(OverlayTheme.PANEL_BG)
+            setColor(Color.argb(235, Color.red(bg), Color.green(bg), Color.blue(bg)))
             setStroke((1 * d).toInt(), OverlayTheme.STROKE_SOFT)
         }
-        setPadding((10 * d).toInt(), (8 * d).toInt(), (10 * d).toInt(), (8 * d).toInt())
+        setPadding((8 * d).toInt(), (5 * d).toInt(), (8 * d).toInt(), (5 * d).toInt())
 
-        fun button(text: String): Button = Button(context).apply {
+        fun compactButton(text: String, color: Int): Button = Button(context).apply {
             this.text = text
             isAllCaps = false
-            textSize = 13f
-            setTextColor(OverlayTheme.BTN_TEXT)
+            textSize = 12f
+            setTextColor(color)
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = OverlayTheme.RADIUS_BTN_DP * d
@@ -75,64 +81,57 @@ class BallPanel(context: Context) : LinearLayout(context) {
             }
             minWidth = 0
             minimumWidth = 0
-            layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
-                topMargin = (4 * d).toInt()
+            layoutParams = LinearLayout.LayoutParams(0, (30 * d).toInt(), 1f).apply {
+                marginStart = (2 * d).toInt()
             }
+            setOnClickListener { onAction?.invoke() }
         }
 
-        fun label(): TextView = TextView(context).apply {
-            textSize = 11f
+        // 一行四个等宽按钮：撤销（按需）/ 启停 / 停止 / 收起。
+        val row = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            )
+        }
+        btnUndo = compactButton("撤销", OverlayTheme.WARNING).apply { visibility = View.GONE }
+        btnToggle = compactButton("开始", OverlayTheme.BTN_TEXT)
+        btnStop = compactButton("停止", OverlayTheme.DANGER)
+        btnCollapse = compactButton("收起", OverlayTheme.BTN_TEXT)
+        row.addView(btnUndo)
+        row.addView(btnToggle)
+        row.addView(btnStop)
+        row.addView(btnCollapse)
+        addView(row)
+
+        tvStatus = TextView(context).apply {
+            textSize = 10f
             setTextColor(OverlayTheme.TEXT_DIM)
             gravity = Gravity.CENTER
-            layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
-                topMargin = (2 * d).toInt()
-            }
-        }
-
-        // 能力档位行（裁定阶段 0：档位与限制明示）
-        tvTier = label()
-        // 等待浮层行（默认隐藏）
-        tvWait = label().apply {
-            setTextColor(OverlayTheme.WARNING)
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = (2 * d).toInt() }
             visibility = View.GONE
         }
-        // v2.9.31：模板可能失效的常驻告警。目标应用全屏时面板可能被遮，
-        // 同一份信息同时进通知栏（见 RunnerService.refreshForeground）。
-        tvSuspect = label().apply {
-            setTextColor(OverlayTheme.WARNING)
-            visibility = View.GONE
-        }
-        // 常驻「下一步」：FOLDED 级预告的落点，不阻塞
-        tvNext = label().apply {
-            setTextColor(OverlayTheme.TEXT_DIM)
-            visibility = View.GONE
-        }
-        // 终止卡：原因 + 位置
-        tvHalt = label().apply {
-            setTextColor(OverlayTheme.DANGER)
-            visibility = View.GONE
-        }
-        btnUndo = button("撤销本步").apply {
-            setTextColor(OverlayTheme.WARNING)
-            visibility = View.GONE
-        }
-        btnToggle = button("开始")
-        btnStop = button("停止").apply { setTextColor(OverlayTheme.DANGER) }
-        btnCollapse = button("收起")
-        addView(tvTier)
-        addView(tvWait)
-        addView(tvSuspect)
-        addView(tvNext)
-        addView(tvHalt)
-        addView(btnUndo)
-        addView(btnToggle)
-        addView(btnStop)
-        addView(btnCollapse)
+        addView(tvStatus)
 
         btnToggle.setOnClickListener { onToggle?.invoke() }
         btnStop.setOnClickListener { onStop?.invoke() }
         btnCollapse.setOnClickListener { onCollapse?.invoke() }
         btnUndo.setOnClickListener { dismissUndo(); onUndo?.invoke() }
+    }
+
+    /** 合并状态文本到单行：按优先级取第一条，无内容则隐藏。 */
+    private fun refreshStatus() {
+        val text = haltText.ifBlank { waitText }.ifBlank { suspectText }
+            .ifBlank { nextText }.ifBlank { tierText }
+        tvStatus.text = text
+        tvStatus.visibility = if (text.isBlank()) View.GONE else View.VISIBLE
     }
 
     /** 按运行状态刷新主按钮文案。 */
@@ -141,61 +140,38 @@ class BallPanel(context: Context) : LinearLayout(context) {
             RunnerService.State.IDLE -> "开始"
             RunnerService.State.RUNNING -> "暂停"
             RunnerService.State.PAUSED -> "继续"
-            RunnerService.State.HALTED -> "从这步继续"
+            RunnerService.State.HALTED -> "继续"
         }
     }
 
     /** 能力档位说明（空串=不显示）。 */
     fun setTier(text: String) {
-        tvTier.text = text
-        tvTier.visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
+        tierText = text
+        refreshStatus()
     }
 
     /** 等待浮层：null=隐藏；非空=显示"正在等待 X Ns / Ms"。 */
     fun setWait(status: dev.nymph.auto.core.runner.WaitStatus?) {
-        if (status == null) {
-            tvWait.visibility = View.GONE
-        } else {
-            tvWait.text = status.render()
-            tvWait.visibility = View.VISIBLE
-        }
+        waitText = status?.render() ?: ""
+        refreshStatus()
     }
 
     /**
      * v2.9.31：「疑似在场」持续未达阈值时的可见告警。空串清除。
-     * 只更新文本、不阻塞、不改变运行状态；同一份文案也进前台通知，
-     * 保证用户切到任何界面都够得着「重新拾取」。
+     * 同一份文案也进前台通知，保证切到任何界面都够得着「重新拾取」。
      */
     fun setSuspect(text: String) {
-        if (text.isBlank()) {
-            tvSuspect.visibility = View.GONE
-        } else {
-            tvSuspect.text = text
-            tvSuspect.visibility = View.VISIBLE
-        }
+        suspectText = text
+        refreshStatus()
     }
 
-    /**
-     * 常驻「下一步」。空串清除。
-     *
-     * 这是 FOLDED 级预告的唯一出口：它必须**不阻塞**，因此这里只更新文本，
-     * 不做任何等待、不触发布局抖动（文本长度变化由单行省略处理）。
-     */
+    /** 常驻「下一步」。FOLDED 级预告不阻塞，只刷新单行状态文本。 */
     fun setNext(text: String) {
-        if (text.isBlank()) {
-            tvNext.visibility = View.GONE
-        } else {
-            tvNext.text = text
-            tvNext.visibility = View.VISIBLE
-        }
+        nextText = text
+        refreshStatus()
     }
 
-    /**
-     * 显示撤销键并在 [windowMs] 后自动收起。
-     *
-     * 窗口时长由 core.runner.AnnouncePolicy 决定，面板不自行延长——否则
-     * 「预告多久」会有两个真源。
-     */
+    /** 显示撤销键并在 [windowMs] 后自动收起。 */
     fun showUndo(windowMs: Long) {
         btnUndo.visibility = View.VISIBLE
         btnUndo.removeCallbacks(hideUndo)
@@ -210,15 +186,13 @@ class BallPanel(context: Context) : LinearLayout(context) {
         btnUndo.visibility = View.GONE
     }
 
-    /**
-     * 终止卡：null=清除；非空=显示原因与位置。
-     * 「从这步继续」同时出现在主按钮（[setState] HALTED 档）与通知栏 action。
-     */
+    /** 终止卡：null=清除；非空=显示原因与位置。 */
     fun setHalt(report: HaltReport.Report?) {
         dismissUndo()
-        if (report != null) setSuspect("")
+        if (report != null) suspectText = ""
         if (report == null) {
-            tvHalt.visibility = View.GONE
+            haltText = ""
+            refreshStatus()
             return
         }
         val where = when {
@@ -226,7 +200,7 @@ class BallPanel(context: Context) : LinearLayout(context) {
             report.resumeStep > 0 -> " · 第 ${report.resumeStep} 步"
             else -> ""
         }
-        tvHalt.text = report.headline + where
-        tvHalt.visibility = View.VISIBLE
+        haltText = report.headline + where
+        refreshStatus()
     }
 }

@@ -164,7 +164,7 @@ class RunnerService : Service() {
             pendingCameraCapture = onCapture
             val svc = liveInstance
             if (svc != null) {
-                svc.enterEditCameraMode(onCapture)
+                svc.showCameraBall(onCapture)
                 return
             }
             val intent = Intent(context, RunnerService::class.java).setAction(ACTION_ENTER_CAMERA)
@@ -172,10 +172,10 @@ class RunnerService : Service() {
             else context.startService(intent)
         }
 
-        /** 退出建档取景态：清除中转回调并复位已存在悬浮球，避免回调滞留。 */
+        /** 退出建档取景态：清除中转回调并移除独立相机球，避免回调滞留。 */
         fun exitCameraCapture() {
             pendingCameraCapture = null
-            liveInstance?.exitEditCameraMode()
+            liveInstance?.hideCameraBall()
         }
 
         /** 看门狗轮询间隔 / 判定卡死阈值。长 WAIT 与条件轮询会刷新心跳，不会误判终止。 */
@@ -292,6 +292,11 @@ class RunnerService : Service() {
     private var ballParams: WindowManager.LayoutParams? = null
     private var panel: BallPanel? = null
     private var panelParams: WindowManager.LayoutParams? = null
+    // v3.1.1：建档相机球独立于运行球，二者进程内并存、互不引用。
+    private var cameraBall: dev.nymph.auto.ui.CameraBall? = null
+    private var cameraParams: WindowManager.LayoutParams? = null
+    /** 紧凑面板自动收起任务（C 方案：展开后无操作超时收起）。 */
+    private val panelAutoHide = Runnable { hidePanel() }
     /** 动作可视化层（v2.4.0）；默认关闭时全程为 null，零开销。 */
     private var visualizer: VisualizerLayer? = null
 
@@ -371,20 +376,15 @@ class RunnerService : Service() {
                 script = parsed
                 RunLog.i("Runner", "已加载脚本「${parsed.name}」${parsed.totalActionCount()} 步")
                 showBall()
-                toast("已就绪：${parsed.name}，点悬浮球展开控制面板")
+                toast("已就绪：${parsed.name}，点悬浮球启停，长按展开面板")
             }
             ACTION_TOGGLE -> toggle()
-            // ADR-075 裁决4 修复：建档取景态专用入口——只创建悬浮球 + 绑抓帧回调 +
-            // 切相机模式，绝不加载脚本、不进入 toggle/start 链、不改变脚本运行状态。
-            // 悬浮窗权限缺失时 showBall 内部 toast + 静默降级，绝不抛异常。
+            // v3.1.1：建档取景专用入口——显示独立的相机球并绑定抓帧回调，
+            // 绝不加载脚本、不进入 toggle/start 链、不改变运行球状态。
+            // 悬浮窗权限缺失时 showCameraBall 内部 toast + 静默降级，绝不抛异常。
             ACTION_ENTER_CAMERA -> {
-                showBall()
-                ball?.let { v ->
-                    v.onCapture = pendingCameraCapture
-                    v.setMode(FloatBall.Mode.EDIT_CAMERA)
-                }
-                hidePanel()
-                RunLog.i("Runner", "建档取景态已就绪：相机球点击走抓帧回调")
+                showCameraBall(pendingCameraCapture)
+                RunLog.i("Runner", "建档相机球已就绪：点球抓帧")
                 // 不提前 return：必须 fall-through 到末尾 refreshForeground() 完成
                 // startForeground，否则 startForegroundService 启动后 5s 内未挂前台会崩溃。
             }
@@ -917,7 +917,10 @@ class RunnerService : Service() {
             return
         }
         RunLog.d("Runner", "创建悬浮球")
-        val v = FloatBall(this)
+        val v = FloatBall(this).apply {
+            onToggle = { toggle() }
+            onShowPanel = { showPanel() }
+        }
         val p = WindowManager.LayoutParams().apply {
             type = overlayType()
             format = PixelFormat.TRANSLUCENT
@@ -944,13 +947,15 @@ class RunnerService : Service() {
         }
         ball = v
         ballParams = p
-        RunLog.i("Runner", "悬浮球已显示，点击展开控制面板")
+        RunLog.i("Runner", "悬浮球已显示：点击启停，长按展开紧凑面板")
 
-        // 控制面板（默认隐藏，点球展开）
+        // v3.1.1 B+C 方案：紧凑控制条（默认隐藏，长按球展开）。
         val panel = BallPanel(this).apply {
             onToggle = { toggle() }
             onStop = { stopAll() }
             onCollapse = { hidePanel() }
+            // C 方案：任一按钮操作后立即收起，避免持续遮挡。
+            onAction = { hidePanel() }
             visibility = View.GONE
         }
         val pp = WindowManager.LayoutParams().apply {
@@ -961,7 +966,8 @@ class RunnerService : Service() {
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-            width = dp(112)
+            // B 方案：4 等宽按钮单行，宽度按紧凑条重算；高度自适应（按钮行+单行状态）。
+            width = dp(176)
             height = WindowManager.LayoutParams.WRAP_CONTENT
             gravity = Gravity.TOP or Gravity.START
         }
@@ -981,8 +987,8 @@ class RunnerService : Service() {
     private fun layoutPanel(ballX: Int, ballY: Int) {
         val p = panelParams ?: return
         val v = panel ?: return
-        // 高度含能力档位行与等待浮层行（5 行）
-        val panelH = dp(200)
+        // v3.1.1 B 方案：紧凑条仅一行按钮 + 至多一行状态，高度按 56dp 估算。
+        val panelH = dp(56)
         val preferredY = if (ballY + dp(56) + panelH <= screenH) ballY + dp(56)
         else (ballY - panelH - dp(8)).coerceAtLeast(0)
         // v2.9.19：边界收敛统一走全屏绝对坐标契约，与运行球、编辑面板一致。
@@ -995,32 +1001,114 @@ class RunnerService : Service() {
     }
 
     private fun hidePanel() {
+        panel?.removeCallbacks(panelAutoHide)
         panel?.visibility = View.GONE
     }
 
-    private fun togglePanel() {
+    /** v3.1.1 A 方案：长按球展开紧凑面板，并在 4s 无操作后自动收起（C 方案）。 */
+    private fun showPanel() {
         val p = panel ?: return
-        p.visibility = if (p.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-        if (p.visibility == View.VISIBLE) layoutPanel(ballParams?.x ?: 0, ballParams?.y ?: 0)
+        p.visibility = View.VISIBLE
+        layoutPanel(ballParams?.x ?: 0, ballParams?.y ?: 0)
+        p.removeCallbacks(panelAutoHide)
+        p.postDelayed(panelAutoHide, 4_000L)
     }
 
     /**
-     * ADR-075 / 裁决 4 + 收尾：进入编辑建档态——把运行球切为相机语义（全局常驻）。
-     * 球未显示时先按需创建；悬浮窗权限缺失/添加失败由 [showBall] 内部 toast + 静默降级，
-     * 绝不抛异常、绝不启动/停止脚本。点球只调 [onCapture]（抓帧），不再展开面板/启停。
-     * 建档结束必须调用 [exitEditCameraMode] 复位，绝不把 EDIT_CAMERA 泄漏到运行态。
+     * v3.1.1 双球分离：创建独立的建档相机球（与运行球并存、互不引用）。
+     * 点球只调 [onCapture]（抓当前整页帧），不展开面板、不触发任何启停；
+     * 悬浮窗权限缺失时 toast + 静默降级，绝不抛异常。
      */
-    fun enterEditCameraMode(onCapture: () -> Unit) {
-        if (ball == null) showBall()
-        val v = ball ?: return
+    fun showCameraBall(onCapture: (() -> Unit)?) {
+        if (cameraBall != null) return
+        if (!Settings.canDrawOverlays(this)) {
+            RunLog.e("Runner", "悬浮窗权限缺失，无法创建相机球")
+            toast("缺少悬浮窗权限，无法使用相机球抓帧")
+            return
+        }
+        val v = dev.nymph.auto.ui.CameraBall(this)
         v.onCapture = onCapture
-        v.setMode(FloatBall.Mode.EDIT_CAMERA)
-        hidePanel()
+        // 默认位置：运行球右下方错开 60dp，避免两球重叠；无运行球则屏幕右侧 1/2 高度。
+        val baseX = ballParams?.x ?: (screenW - dp(72))
+        val baseY = ballParams?.y ?: (screenH / 2)
+        val p = WindowManager.LayoutParams().apply {
+            type = overlayType()
+            format = PixelFormat.TRANSLUCENT
+            flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            width = dp(52)
+            height = dp(52)
+            gravity = Gravity.TOP or Gravity.START
+            val (cx, cy) = OverlayBounds.clamp(
+                baseX + dp(60), baseY + dp(48), dp(52), dp(52),
+                OverlayBounds.Size(screenW, screenH),
+            )
+            x = cx
+            y = cy
+        }
+        attachCameraBallTouch(v, p)
+        runCatching { wm.addView(v, p) }.onFailure {
+            RunLog.e("Runner", "相机球添加失败：${it.javaClass.simpleName}: ${it.message}")
+            toast("相机球创建失败")
+            return
+        }
+        cameraBall = v
+        cameraParams = p
+        RunLog.i("Runner", "相机球已显示：点击抓整页帧")
     }
 
-    /** ADR-075 / 裁决 4：退出建档态立即复位 RUN_STATUS 并清空抓帧回调，恢复球启停。 */
-    fun exitEditCameraMode() {
-        ball?.setMode(FloatBall.Mode.RUN_STATUS)
+    /** v3.1.1：退出建档态立即移除相机球并清空回调。 */
+    fun hideCameraBall() {
+        cameraBall?.let { v ->
+            v.onCapture = null
+            runCatching { wm.removeView(v) }
+        }
+        cameraBall = null
+        cameraParams = null
+    }
+
+    /** 相机球触摸：拖动收敛边界；点击（未移动）只抓帧，无长按/启停语义。 */
+    private fun attachCameraBallTouch(v: dev.nymph.auto.ui.CameraBall, p: WindowManager.LayoutParams) {
+        var downRawX = 0f
+        var downRawY = 0f
+        var offX = 0f
+        var offY = 0f
+        var moved = false
+        v.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downRawX = e.rawX
+                    downRawY = e.rawY
+                    offX = p.x - e.rawX
+                    offY = p.y - e.rawY
+                    moved = false
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (abs(e.rawX - downRawX) > dp(8) || abs(e.rawY - downRawY) > dp(8)) {
+                        moved = true
+                    }
+                    if (moved) {
+                        val (cx, cy) = OverlayBounds.clamp(
+                            (e.rawX + offX).toInt(), (e.rawY + offY).toInt(),
+                            p.width, p.height, OverlayBounds.Size(screenW, screenH),
+                        )
+                        p.x = cx
+                        p.y = cy
+                        runCatching { wm.updateViewLayout(v, p) }
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!moved) v.onCapture?.invoke()
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> true
+                else -> false
+            }
+        }
     }
 
     private fun attachBallTouch(v: FloatBall, p: WindowManager.LayoutParams) {
@@ -1030,14 +1118,13 @@ class RunnerService : Service() {
         var offY = 0f
         var moved = false
         var longPressed = false
+        // v3.1.1 A 方案：长按球展开紧凑面板（不再是停止并移除）。
+        // 停止动作收进面板「停止」按钮 / 通知栏；与点击启停语义分离，杜绝误触。
         val longPressRunnable = Runnable {
-            // ADR-075 裁决 4：编辑建档态下长按也绝不停脚本（互斥标志隔离启停）。
-            if (v.currentMode() == FloatBall.Mode.EDIT_CAMERA) return@Runnable
             longPressed = true
-            vibrate(60L)
-            RunLog.i("Runner", "长按悬浮球：停止并关闭")
-            toast("已停止")
-            stopAll()
+            vibrate(40L)
+            RunLog.i("Runner", "长按悬浮球：展开紧凑控制面板")
+            v.onShowPanel?.invoke()
         }
         v.setOnTouchListener { _, e ->
             when (e.actionMasked) {
@@ -1080,12 +1167,10 @@ class RunnerService : Service() {
                     DragDiagnostics.onEnd(DragDiagnostics.Target.RUNNER_BALL)
                     v.removeCallbacks(longPressRunnable)
                     if (!moved && !longPressed) {
-                        // ADR-075 裁决 4：编辑建档态点球只抓帧，绝不展开面板/触发启停。
-                        if (v.currentMode() == FloatBall.Mode.EDIT_CAMERA) {
-                            v.onCapture?.invoke()
-                        } else {
-                            togglePanel()
-                        }
+                        // v3.1.1 A 方案：点击运行球直接启停（不弹面板）；
+                        // 长按已在 longPressRunnable 展开面板，此处不再处理。
+                        hidePanel()
+                        v.onToggle?.invoke()
                     }
                     true
                 }
@@ -1250,6 +1335,7 @@ class RunnerService : Service() {
         panel?.let { runCatching { wm.removeView(it) } }
         panel = null
         panelParams = null
+        hideCameraBall()
         ball?.let { v ->
             runCatching { wm.removeView(v) }
             ball = null

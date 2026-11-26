@@ -102,21 +102,36 @@ class WorkbenchRefactorGateTest {
         assertTrue("整图门阈值回写", wb.contains("workSimilarity"))
     }
 
-    // ── 静态扫描：悬浮球互斥标志 ──
+    // ── 静态扫描：v3.1.1 双球分离 + A+B+C 交互重构 ──
     @Test
-    fun `悬浮球双语义互斥标志存实例字段且退出清除`() {
+    fun `运行球与相机球分离且点击启停长按出面板`() {
         val ball = read("ui/FloatBall.kt")
-        assertTrue("互斥模式枚举", ball.contains("enum class Mode"))
-        assertTrue("实例字段mode", ball.contains("private var mode"))
-        assertTrue("相机态点击回调", ball.contains("var onCapture"))
-        assertTrue("复位API", ball.contains("fun setMode"))
-        // 退出复位 RUN_STATUS 时清空 onCapture，杜绝泄漏到运行态
-        assertTrue("退出清除回调", ball.contains("if (m == Mode.RUN_STATUS) onCapture = null"))
+        // 运行球单一语义：点击启停 + 长按出面板；不再有互斥模式枚举。
+        assertTrue("点击启停回调", ball.contains("var onToggle"))
+        assertTrue("长按展开面板回调", ball.contains("var onShowPanel"))
+        assertFalse("不得再有互斥模式枚举", ball.contains("enum class Mode"))
+        assertFalse("不得再有相机抓帧回调", ball.contains("onCapture"))
+
+        // 相机球是独立控件，只绑定抓帧回调，无启停/面板语义。
+        val cam = read("ui/CameraBall.kt")
+        assertTrue("独立相机球类", cam.contains("class CameraBall"))
+        assertTrue("相机球抓帧回调", cam.contains("var onCapture"))
+        assertFalse("相机球不得有启停回调", cam.contains("onToggle") or cam.contains("onShowPanel"))
 
         val svc = read("service/RunnerService.kt")
-        assertTrue("进入建档态API", svc.contains("fun enterEditCameraMode"))
-        assertTrue("退出建档态API", svc.contains("fun exitEditCameraMode"))
-        assertTrue("点击分流不误触启停", svc.contains("v.onCapture?.invoke()"))
+        assertTrue("创建独立相机球 API", svc.contains("fun showCameraBall"))
+        assertTrue("移除独立相机球 API", svc.contains("fun hideCameraBall"))
+        assertFalse("不得再有旧互斥入口", svc.contains("enterEditCameraMode") || svc.contains("exitEditCameraMode"))
+        // A 方案：点击运行球走 onToggle 回调（绑定 toggle），长按走 onShowPanel（绑定 showPanel）。
+        assertTrue("球点击回调绑定启停", svc.contains("onToggle = { toggle() }"))
+        assertTrue("球长按回调绑定面板", svc.contains("onShowPanel = { showPanel() }"))
+        assertTrue("点击时先收起面板", svc.contains("hidePanel()\n                        v.onToggle?.invoke()"))
+        // B+C 方案：紧凑条 + 超时自动收起 + 操作后收起。
+        assertTrue("面板超时自动收起", svc.contains("postDelayed(panelAutoHide"))
+        val panel = read("ui/BallPanel.kt")
+        assertTrue("面板半透明", panel.contains("Color.argb"))
+        assertTrue("面板操作后收起钩子", panel.contains("onAction"))
+        assertTrue("面板单行状态文本", panel.contains("maxLines = 1"))
     }
 
     // ── 静态扫描：裁决 4 修复——相机球建档取景态「主动拉起」链路 ──
@@ -131,8 +146,8 @@ class WorkbenchRefactorGateTest {
         // 专用 action：只建球 + 置相机模式，不加载脚本、不进 ACTION_START 链。
         assertTrue("专用 action 常量", svc.contains("ACTION_ENTER_CAMERA"))
         assertTrue("专用 action 分支", svc.contains("ACTION_ENTER_CAMERA ->"))
-        // 球未显示时先创建（全局常驻）。
-        assertTrue("球未显示先创建（全局常驻）", svc.contains("if (ball == null) showBall()"))
+        // v3.1.1：独立相机球按幂等判空创建（不复用运行球）。
+        assertTrue("独立相机球幂等创建", svc.contains("if (cameraBall != null) return"))
         // 首启必须落前台：ACTION_ENTER_CAMERA 分支不得提前 return 跳过 refreshForeground。
         val branch = svc.substring(
             svc.indexOf("ACTION_ENTER_CAMERA ->"),

@@ -18,9 +18,10 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Done
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -39,24 +40,21 @@ import dev.nymph.auto.service.RunnerService
 import kotlinx.coroutines.launch
 
 /**
- * 首次启动新手引导（v3.1.0）。
+ * 首次启动新手引导（v3.1.1 重构）。
  *
- * ## 设计定位
+ * ## 引导路径（严格按建档实操顺序）
  *
- * 引导只解决一件事：把「新用户在前 60 秒内做不出第一条脚本」的空白期补上。
- * 它不承载执行语义，只做三件事——
- *  1. 建立心智模型：本地离线自动化，录制 → 建档 → 运行；
- *  2. 把「两项系统能力」提前到首次会话，用实时状态消除「为什么点了没反应」；
- *  3. 用明确的下一步收口，不把用户留在空列表里。
+ * 引导只解决一件事：让新用户在首次会话内跑通「权限 → 整页截图 → 编辑 → 保存」的最小闭环。
+ * 页序即操作序，不插入与建档无关的定位/理念页：
+ *  1. [PagePermissions]：先授予无障碍服务与悬浮窗（实时回读状态，可一键跳系统设置）；
+ *  2. [PageCapture]：整页截图——进入建档后点悬浮相机球抓当前整页画面作为画布底图；
+ *  3. [PageEdit]：编辑——在画布上标落点/框特征/整图门，判定条件可自定义；
+ *  4. [PageSave]：保存后可再编辑——保存不锁定，脚本随时可回到工作台继续改。
  *
- * 视觉完全落在既有 Quiet Precision 体系内：深底 + 青绿强调 + 状态 pill，
- * 不引入新的颜色或装饰语言（craft floor：拒绝 AI 模板感的渐变/emoji/彩条）。
+ * ## 视觉与门控
  *
- * ## 一次性门控
- *
- * 复用 [RunnerService.PREFS]（`nymphauto` SharedPreferences）的布尔标记，
- * 与 v2.9.16 的「场景范式引导一次性标记」同一范式：不新增文件、不新增权限。
- * 标记只在「开始使用 / 跳过 / 系统返回」三个出口写盘；再次进入不重复弹出。
+ * 沿用 Quiet Precision 设计系统：深底 + 青绿强调 + 状态 pill，不引入新颜色或装饰语言。
+ * 一次性门控复用 [RunnerService.PREFS] 布尔标记，仅在「开始使用 / 跳过 / 系统返回」出口写盘。
  */
 
 private const val KEY_ONBOARDING_DONE = "onboarding_done_v1"
@@ -75,8 +73,8 @@ object OnboardingPrefs {
 /**
  * 引导主壳：四页横向分页 + 底部进度/下一步。
  *
- * @param a11yOn 无障碍服务实时开关状态（第二页权限卡用）。
- * @param overlayOn 悬浮窗实时授权状态（第二页权限卡用）。
+ * @param a11yOn 无障碍服务实时开关状态（第一页权限卡用）。
+ * @param overlayOn 悬浮窗实时授权状态（第一页权限卡用）。
  */
 @Composable
 fun OnboardingScreen(
@@ -97,10 +95,10 @@ fun OnboardingScreen(
             modifier = Modifier.weight(1f),
         ) { i ->
             when (i) {
-                0 -> PagePositioning()
-                1 -> PagePermissions(a11yOn, overlayOn, onOpenA11y, onOpenOverlay)
-                2 -> PageWorkflow()
-                else -> PageReady()
+                0 -> PagePermissions(a11yOn, overlayOn, onOpenA11y, onOpenOverlay)
+                1 -> PageCapture()
+                2 -> PageEdit()
+                else -> PageSave()
             }
         }
 
@@ -162,23 +160,7 @@ fun OnboardingScreen(
     }
 }
 
-// ------------------------------------------------------------ 页 1：定位
-
-@Composable
-private fun PagePositioning() {
-    PageScaffold(
-        icon = Icons.Filled.PlayArrow,
-        title = "在目标应用之上，自动执行重复操作",
-        subtitle = "NymphAuto 通过无障碍服务注入手势、识别界面，把「录制 → 建档 → 运行」" +
-            "收敛为一条离线流水线。",
-    ) {
-        Bullet("本地离线：无 INTERNET 权限，全部数据留在设备内")
-        Bullet("零录屏占用：不申请 MediaProjection，可与系统录屏并行")
-        Bullet("明文可审计：脚本为明文 JSON，release 关闭 R8 混淆")
-    }
-}
-
-// ------------------------------------------------------------ 页 2：权限
+// ------------------------------------------------------------ 页 1：权限（首屏）
 
 @Composable
 private fun PagePermissions(
@@ -189,22 +171,29 @@ private fun PagePermissions(
 ) {
     PageScaffold(
         icon = Icons.Filled.Settings,
-        title = "先配置两项系统能力",
-        subtitle = "手势注入与界面识别依赖无障碍服务；悬浮球与控制面板依赖悬浮窗授权。" +
-            "状态会随系统设置实时回读。",
+        title = "先授予两项系统能力",
+        subtitle = "这两项是执行与截图的前提，授权状态会实时回读；授予后再进入建档。",
     ) {
         OnboardingPermRow(
             title = "无障碍服务",
-            subtitle = "手势注入 · 控件读取 · 无障碍截图",
+            subtitle = "手势注入 · 控件读取 · 整页截图取帧",
             ok = a11yOn,
             onOpen = onOpenA11y,
         )
         Spacer(Modifier.height(Ds.SM))
         OnboardingPermRow(
             title = "悬浮窗",
-            subtitle = "运行/录制时的悬浮球与控制面板",
+            subtitle = "建档时的相机球与运行时的悬浮球",
             ok = overlayOn,
             onOpen = onOpenOverlay,
+        )
+        Spacer(Modifier.height(Ds.MD))
+        Text(
+            if (a11yOn && overlayOn) "两项能力已就绪，点「下一步」继续"
+            else "授予后返回本页，状态会自动变为「已就绪」",
+            style = Ds.BodySecondary,
+            color = if (a11yOn && overlayOn) MaterialTheme.colorScheme.primary
+            else MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
@@ -254,71 +243,69 @@ private fun OnboardingPermRow(
     }
 }
 
-// ------------------------------------------------------------ 页 3：工作流
+// ------------------------------------------------------------ 页 2：整页截图
 
 @Composable
-private fun PageWorkflow() {
+private fun PageCapture() {
     PageScaffold(
-        icon = Icons.AutoMirrored.Filled.List,
-        title = "三步建立一条脚本",
-        subtitle = "每一步都有明确的入口与退出，不依赖记忆菜单位置。",
+        icon = Icons.Filled.Place,
+        title = "切到目标界面，点相机球抓整页",
+        subtitle = "进入脚本工作台建档后，先切到要自动化的应用界面，再点悬浮的相机球——" +
+            "它会把当前整页画面抓成画布底图。",
     ) {
-        StepCard("1", "录制", "切到目标应用照常操作，被动观察点击/滑动/输入，自动编译为场景")
+        StepCard("1", "新建脚本", "从脚本页点「新建脚本」进入工作台建档")
         Spacer(Modifier.height(Ds.SM))
-        StepCard("2", "建档", "在工作台逐场景精确编辑，框选特征、配置合取与整图门")
+        StepCard("2", "切到目标界面", "打开要自动化的应用，停在操作的起始画面")
         Spacer(Modifier.height(Ds.SM))
-        StepCard("3", "运行", "悬浮球一键启停，命中率与轨迹实时可视化")
+        StepCard("3", "点相机球抓整页", "悬浮相机球点一下即抓当前整页，可反复重抓直到满意")
+        Spacer(Modifier.height(Ds.MD))
+        Text(
+            "相机球只在建档时出现，点它只抓帧、不会启动脚本；抓帧走无障碍链，不占录屏权限。",
+            style = Ds.BodySecondary,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
+// ------------------------------------------------------------ 页 3：编辑
+
 @Composable
-private fun StepCard(order: String, title: String, subtitle: String) {
-    Surface(
-        color = MaterialTheme.colorScheme.surfaceContainerHigh,
-        shape = Ds.RadiusMd,
-        modifier = Modifier.fillMaxWidth(),
+private fun PageEdit() {
+    PageScaffold(
+        icon = Icons.Filled.Edit,
+        title = "在底图上编辑，条件可自定义",
+        subtitle = "抓到的整页就是画布。在画布上直接标注要操作的位置，判定条件由你决定。",
     ) {
-        Row(
-            Modifier.padding(Ds.LG),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box(
-                Modifier
-                    .size(30.dp)
-                    .background(MaterialTheme.colorScheme.primaryContainer, CircleShape),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    order,
-                    style = Ds.Mono.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold),
-                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                )
-            }
-            Spacer(Modifier.width(Ds.MD))
-            Column(Modifier.weight(1f)) {
-                Text(title, style = Ds.ItemTitle)
-                Text(
-                    subtitle,
-                    style = Ds.BodySecondary,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
+        Bullet("标点：在需要点击/滑动的位置落点，指定动作与顺序")
+        Bullet("框特征：框住目标区域，按控件 ID / 文字 / 图像特征识别，不依赖固定坐标")
+        Bullet("整图门：用整页匹配作为触发条件，满足才往下执行")
+        Spacer(Modifier.height(Ds.MD))
+        Text(
+            "编辑是可选的，也不要求一次到位——先保存一条能跑的，再逐步细化条件即可。",
+            style = Ds.BodySecondary,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
-// ------------------------------------------------------------ 页 4：开始
+// ------------------------------------------------------------ 页 4：保存后可再编辑
 
 @Composable
-private fun PageReady() {
+private fun PageSave() {
     PageScaffold(
-        icon = Icons.Filled.CheckCircle,
-        title = "准备就绪",
-        subtitle = "从「录制」开始最快；也可先导入现有 .zjs 脚本，或直接新建脚本进入工作台建档。",
+        icon = Icons.Filled.Done,
+        title = "保存后随时可再编辑",
+        subtitle = "保存不是终点。任何已保存的脚本都能重新进入工作台，继续抓帧、改标注、调条件。",
     ) {
-        Bullet("首次运行会请求 JS 授权，仅在脚本含「运行 JS 代码」场景时出现")
-        Bullet("引导可随时在「设置 → 新手引导」重新查看")
-        Bullet("全部能力离线，随时可在设置页关闭可视化与高频识别")
+        Bullet("脚本以明文 JSON 存本机，可直接打开阅读与备份")
+        Bullet("脚本页点任意脚本即可编辑，改完再保存不影响其他脚本")
+        Bullet("运行时用悬浮球一键启停，命中率与轨迹实时可视化")
+        Spacer(Modifier.height(Ds.MD))
+        Text(
+            "引导可随时在「设置 → 新手引导」重新查看。现在开始，点「开始使用」进入脚本页。",
+            style = Ds.BodySecondary,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -360,6 +347,42 @@ private fun PageScaffold(
         )
         Spacer(Modifier.height(Ds.XL))
         content()
+    }
+}
+
+@Composable
+private fun StepCard(order: String, title: String, subtitle: String) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = Ds.RadiusMd,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            Modifier.padding(Ds.LG),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                Modifier
+                    .size(30.dp)
+                    .background(MaterialTheme.colorScheme.primaryContainer, CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    order,
+                    style = Ds.Mono.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold),
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                )
+            }
+            Spacer(Modifier.width(Ds.MD))
+            Column(Modifier.weight(1f)) {
+                Text(title, style = Ds.ItemTitle)
+                Text(
+                    subtitle,
+                    style = Ds.BodySecondary,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
 }
 

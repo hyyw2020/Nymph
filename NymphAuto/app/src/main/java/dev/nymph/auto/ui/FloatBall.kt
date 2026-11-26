@@ -8,38 +8,24 @@ import dev.nymph.auto.service.RunnerService
 import kotlin.math.min
 
 /**
- * 悬浮球：状态指示（灰=就绪 / 绿=执行中 / 黄=暂停）+ 拖动 + 点击切换。
+ * 运行球：脚本启停状态指示（灰=就绪 / 绿=执行中 / 黄=暂停 / 红=终止待恢复）+ 拖动 + 点击启停。
  *
- * ADR-075 / 裁决 4：双语义互斥标志 [mode] 存实例字段、仅内存态、不持久化、不进 Script。
- * - [Mode.RUN_STATUS]（默认）：点击展开面板走启停，长按需停——运行态逐字零回归。
- * - [Mode.EDIT_CAMERA]：点击只回调 [onCapture]（抓当前帧建档，走无障碍链），
- *   屏蔽 onToggle / onStop 启停，点一下绝不误触启停；退出立即复位 RUN_STATUS。
- * 两条回调互斥、不复用；[setMode] 是本标志的唯一写入口。
+ * v3.1.1 交互重构（A+B+C 方案）——单一语义，不再承载相机取景：
+ *  - 点击 → 直接 [onToggle]（开始/暂停/继续，A 方案「点击即启停」）；
+ *  - 长按 → [onShowPanel] 展开紧凑控制条，长按时长内移动则判为拖动、不出面板；
+ *  - 拖动 → 移动位置，面板跟随。
+ * 相机取景已拆分为独立的 [CameraBall] 控件，二者在进程内并存、互不引用，
+ * 杜绝 ADR-075 时代「一个球两种互斥模式」带来的误触与语义耦合。
  */
 class FloatBall(context: Context) : View(context) {
 
-    /** 双语义互斥模式。 */
-    enum class Mode { EDIT_CAMERA, RUN_STATUS }
+    /** 点击启停回调。 */
+    var onToggle: (() -> Unit)? = null
+    /** 长按展开紧凑面板回调。 */
+    var onShowPanel: (() -> Unit)? = null
 
-    /** 相机态点击回调（抓帧建档）。运行态为 null。 */
-    var onCapture: (() -> Unit)? = null
-
-    private var mode: Mode = Mode.RUN_STATUS
     private var state = RunnerService.State.IDLE
     private val density = resources.displayMetrics.density
-
-    /** 当前模式（只读）。 */
-    fun currentMode(): Mode = mode
-
-    /**
-     * 唯一写入口：进入编辑建档态置 EDIT_CAMERA，退出立即复位 RUN_STATUS。
-     * 复位时一并清空 onCapture，杜绝回调泄漏到运行态导致球无法启停。
-     */
-    fun setMode(m: Mode) {
-        mode = m
-        if (m == Mode.RUN_STATUS) onCapture = null
-        invalidate()
-    }
 
     private val circlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -53,11 +39,6 @@ class FloatBall(context: Context) : View(context) {
     private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
         color = 0xFFFFFFFF.toInt()
-    }
-    /** 相机镜头孔：用球体底色，形成「方框挖孔」的相机轮廓。 */
-    private val cameraLensPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-        color = OverlayTheme.IDLE
     }
 
     fun setState(s: RunnerService.State) {
@@ -81,14 +62,6 @@ class FloatBall(context: Context) : View(context) {
         if (r <= 0f) return
         canvas.drawCircle(cx, cy, r, circlePaint)
         canvas.drawCircle(cx, cy, r, borderPaint)
-        // 编辑建档态：画相机方框 + 镜头圆点，与运行态三角/暂停条明显区分。
-        if (mode == Mode.EDIT_CAMERA) {
-            val hw = r * 0.42f
-            val hh = r * 0.32f
-            canvas.drawRoundRect(cx - hw, cy - hh, cx + hw, cy + hh, 3f * density, 3f * density, iconPaint)
-            canvas.drawCircle(cx, cy, r * 0.13f, cameraLensPaint)
-            return
-        }
         val ir = r * 0.36f
         if (state == RunnerService.State.RUNNING) {
             val bw = r * 0.24f
