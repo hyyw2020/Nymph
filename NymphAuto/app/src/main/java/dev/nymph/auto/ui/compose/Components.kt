@@ -82,13 +82,19 @@ fun StatusPill(
 
 enum class Tone { OK, WARN, BAD, NEUTRAL }
 
-/** 分组标题：承担区块层级，用有分量的标题字号而非 eyebrow 小标签。 */
+/**
+ * 分组标题：承担区块层级，用有分量的标题字号而非 eyebrow 小标签。
+ *
+ * 左右边距由父容器统一提供（RecordScreen/SettingsScreen 的 Column 已
+ * `.padding(horizontal = 16.dp)`），此处只负责上下节奏。此前叠加了
+ * start/end = 16.dp，导致标题比同组卡片多缩进 16dp、左右不对齐。
+ */
 @Composable
 fun SectionTitle(text: String, trailing: String? = null) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(start = Ds.LG, end = Ds.LG, top = Ds.XL, bottom = Ds.SM),
+            .padding(top = Ds.XL, bottom = Ds.SM),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(

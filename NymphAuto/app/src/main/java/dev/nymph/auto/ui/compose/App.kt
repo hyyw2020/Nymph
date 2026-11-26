@@ -13,12 +13,16 @@ import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.automirrored.filled.List
@@ -44,6 +48,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -77,13 +82,23 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
     var showVideoImport by remember { mutableStateOf(false) }
     // v3.0.0：轻量定点点击快路径（三步：坐标→间隔→运行）
     var showSimpleTap by remember { mutableStateOf(false) }
+    // v3.1.0：首次启动新手引导。一次性门控读 nymphauto SharedPreferences，
+    // 只做新用户前 60 秒的心智模型与权限引导，不承载任何执行语义。
+    var showOnboarding by remember { mutableStateOf(!OnboardingPrefs.isDone(context)) }
 
     fun toast(msg: String) {
         Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
     }
 
+    fun finishOnboarding() {
+        OnboardingPrefs.markDone(context)
+        showOnboarding = false
+    }
+
     // 二级日志页未接入系统返回：此前在日志页按返回键会直接退出整个应用。
     BackHandler(enabled = showLogs) { showLogs = false }
+    // 引导期间系统返回等价于「跳过」：标记完成并退出，不重复弹出。
+    BackHandler(enabled = showOnboarding) { finishOnboarding() }
 
     // 通知权限（Android 13+ 运行时权限）：拒绝过一次后系统不再弹框，
     // 此时 launch 会立即回调 denied，引导用户去系统通知设置手动开启。
@@ -138,6 +153,26 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
         }
     }
 
+    // v3.1.0：首次启动新手引导——覆盖主壳，优先于日志/编辑器渲染。
+    // 权限页实时回读 vm.state 的 a11yOn/overlayOn，跳系统设置返回后自动刷新。
+    if (showOnboarding) {
+        OnboardingScreen(
+            a11yOn = state.a11yOn,
+            overlayOn = state.overlayOn,
+            onOpenA11y = { launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) },
+            onOpenOverlay = {
+                launch(
+                    Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:${context.packageName}"),
+                    ),
+                )
+            },
+            onFinish = ::finishOnboarding,
+        )
+        return
+    }
+
     if (showLogs) {
         LogScreen(
             loadLines = { vm.logTail() },
@@ -174,13 +209,29 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
         topBar = {
             TopAppBar(
                 title = {
-                    Column {
-                        Text("NymphAuto", style = Ds.Title)
-                        Text(
-                            "本地 · 离线 · 不占录屏权限",
-                            style = Ds.Label,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            Modifier
+                                .size(34.dp)
+                                .background(MaterialTheme.colorScheme.primary, Ds.RadiusMd),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                Icons.Filled.PlayArrow,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onPrimary,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                        Spacer(Modifier.width(Ds.MD))
+                        Column {
+                            Text("NymphAuto", style = Ds.Title)
+                            Text(
+                                "本地 · 离线 · 不占录屏权限",
+                                style = Ds.Label,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
                 },
                 actions = {
@@ -253,6 +304,18 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
                             // ADR-075 D7：停用「轻量定点点击」第 4 弹窗，统一引导到工作台建档。
                             onSimpleTap = { editing = Script(name = "未命名脚本") },
                             onStopRun = { vm.stopRunning(); toast("正在停止…") },
+                            onOpenA11y = {
+                                launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                            },
+                            onOpenOverlay = {
+                                launch(
+                                    Intent(
+                                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                        Uri.parse("package:${context.packageName}"),
+                                    ),
+                                )
+                            },
+                            onRecord = { tab = 1 },
                         )
                     }
                 }
@@ -308,6 +371,7 @@ fun NymphApp(vm: AppViewModel, onPickImport: () -> Unit) {
                         FloatingEditorService.stop(context)
                         toast("系统悬浮编辑器已关闭")
                     },
+                    onShowOnboarding = { showOnboarding = true },
                 )
             }
         }
