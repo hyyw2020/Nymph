@@ -95,6 +95,8 @@ class RunnerService : Service() {
 
         /** 从终止位置继续（HALTED → RUNNING）。 */
         const val ACTION_RESUME = "dev.nymph.auto.action.RESUME"
+        /** ADR-075 裁决4：进入建档取景态——仅创建悬浮球并切相机模式，不加载脚本。 */
+        const val ACTION_ENTER_CAMERA = "dev.nymph.auto.action.ENTER_CAMERA"
         const val EXTRA_SCRIPT_JSON = "script_json"
         const val EXTRA_SCRIPT_NAME = "script_name"
         const val PREFS = "nymphauto"
@@ -140,6 +142,41 @@ class RunnerService : Service() {
 
         /** 取当前服务实例；服务未启动返回 null（fail-soft，调用方判空即可）。 */
         fun live(): RunnerService? = liveInstance
+
+        /**
+         * ADR-075 裁决4 修复：建档取景态的抓帧回调无法随 Intent 跨 Binder 传递
+         * （lambda 是 Compose 侧闭包），故以进程内静态变量中转，仅内存、不进 Script。
+         */
+        @Volatile
+        private var pendingCameraCapture: (() -> Unit)? = null
+
+        /**
+         * ADR-075 裁决4 修复：进入工作台建档时主动拉起服务并切入相机取景态。
+         *
+         * 修复此前「服务未启动 → live() == null → 静默降级 → 相机球从不出现」的断链：
+         *  - 服务已在运行：直接置相机模式并绑定抓帧回调；
+         *  - 服务未运行：以 [ACTION_ENTER_CAMERA] 启动前台服务（不加载任何脚本），
+         *    由 [onStartCommand] 创建悬浮球后取用 [pendingCameraCapture] 完成置位。
+         *
+         * 全程不加载脚本、不触发 ACTION_START、不改变脚本运行状态。
+         */
+        fun enterCameraCapture(context: Context, onCapture: () -> Unit) {
+            pendingCameraCapture = onCapture
+            val svc = liveInstance
+            if (svc != null) {
+                svc.enterEditCameraMode(onCapture)
+                return
+            }
+            val intent = Intent(context, RunnerService::class.java).setAction(ACTION_ENTER_CAMERA)
+            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
+            else context.startService(intent)
+        }
+
+        /** 退出建档取景态：清除中转回调并复位已存在悬浮球，避免回调滞留。 */
+        fun exitCameraCapture() {
+            pendingCameraCapture = null
+            liveInstance?.exitEditCameraMode()
+        }
 
         /** 看门狗轮询间隔 / 判定卡死阈值。长 WAIT 与条件轮询会刷新心跳，不会误判终止。 */
         private const val WATCHDOG_TICK_MS = 5_000L
@@ -337,6 +374,20 @@ class RunnerService : Service() {
                 toast("已就绪：${parsed.name}，点悬浮球展开控制面板")
             }
             ACTION_TOGGLE -> toggle()
+            // ADR-075 裁决4 修复：建档取景态专用入口——只创建悬浮球 + 绑抓帧回调 +
+            // 切相机模式，绝不加载脚本、不进入 toggle/start 链、不改变脚本运行状态。
+            // 悬浮窗权限缺失时 showBall 内部 toast + 静默降级，绝不抛异常。
+            ACTION_ENTER_CAMERA -> {
+                showBall()
+                ball?.let { v ->
+                    v.onCapture = pendingCameraCapture
+                    v.setMode(FloatBall.Mode.EDIT_CAMERA)
+                }
+                hidePanel()
+                RunLog.i("Runner", "建档取景态已就绪：相机球点击走抓帧回调")
+                // 不提前 return：必须 fall-through 到末尾 refreshForeground() 完成
+                // startForeground，否则 startForegroundService 启动后 5s 内未挂前台会崩溃。
+            }
             // v2.9.30：通知栏三键之一。归还是「立刻不占读屏」，因此不经过
             // toggle 的暂停语义（暂停仍持有通道，只是不派发动作）。
             ACTION_HANDOVER -> {

@@ -119,29 +119,58 @@ class WorkbenchRefactorGateTest {
         assertTrue("点击分流不误触启停", svc.contains("v.onCapture?.invoke()"))
     }
 
-    // ── 静态扫描：裁决 4 收尾——置位 API 已真正接线（此前零调用），且 fail-soft ──
+    // ── 静态扫描：裁决 4 修复——相机球建档取景态「主动拉起」链路 ──
     @Test
-    fun `相机球置位API已接线到工作台进入退出且服务未启动静默降级`() {
+    fun `相机球建档取景态主动拉起服务而非静默降级`() {
         val svc = read("service/RunnerService.kt")
-        // 进程内单例访问点：工作台据此触达置位 API（只内存、不持久化）。
-        assertTrue("服务实例访问点 live()", svc.contains("fun live(): RunnerService?"))
-        assertTrue("onCreate 注册实例", svc.contains("liveInstance = this"))
-        assertTrue("onDestroy 注销实例", svc.contains("if (liveInstance === this) liveInstance = null"))
-        // enterEditCameraMode 全局常驻：球未显示时先创建（此前是 `?: return` 静默失败）。
+        // 进程内中转回调：Compose 抓帧闭包无法随 Intent 跨 Binder 传递，故进程内暂存。
+        assertTrue("进程内中转抓帧回调", svc.contains("pendingCameraCapture"))
+        assertTrue("主动进入取景态入口", svc.contains("fun enterCameraCapture"))
+        assertTrue("退出取景态入口", svc.contains("fun exitCameraCapture"))
+        assertTrue("服务未启动时拉起", svc.contains("startForegroundService(intent)"))
+        // 专用 action：只建球 + 置相机模式，不加载脚本、不进 ACTION_START 链。
+        assertTrue("专用 action 常量", svc.contains("ACTION_ENTER_CAMERA"))
+        assertTrue("专用 action 分支", svc.contains("ACTION_ENTER_CAMERA ->"))
+        // 球未显示时先创建（全局常驻）。
         assertTrue("球未显示先创建（全局常驻）", svc.contains("if (ball == null) showBall()"))
+        // 首启必须落前台：ACTION_ENTER_CAMERA 分支不得提前 return 跳过 refreshForeground。
+        val branch = svc.substring(
+            svc.indexOf("ACTION_ENTER_CAMERA ->"),
+            svc.indexOf("// v2.9.30：通知栏三键之一")
+        )
+        assertFalse("取景态分支不得提前 return（否则 startForegroundService 5s 未挂前台崩溃）",
+            branch.contains("return START_NOT_STICKY"))
 
         val wb = codeOnly(read("ui/compose/SceneCanvasEditorDialog.kt"))
-        // 进入工作台调 enterEditCameraMode、退出 onDispose 调 exitEditCameraMode——两侧都接上。
-        assertTrue("工作台进入调 enterEditCameraMode",
-            wb.contains(".enterEditCameraMode"))
-        assertTrue("工作台退出调 exitEditCameraMode",
-            wb.contains(".exitEditCameraMode"))
+        // 进入工作台调 enterCameraCapture、退出 onDispose 调 exitCameraCapture——两侧都接上。
+        assertTrue("工作台进入调 enterCameraCapture",
+            wb.contains("RunnerService.enterCameraCapture(context)"))
+        assertTrue("工作台退出调 exitCameraCapture",
+            wb.contains("RunnerService.exitCameraCapture()"))
         assertTrue("退出在 onDispose 复位", wb.contains("onDispose"))
         // 抓帧回调用 rememberUpdatedState 持有，避免球点击调用过期闭包。
         assertTrue("抓帧回调记住最新闭包", wb.contains("rememberUpdatedState"))
-        // fail-soft：服务未启动时判空静默，绝不因此启停脚本或改服务生命周期。
-        assertTrue("服务判空安全调用", wb.contains("RunnerService.live()?."))
-        assertFalse("工作台不得主动 startService（不改服务生命周期）",
-            wb.contains("startService") || wb.contains("startForegroundService"))
+        // 不再依赖 live() 判空静默降级——该断链导致相机球从不出现。
+        assertFalse("不得再退回 live() 判空静默降级的断链实现",
+            wb.contains("RunnerService.live()?."))
+    }
+
+    // ── 静态扫描：界面重合修复——工作台独占整屏（与源码视图同构 early-return） ──
+    @Test
+    fun `工作台分支earlyReturn独占整屏不再与步骤视图叠绘`() {
+        val editor = codeOnly(read("ui/compose/EditorScreen.kt"))
+        val wbCall = "SceneCanvasEditorDialog("
+        val idx = editor.indexOf(wbCall)
+        assertTrue("工作台入口必须存在", idx >= 0)
+        // 从工作台调用点往后一小段必须出现 return——早于步骤视图 Column(fillMaxSize)。
+        val afterWb = editor.substring(idx, (idx + 2400).coerceAtMost(editor.length))
+        assertTrue("工作台组合后必须 early-return 独占整屏", afterWb.contains("return"))
+        // 步骤视图锚点用其 TopAppBar 标题（注释行会被 codeOnly 过滤，不能做锚点）。
+        val stepViewIdx = editor.indexOf("\"编辑场景\", maxLines = 1")
+        assertTrue("步骤视图锚点存在", stepViewIdx >= 0)
+        assertTrue("工作台调用必须位于步骤视图之前", idx < stepViewIdx)
+        // 只保留一处工作台调用——此前分支重复（前置独占 + 末尾叠绘）是界面重合根因。
+        val callCount = Regex(Regex.escape(wbCall)).findAll(editor).count()
+        assertEquals("工作台调用点必须恰好 1 处", 1, callCount)
     }
 }

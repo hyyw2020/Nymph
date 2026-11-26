@@ -273,6 +273,32 @@ fun EditorScreen(
         return
     }
 
+    // ADR-075：单一工作台——与源码视图同构，early-return 独占整屏。
+    // 修复「界面重合」：此前本分支与步骤视图同处一个 Composable 作用域，两个
+    // Column(fillMaxSize) 被同时组合、层叠绘制，底层「未命名脚本/执行1次」等透出。
+    // 采用 early-return 后，工作台与步骤视图互斥，任一时刻只组合其一。
+    if (showSceneCanvas) {
+        SceneCanvasEditorDialog(
+            initial = scriptBase.canvas,
+            initialAssets = scriptBase.assets,
+            globalMethod = scriptBase.globalMethod,
+            globalVerifySimilarity = scriptBase.globalVerifySimilarity,
+            onDismiss = { showSceneCanvas = false },
+            onConfirm = { canvas, updatedAssets, method, similarity ->
+                pushUndo()
+                // v3.0.4：画布仅作可视化编辑视图，保存时编译进现有 Action/sceneRule。
+                // 编译 + 合并统一走 SceneCanvas.mergeInto（测试共用同一函数，杜绝门控绕过）。
+                // N5 整图校验配置写回 Script 级字段（不进 canvas、不进运行链模型）。
+                scriptBase = SceneCanvas.mergeInto(scriptBase, canvas, updatedAssets).copy(
+                    globalMethod = method,
+                    globalVerifySimilarity = similarity.coerceIn(1, 100),
+                )
+                showSceneCanvas = false
+            },
+        )
+        return
+    }
+
     // ------------------------------------------------------------ 步骤视图
     Column(Modifier.fillMaxSize()) {
         // v2.9.7：5 个 TextButton 的默认 12dp 左右内边距把标题挤成「编/辑/动/作」
@@ -564,29 +590,8 @@ fun EditorScreen(
     // 能力并入单一工作台的「框特征」态（captureFeatureTemplate + 每框相似度滑块）。
     // 文件保留不删（避免「删了又改」），showFeatureCapture 状态不再有入口触发。
 
-    // ADR-075：单一工作台——不再以 Dialog 弹出，作为覆盖整屏的工作台页面宿主。
-    // D1–D3 三入口已合并为上方单一入口；D4 ActionEditDialog 保留为「编辑任意已存在 Action」
-    // 的通用载体（只读分支已删）；D6 FeatureCaptureDialog 调用已停用（能力并入框特征态）。
-    if (showSceneCanvas) {
-        SceneCanvasEditorDialog(
-            initial = scriptBase.canvas,
-            initialAssets = scriptBase.assets,
-            globalMethod = scriptBase.globalMethod,
-            globalVerifySimilarity = scriptBase.globalVerifySimilarity,
-            onDismiss = { showSceneCanvas = false },
-            onConfirm = { canvas, updatedAssets, method, similarity ->
-                pushUndo()
-                // v3.0.4 路径乙：画布只做可视化编辑视图，保存时编译进现有 Action/sceneRule。
-                // 编译 + 合并统一走 SceneCanvas.mergeInto（测试共用同一函数，杜绝门控绕过）。
-                // N5 整图门配置写回 Script 级字段（不进 canvas、不进运行链模型）。
-                scriptBase = SceneCanvas.mergeInto(scriptBase, canvas, updatedAssets).copy(
-                    globalMethod = method,
-                    globalVerifySimilarity = similarity.coerceIn(1, 100),
-                )
-                showSceneCanvas = false
-            },
-        )
-    }
+    // ADR-075 D4/D6：ActionEditDialog（通用 Action 编辑载体，只读分支已删）与
+    // FeatureCaptureDialog（调用已停用，能力并入工作台「框特征」态）见上文各自处理。
 }
 
 @Composable

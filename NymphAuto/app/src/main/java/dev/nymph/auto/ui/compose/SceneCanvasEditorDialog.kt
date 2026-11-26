@@ -181,15 +181,18 @@ fun SceneCanvasEditorDialog(
         }
     }
 
-    // ADR-075 裁决 4 收尾：相机球点击走最新抓帧闭包（rememberUpdatedState 避免持有过期 state）。
+    // ADR-075 裁决 4 修复：相机球点击走最新抓帧闭包（rememberUpdatedState 避免持有过期 state）。
     val latestGrab by rememberUpdatedState({ grabFrame() })
-    // 进入建档工作台 → 常驻球切 EDIT_CAMERA（点球抓帧、屏蔽启停）；退出 → 立即复位 RUN_STATUS。
-    // 全部 fail-soft：RunnerService.live() 为 null（服务未启动）时静默跳过，工作台按钮抓帧照常可用，
-    // 绝不因建档界面影响脚本启停或服务生命周期。
+    val context = LocalContext.current
+    // 进入建档工作台 → 主动拉起 RunnerService 并让悬浮球切 EDIT_CAMERA（点球抓当前目标界面、
+    // 屏蔽启停）；退出 → 复位 RUN_STATUS 并清中转回调。
+    // 修复此前「服务未启动 → live()==null → 静默降级 → 相机球从不出现」的断链：
+    // enterCameraCapture 在服务未启动时以 ACTION_ENTER_CAMERA 拉起前台服务，不加载任何脚本。
+    // 悬浮窗权限缺失时 showBall 内部 toast + 静默降级，工作台按钮抓帧仍可用。
     DisposableEffect(Unit) {
-        dev.nymph.auto.service.RunnerService.live()?.enterEditCameraMode { latestGrab() }
+        dev.nymph.auto.service.RunnerService.enterCameraCapture(context) { latestGrab() }
         onDispose {
-            dev.nymph.auto.service.RunnerService.live()?.exitEditCameraMode()
+            dev.nymph.auto.service.RunnerService.exitCameraCapture()
         }
     }
 

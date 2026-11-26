@@ -223,7 +223,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKSPACE = os.path.dirname(ROOT)
 BT = "/opt/android-sdk/build-tools/36.0.0"
 APK = os.path.join(WORKSPACE, "NymphAuto-release.apk")
-SRC_ZIP = os.path.join(WORKSPACE, "NymphAuto-source-v3.0.4.zip")
+SRC_ZIP = os.path.join(WORKSPACE, "NymphAuto-source-v3.0.5.zip")
 DEX_DIR = "/tmp/build/v300dex"
 
 # 16 KB 页对齐核验（v2.9.0）
@@ -2570,7 +2570,7 @@ def main() -> int:
         # ADR-068：截图取证链隔离门禁（新链零取屏 + 单一出口）属架构红线，两种模式都查。
         # 不检查：61 项取证链静态门禁、表述门禁、elf 对齐、全部 dex 符号。
         ok = (
-            apk["versionName"] == "3.0.4" and apk["versionCode"] == 72
+            apk["versionName"] == "3.0.5" and apk["versionCode"] == 73
             and base_ok
             and bool(g.get("v300_fast_path_wired"))
             and bool(g.get("v3000_screenshot_quarantined"))
@@ -2579,7 +2579,7 @@ def main() -> int:
     else:
         # full：发布硬门槛，逐字保留原有全部条件（仅版本号随 3.0.0 更新）。
         ok = (
-            apk["versionName"] == "3.0.4" and apk["versionCode"] == 72
+            apk["versionName"] == "3.0.5" and apk["versionCode"] == 73
             and base_ok
             and data["drag"]["ok"]
             # v2.9.2 / ADR-008：新增 core 能力必须真的编进 release dex
